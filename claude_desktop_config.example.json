@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fusion360": {
+      "command": "uv",
+      "args": ["run", "--directory", "C:\\MCP\\mcp_server", "server.py"]
+    }
+  }
+}

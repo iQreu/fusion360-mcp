@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual envs / uv
+.venv/
+venv/
+.python-version
+
+# Runtime artifacts
+*.log
+fusion_mcp_view.png
+
+# OS
+Thumbs.db
+.DS_Store

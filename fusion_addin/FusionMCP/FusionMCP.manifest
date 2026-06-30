@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "FusionMCP_bridge_addin",
+    "author": "FusionMCP",
+    "description": {
+        "": "MCP bridge: exposes the Fusion 360 API over a local socket for an external Model Context Protocol server."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
