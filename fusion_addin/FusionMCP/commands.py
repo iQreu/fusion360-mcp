@@ -15,6 +15,7 @@ import math
 import os
 import re
 import tempfile
+import time
 import traceback
 
 import adsk.core
@@ -22,7 +23,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -37,7 +38,8 @@ _READ_ONLY_OPS = frozenset({
     'ping', 'server_info', 'get_state', 'query_entities', 'list_parameters',
     'measure', 'bounding_box', 'center_of_mass', 'interference', 'screenshot',
     'fit_view', 'timeline', 'bom', 'mesh_info',
-    'get_selection', 'highlight', 'multi_screenshot',
+    'get_selection', 'highlight', 'multi_screenshot', 'list_documents',
+    'mass_properties', 'cam_setups', 'export_parameters',
 })
 
 
@@ -443,11 +445,20 @@ def op_extrude(app, p):
     prof = _registry.get(p['profile'])
     feats = _root(app).features.extrudeFeatures
     ein = feats.createInput(prof, _operation(p.get('operation', 'new')))
-    distance = _vi(p['distance'] * MM)
-    if p.get('symmetric'):
-        ein.setSymmetricExtent(distance, True)  # distance = full length
+    if p.get('to_face'):
+        # Extrude up to a face/body instead of a fixed distance.
+        extent = adsk.fusion.ToEntityExtentDefinition.create(
+            _registry.get(p['to_face']), False)
+        ein.setOneSideExtent(
+            extent, adsk.fusion.ExtentDirections.PositiveExtentDirection)
     else:
-        ein.setDistanceExtent(False, distance)
+        distance = _vi(p['distance'] * MM)
+        if p.get('symmetric'):
+            ein.setSymmetricExtent(distance, True)  # distance = full length
+        else:
+            ein.setDistanceExtent(False, distance)
+    if p.get('taper_angle'):
+        ein.taperAngle = _vi(math.radians(p['taper_angle']))
     return _feature_result(feats.add(ein), 'extrude')
 
 
@@ -839,6 +850,39 @@ def op_split_body(app, p):
     return _feature_result(feats.add(sin), 'split_body')
 
 
+def op_offset_face(app, p):
+    """Press-pull: offset face tokens by `distance` mm (negative pushes in).
+    Quick thickness/clearance tweaks without editing sketches."""
+    feats = _root(app).features.offsetFacesFeatures
+    return _feature_result(
+        feats.add(feats.createInput(_collection(p['faces']),
+                                    _vi(p['distance'] * MM))),
+        'offset_face')
+
+
+def op_scale(app, p):
+    """Uniformly scale bodies/components (tokens) by `factor` about a point
+    (token; default: the origin). E.g. fix an STL imported in the wrong unit."""
+    feats = _root(app).features.scaleFeatures
+    point = (_registry.get(p['point']) if p.get('point')
+             else _root(app).originConstructionPoint)
+    sin = feats.createInput(_collection(p['entities']), point,
+                            _vi(float(p['factor'])))
+    return _feature_result(feats.add(sin), 'scale')
+
+
+def op_thicken(app, p):
+    """Thicken surface faces (tokens) into a solid, `thickness` mm (symmetric
+    centres it). The solid counterpart for surface lofts/sweeps/patches."""
+    feats = _root(app).features.thickenFeatures
+    faces = _collection(p['faces'])
+    tin = feats.createInput(faces, _vi(p['thickness'] * MM),
+                            bool(p.get('symmetric', False)),
+                            _operation(p.get('operation', 'new')),
+                            bool(p.get('chain', True)))
+    return _feature_result(feats.add(tin), 'thicken')
+
+
 # --------------------------------------------------------------------------- #
 # Assemblies: components, occurrences, joints, rename, copy
 # --------------------------------------------------------------------------- #
@@ -932,6 +976,151 @@ def op_joint(app, p):
 
 
 # --------------------------------------------------------------------------- #
+# Assembly motion: driving joints, limits, occurrence transform, grounding
+# --------------------------------------------------------------------------- #
+def op_drive_joint(app, p):
+    """Set a joint's motion value: rotation (deg) for revolute/cylindrical,
+    slide (mm) for slider/cylindrical. kind: auto|rotation|slide. Combine with
+    interference + multi_screenshot to check a mechanism through its range."""
+    joint = _registry.get(p['joint'])
+    motion = joint.jointMotion
+    kind = (p.get('kind') or 'auto').lower()
+    value = float(p['value'])
+    out = {'joint': p['joint']}
+    if kind in ('auto', 'rotation') and hasattr(motion, 'rotationValue'):
+        motion.rotationValue = math.radians(value)
+        out['rotation_deg'] = round(math.degrees(motion.rotationValue), 4)
+    elif kind in ('auto', 'slide') and hasattr(motion, 'slideValue'):
+        motion.slideValue = value * MM
+        out['slide_mm'] = round(motion.slideValue / MM, 4)
+    else:
+        raise ValueError('Joint has no %s motion (motion type: %s)'
+                         % (kind, type(motion).__name__))
+    return out
+
+
+def op_set_joint_limits(app, p):
+    """Set limits on a joint's motion. kind: rotation (deg) or slide (mm);
+    min/max/rest are optional — omitted ones stay untouched."""
+    joint = _registry.get(p['joint'])
+    motion = joint.jointMotion
+    kind = (p.get('kind') or 'rotation').lower()
+    if kind == 'rotation':
+        limits, conv = getattr(motion, 'rotationLimits', None), math.radians
+    elif kind == 'slide':
+        limits, conv = getattr(motion, 'slideLimits', None), lambda v: v * MM
+    else:
+        raise ValueError('kind must be rotation|slide, got %r' % kind)
+    if limits is None:
+        raise ValueError('Joint has no %s limits (motion type: %s)'
+                         % (kind, type(motion).__name__))
+    if p.get('min') is not None:
+        limits.isMinimumValueEnabled = True
+        limits.minimumValue = conv(float(p['min']))
+    if p.get('max') is not None:
+        limits.isMaximumValueEnabled = True
+        limits.maximumValue = conv(float(p['max']))
+    if p.get('rest') is not None:
+        limits.isRestValueEnabled = True
+        limits.restValue = conv(float(p['rest']))
+    return {'joint': p['joint'], 'kind': kind}
+
+
+def op_move_occurrence(app, p):
+    """Move/rotate a whole occurrence (component instance): dx/dy/dz in mm,
+    rx/ry/rz in deg about world axes through the occurrence origin. This is the
+    assembly-level counterpart of move_body."""
+    occ = _registry.get(p['occurrence'])
+    t = occ.transform2 if hasattr(occ, 'transform2') else occ.transform
+    origin = t.translation
+    delta = adsk.core.Matrix3D.create()
+    for vec, ang in (((1, 0, 0), p.get('rx', 0)), ((0, 1, 0), p.get('ry', 0)),
+                     ((0, 0, 1), p.get('rz', 0))):
+        if ang:
+            rot = adsk.core.Matrix3D.create()
+            rot.setToRotation(math.radians(ang),
+                              adsk.core.Vector3D.create(*vec),
+                              adsk.core.Point3D.create(origin.x, origin.y, origin.z))
+            delta.transformBy(rot)
+    if p.get('dx') or p.get('dy') or p.get('dz'):
+        tr = adsk.core.Matrix3D.create()
+        tr.translation = adsk.core.Vector3D.create(
+            p.get('dx', 0) * MM, p.get('dy', 0) * MM, p.get('dz', 0) * MM)
+        delta.transformBy(tr)
+    t.transformBy(delta)
+    if hasattr(occ, 'transform2'):
+        occ.transform2 = t
+    else:
+        occ.transform = t
+    new_origin = (occ.transform2 if hasattr(occ, 'transform2') else occ.transform).translation
+    return {'occurrence': p['occurrence'],
+            'origin_mm': [round(new_origin.x / MM, 4), round(new_origin.y / MM, 4),
+                          round(new_origin.z / MM, 4)]}
+
+
+def op_ground_occurrence(app, p):
+    """Ground (anchor, default) or unground an occurrence so joints move the
+    other parts relative to it."""
+    occ = _registry.get(p['occurrence'])
+    occ.isGrounded = bool(p.get('grounded', True))
+    return {'occurrence': p['occurrence'], 'grounded': occ.isGrounded}
+
+
+# --------------------------------------------------------------------------- #
+# Cloud data panel: projects, documents
+# --------------------------------------------------------------------------- #
+def op_list_documents(app, p):
+    """List cloud projects and the documents in their root folders (data-panel
+    view). Optional project name filter. Cloud calls can be slow on first use."""
+    data = app.data
+    target = p.get('project')
+    projects = []
+    for i in range(data.dataProjects.count):
+        proj = data.dataProjects.item(i)
+        if target and proj.name != target:
+            continue
+        docs = []
+        try:
+            files = proj.rootFolder.dataFiles
+            for j in range(files.count):
+                df = files.item(j)
+                entry = {'name': df.name}
+                with contextlib.suppress(Exception):
+                    entry['type'] = df.fileExtension
+                docs.append(entry)
+        except Exception as exc:
+            docs = [{'error': str(exc)}]
+        projects.append({'project': proj.name, 'documents': docs})
+    if target and not projects:
+        raise RuntimeError('No cloud project named %r' % target)
+    return {'count': len(projects), 'projects': projects}
+
+
+def op_open_document(app, p):
+    """Open a cloud document by name (optionally scoped to a project). The
+    opened document becomes active; call get_state afterwards."""
+    data = app.data
+    name = p['name']
+    target = p.get('project')
+    for i in range(data.dataProjects.count):
+        proj = data.dataProjects.item(i)
+        if target and proj.name != target:
+            continue
+        try:
+            files = proj.rootFolder.dataFiles
+        except Exception:
+            continue
+        for j in range(files.count):
+            df = files.item(j)
+            if df.name == name:
+                doc = app.documents.open(df)
+                return {'opened': doc.name, 'project': proj.name}
+    raise RuntimeError('Document %r not found%s. Use list_documents to see '
+                       'what is available.'
+                       % (name, ' in project %r' % target if target else ''))
+
+
+# --------------------------------------------------------------------------- #
 # Parameters
 # --------------------------------------------------------------------------- #
 def op_list_parameters(app, p):
@@ -963,6 +1152,53 @@ def op_add_parameter(app, p):
     prm = design.userParameters.add(p['name'], vi, p.get('units', 'mm'),
                                     p.get('comment', ''))
     return {'name': prm.name, 'value_internal': prm.value, 'expression': prm.expression}
+
+
+def op_export_parameters(app, p):
+    """Write all parameters to a CSV file (name, kind, expression, unit,
+    comment) — edit in a spreadsheet, re-apply with import_parameters."""
+    design = _design(app)
+    user_names = {prm.name for prm in design.userParameters}
+    path = p['csv_path']
+    count = 0
+    with open(path, 'w', newline='', encoding='utf-8') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['name', 'kind', 'expression', 'unit', 'comment'])
+        for prm in design.allParameters:
+            writer.writerow([prm.name,
+                             'user' if prm.name in user_names else 'model',
+                             prm.expression, prm.unit, prm.comment or ''])
+            count += 1
+    return {'csv': path, 'parameters': count}
+
+
+def op_import_parameters(app, p):
+    """Apply parameters from a CSV (columns: name, expression; optional unit,
+    comment). Existing parameters get the new expression; unknown names are
+    created as user parameters. Reports per-row results."""
+    design = _design(app)
+    results = []
+    with open(p['csv_path'], newline='', encoding='utf-8-sig') as fh:
+        for row in csv.DictReader(fh):
+            name = (row.get('name') or '').strip()
+            expr = (row.get('expression') or '').strip()
+            if not name or not expr:
+                continue
+            try:
+                prm = design.allParameters.itemByName(name)
+                if prm:
+                    prm.expression = expr
+                    results.append({'name': name, 'action': 'updated'})
+                else:
+                    design.userParameters.add(
+                        name, adsk.core.ValueInput.createByString(expr),
+                        (row.get('unit') or 'mm').strip(),
+                        (row.get('comment') or '').strip())
+                    results.append({'name': name, 'action': 'created'})
+            except Exception as exc:
+                results.append({'name': name, 'action': 'failed',
+                                'error': str(exc)})
+    return {'count': len(results), 'results': results}
 
 
 # --------------------------------------------------------------------------- #
@@ -1044,6 +1280,31 @@ def op_center_of_mass(app, p):
     """Centre of mass of a body token, in mm (requires a mass-properties solve)."""
     com = _registry.get(p['body']).physicalProperties.centerOfMass
     return {'body': p['body'], 'center_mm': _xyz_mm(com)}
+
+
+def op_mass_properties(app, p):
+    """Full mass report for a body token: mass (kg), volume (mm^3), surface
+    area (mm^2), centre of mass (mm) and moments of inertia about the world
+    axes through the centre of mass (kg*mm^2)."""
+    body = _registry.get(p['body'])
+    props = body.physicalProperties
+    out = {
+        'body': p['body'],
+        'mass_kg': round(props.mass, 6),
+        'volume_mm3': round(props.volume / (MM ** 3), 3),
+        'area_mm2': round(props.area / (MM * MM), 3),
+        'center_of_mass_mm': _xyz_mm(props.centerOfMass),
+    }
+    with contextlib.suppress(Exception):
+        ok, xx, yy, zz, xy, yz, xz = props.getXYZMomentsOfInertia()
+        if ok:
+            # kg*cm^2 -> kg*mm^2
+            out['moments_kg_mm2'] = {
+                'xx': round(xx * 100, 3), 'yy': round(yy * 100, 3),
+                'zz': round(zz * 100, 3), 'xy': round(xy * 100, 3),
+                'yz': round(yz * 100, 3), 'xz': round(xz * 100, 3),
+            }
+    return out
 
 
 def op_interference(app, p):
@@ -1210,26 +1471,33 @@ def op_bom(app, p):
 # Sketch text, emboss / engrave
 # --------------------------------------------------------------------------- #
 def op_sketch_text(app, p):
-    """Add text to a sketch at (x, y) mm. height in mm; optional font, bold,
-    italic, angle (deg). The returned text token extrudes directly (extrude /
-    emboss), so labels and logos need no extra tracing."""
+    """Add text to a sketch at (x, y) mm — or along a curve when `path` (sketch
+    curve token) is given. height in mm; optional font, bold, italic, angle
+    (deg). The returned text token extrudes directly (extrude / emboss), so
+    labels and logos need no extra tracing."""
     sk = _registry.get(p['sketch'])
     texts = sk.sketchTexts
     height_mm = float(p.get('height', 10.0))
     x, y = float(p.get('x', 0.0)), float(p.get('y', 0.0))
     text = p['text']
-    try:
+    if p.get('path'):
         tin = texts.createInput2(text, height_mm * MM)
-        # Layout box: generous width estimate so the text never wraps.
-        box_w = float(p.get('box_width', max(4.0, 0.8 * height_mm * len(text))))
-        box_h = float(p.get('box_height', 1.6 * height_mm))
-        tin.setAsMultiLine(
-            _pt(x, y), _pt(x + box_w, y + box_h),
-            adsk.core.HorizontalAlignments.LeftHorizontalAlignment,
-            adsk.core.VerticalAlignments.BottomVerticalAlignment, 0)
-    except Exception:
-        # Older Fusion: positional single-line input.
-        tin = texts.createInput(text, height_mm * MM, _pt(x, y))
+        tin.setAsAlongPath(
+            _registry.get(p['path']), bool(p.get('above_path', True)),
+            adsk.core.HorizontalAlignments.LeftHorizontalAlignment, 0)
+    else:
+        try:
+            tin = texts.createInput2(text, height_mm * MM)
+            # Layout box: generous width estimate so the text never wraps.
+            box_w = float(p.get('box_width', max(4.0, 0.8 * height_mm * len(text))))
+            box_h = float(p.get('box_height', 1.6 * height_mm))
+            tin.setAsMultiLine(
+                _pt(x, y), _pt(x + box_w, y + box_h),
+                adsk.core.HorizontalAlignments.LeftHorizontalAlignment,
+                adsk.core.VerticalAlignments.BottomVerticalAlignment, 0)
+        except Exception:
+            # Older Fusion: positional single-line input.
+            tin = texts.createInput(text, height_mm * MM, _pt(x, y))
     if p.get('font'):
         with contextlib.suppress(Exception):
             tin.fontName = p['font']
@@ -1722,8 +1990,12 @@ def _do_export(app, fmt, path):
     elif fmt == 'stl':
         opts = em.createSTLExportOptions(design.rootComponent, path)
         opts.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+    elif fmt == '3mf':
+        opts = em.createC3MFExportOptions(design.rootComponent, path)
+        with contextlib.suppress(Exception):
+            opts.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
     else:
-        raise ValueError('format must be step|iges|sat|smt|f3d|stl, got %r' % fmt)
+        raise ValueError('format must be step|iges|sat|smt|f3d|stl|3mf, got %r' % fmt)
     em.execute(opts)
     return path
 
@@ -1846,6 +2118,97 @@ def op_set_design_mode(app, p):
         raise ValueError('mode must be "parametric" or "direct", got %r' % p.get('mode'))
     is_direct = design.designType == types.DirectDesignType
     return {'design_type': 'direct' if is_direct else 'parametric'}
+
+
+# --------------------------------------------------------------------------- #
+# CAM (MANUFACTURE): list setups, regenerate toolpaths, post-process G-code.
+# The API cannot create setups — the user makes them once in the UI; from then
+# on regeneration and posting are scriptable.
+# --------------------------------------------------------------------------- #
+def _cam_product(app):
+    import adsk.cam
+    prod = app.activeDocument.products.itemByProductType('CAMProductType')
+    cam = adsk.cam.CAM.cast(prod) if prod else None
+    if not cam:
+        raise RuntimeError('No MANUFACTURE data in this document. Create a '
+                           'Setup in the MANUFACTURE workspace first — the '
+                           'Fusion API cannot create setups.')
+    return cam
+
+
+def _cam_setup_by_name(cam, name):
+    for i in range(cam.setups.count):
+        s = cam.setups.item(i)
+        if s.name == name:
+            return s
+    raise RuntimeError('No CAM setup named %r (see cam_setups)' % name)
+
+
+def op_cam_setups(app, p):
+    """List MANUFACTURE setups with their operations and toolpath state."""
+    cam = _cam_product(app)
+    out = []
+    for i in range(cam.setups.count):
+        s = cam.setups.item(i)
+        entry = {'index': i, 'name': s.name}
+        ops = []
+        with contextlib.suppress(Exception):
+            for j in range(s.allOperations.count):
+                o = s.allOperations.item(j)
+                op_entry = {'name': o.name}
+                with contextlib.suppress(Exception):
+                    op_entry['strategy'] = o.strategy
+                with contextlib.suppress(Exception):
+                    op_entry['has_toolpath'] = bool(o.hasToolpath)
+                ops.append(op_entry)
+        entry['operations'] = ops
+        out.append(entry)
+    return {'count': len(out), 'setups': out}
+
+
+def op_cam_generate(app, p):
+    """(Re)generate toolpaths — for one setup by name, or all setups when
+    omitted. Blocks until generation finishes or `timeout` s (default 240)."""
+    cam = _cam_product(app)
+    if p.get('setup'):
+        future = cam.generateToolpath(_cam_setup_by_name(cam, p['setup']))
+    else:
+        future = cam.generateAllToolpaths(False)
+    deadline = time.time() + float(p.get('timeout', 240))
+    while not future.isGenerationCompleted and time.time() < deadline:
+        adsk.doEvents()
+        time.sleep(0.2)
+    return {'completed': bool(future.isGenerationCompleted),
+            'setup': p.get('setup') or 'all'}
+
+
+def op_cam_post(app, p):
+    """Post-process a setup's toolpaths to NC/G-code. path: output file (its
+    directory and stem become the program folder/name); post_config: a .cps
+    post-processor path or a filename from Fusion's generic post folder
+    (default fanuc.cps); units: mm|in|document."""
+    import adsk.cam
+    cam = _cam_product(app)
+    setup = _cam_setup_by_name(cam, p['setup'])
+    folder, filename = os.path.split(p['path'])
+    program = filename.rsplit('.', 1)[0] or 'program'
+    post = p.get('post_config') or 'fanuc.cps'
+    if not os.path.isabs(post):
+        post = os.path.join(cam.genericPostFolder, post)
+    units_map = {
+        'mm': adsk.cam.PostOutputUnitOptions.MillimetersOutput,
+        'in': adsk.cam.PostOutputUnitOptions.InchesOutput,
+        'document': adsk.cam.PostOutputUnitOptions.DocumentUnitsOutput,
+    }
+    units = units_map.get((p.get('units') or 'mm').lower(), units_map['mm'])
+    pin = adsk.cam.PostProcessInput.create(program, post, folder or '.', units)
+    with contextlib.suppress(Exception):
+        pin.isOpenInEditor = False
+    if not cam.postProcess(setup, pin):
+        raise RuntimeError('Post-processing failed — are the setup toolpaths '
+                           'generated and valid? Run cam_generate first.')
+    return {'posted': p['setup'], 'folder': folder or '.', 'program': program,
+            'post': os.path.basename(post)}
 
 
 # --------------------------------------------------------------------------- #
@@ -2074,6 +2437,21 @@ DISPATCH = {
     'section_view': op_section_view,
     'section_off': op_section_off,
     'undo': op_undo,
+    'drive_joint': op_drive_joint,
+    'set_joint_limits': op_set_joint_limits,
+    'move_occurrence': op_move_occurrence,
+    'ground_occurrence': op_ground_occurrence,
+    'list_documents': op_list_documents,
+    'open_document': op_open_document,
+    'offset_face': op_offset_face,
+    'scale': op_scale,
+    'thicken': op_thicken,
+    'mass_properties': op_mass_properties,
+    'export_parameters': op_export_parameters,
+    'import_parameters': op_import_parameters,
+    'cam_setups': op_cam_setups,
+    'cam_generate': op_cam_generate,
+    'cam_post': op_cam_post,
     'timeline': op_timeline,
     'suppress_feature': op_suppress_feature,
     'list_parameters': op_list_parameters,

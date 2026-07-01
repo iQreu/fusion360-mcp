@@ -72,14 +72,21 @@ perpendicular/equal/collinear/tangent/concentric/coincident/midpoint),
 `sketch_fillet`, `project_to_sketch`
 **Geometria konstrukcyjna**: `construction_plane` (offset/angle/three_points/
 tangent), `construction_axis` (edge/two_points/cylinder), `construction_point`
-**Cechy**: `extrude`, `revolve`, `fillet`, `chamfer`, `shell`, `combine`,
+**Cechy**: `extrude` (dystans/symetrycznie/do ściany `to_face`, pochylenie
+`taper_angle`), `revolve`, `fillet`, `chamfer`, `shell`, `combine`,
 `rectangular_pattern`, `circular_pattern`, `mirror`, `move_body`, `delete`, `hole`
 (simple/counterbore/countersink), `loft`, `sweep`, `rib`, `draft`, `thread`,
-`split_body`
+`split_body`, `offset_face` (press-pull), `scale`, `thicken` (powierzchnia→bryła)
 **Złożenia**: `create_component`, `rename`, `copy_body`, `joint`
-(rigid/revolute/slider/cylindrical/pin_slot/planar/ball)
+(rigid/revolute/slider/cylindrical/pin_slot/planar/ball), `move_occurrence`
+(przesunięcie/obrót całego komponentu), `ground_occurrence`, `drive_joint`
+(ustaw kąt/przesuw przegubu — z `interference` i `multi_screenshot` daje
+sprawdzenie mechanizmu w ruchu), `set_joint_limits`
+**Dokumenty w chmurze**: `list_documents(project)`, `open_document(name)` —
+panel danych Fusion (projekty i dokumenty)
 **Materiały i pomiary**: `set_material`, `set_appearance`, `measure`
-(distance/angle), `bounding_box`, `center_of_mass`, `interference`
+(distance/angle), `bounding_box`, `center_of_mass`, `interference`,
+`mass_properties` (masa, objętość, pole, środek ciężkości, momenty bezwładności)
 **BOM**: `bom(include_mass, csv_path)` — lista części z ilościami, materiałami,
 masą jednostkową i całkowitą; opcjonalny zapis CSV
 **Tekst i grawer**: `sketch_text` (tekst w szkicu: czcionka/wysokość/pochylenie),
@@ -95,13 +102,19 @@ token tekstu działa też w zwykłym `extrude`
 **Rysunki 2D**: `create_drawing` — otwiera kreator „Drawing from Design"
 (API Fusion nie tworzy arkuszy w pełni automatycznie; skryptowalne 2D to
 `export_sketch_dxf` / `export_flat_pattern`)
-**Parametry**: `list_parameters`, `set_parameter`, `add_parameter`
+**Parametry**: `list_parameters`, `set_parameter`, `add_parameter`,
+`export_parameters(csv)` / `import_parameters(csv)` — tabela parametrów do/z
+arkusza kalkulacyjnego
+**CAM (MANUFACTURE)**: `cam_setups` (lista setupów i operacji), `cam_generate`
+(przeliczenie ścieżek), `cam_post(setup, path, post_config)` — G-code przez
+post-procesor (.cps). Setup tworzy się raz w UI — API nie umie go założyć;
+regeneracja i post są już skryptowalne
 **Timeline**: `timeline` (list/rollback), `suppress_feature`
 **Aktualizacje**: automatyczne sprawdzenie + pobranie przy starcie (patrz
 [Aktualizacje z GitHuba](#aktualizacje-z-githuba)); `check_for_updates` (odczyt:
 wersje + release notes), `apply_update(confirm=True, method="auto")` (instaluje
 **po zgodzie użytkownika**: `git pull` dla czystego checkoutu, inaczej zip)
-**I/O**: `export(format, path, allow_fallback=True)` (step/iges/sat/smt/f3d/stl),
+**I/O**: `export(format, path, allow_fallback=True)` (step/iges/sat/smt/f3d/stl/3mf),
 `import_file(format, path)` (step/iges/sat/smt/f3d/dxf),
 `screenshot(direction, fit)`, `capture_to_file(direction, fit)`, `fit_view`, `save`
 — presety kamery: `current|front|back|left|right|top|bottom|iso|iso-top-right|iso-top-left|iso-bottom-right|iso-bottom-left`

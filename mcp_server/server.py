@@ -66,6 +66,12 @@ def server_info() -> dict:
     info = _call('server_info')
     if isinstance(info, dict):
         info['server_version'] = updater.LOCAL_VERSION
+        addin = info.get('version')
+        if addin and addin != updater.LOCAL_VERSION:
+            info['version_mismatch'] = (
+                'Add-in %s != server %s. After an update the Fusion add-in '
+                'must be restarted (Shift+S -> Stop, Run) to load the new code.'
+                % (addin, updater.LOCAL_VERSION))
     return info
 
 
@@ -182,12 +188,16 @@ def sketch_spline(sketch: str, points: list[list[float]]) -> dict:
 # Features
 # --------------------------------------------------------------------------- #
 @mcp.tool()
-def extrude(profile: str, distance: float, operation: str = 'new',
-            symmetric: bool = False) -> dict:
+def extrude(profile: str, distance: float = 0.0, operation: str = 'new',
+            symmetric: bool = False, taper_angle: float = 0.0,
+            to_face: str = '') -> dict:
     """Extrude a profile token by `distance` mm. operation: new|join|cut|intersect.
-    If symmetric, distance is the total (centred) length. Returns body tokens."""
+    If symmetric, distance is the total (centred) length. taper_angle (deg)
+    drafts the sides (e.g. molds). to_face: extrude up to a face/body token
+    instead of a distance. Returns body tokens."""
     return _call('extrude', profile=profile, distance=distance,
-                 operation=operation, symmetric=symmetric)
+                 operation=operation, symmetric=symmetric,
+                 taper_angle=taper_angle, to_face=to_face or None)
 
 
 @mcp.tool()
@@ -251,6 +261,32 @@ def circular_pattern(entities: list[str], axis: str, count: int,
 def mirror(entities: list[str], plane: str) -> dict:
     """Mirror tokens across a plane ("XY"/"XZ"/"YZ" or a planar-face token)."""
     return _call('mirror', entities=entities, plane=plane)
+
+
+@mcp.tool()
+def offset_face(faces: list[str], distance: float) -> dict:
+    """Press-pull: offset the given face tokens by `distance` mm (negative
+    pushes inward). The quickest way to tweak a wall thickness or clearance
+    without touching sketches."""
+    return _call('offset_face', faces=faces, distance=distance)
+
+
+@mcp.tool()
+def scale(entities: list[str], factor: float, point: str = '') -> dict:
+    """Uniformly scale bodies/components (tokens) by `factor` about a point
+    token (default: the design origin). Classic use: an STL/scan imported in
+    the wrong unit (factor 25.4 or 0.0394)."""
+    return _call('scale', entities=entities, factor=factor, point=point or None)
+
+
+@mcp.tool()
+def thicken(faces: list[str], thickness: float, symmetric: bool = False,
+            operation: str = 'new') -> dict:
+    """Thicken surface faces (tokens) into a solid, `thickness` mm (symmetric
+    centres it on the surface). operation: new|join|cut|intersect. Turns
+    surface lofts/sweeps into printable solids."""
+    return _call('thicken', faces=faces, thickness=thickness,
+                 symmetric=symmetric, operation=operation)
 
 
 @mcp.tool()
@@ -530,7 +566,8 @@ def add_parameter(name: str, value: str, units: str = 'mm', comment: str = '') -
 @mcp.tool()
 def export(format: str, path: str, allow_fallback: bool = True) -> dict:
     """Export the design to an absolute file path.
-    format: step | iges | sat | smt | f3d | stl.
+    format: step | iges | sat | smt | f3d | stl | 3mf (3mf is the better
+    3D-print format: mesh + units in one file).
     On Fusion Personal some neutral formats (STEP/IGES/SAT/SMT) may be
     license-restricted; with allow_fallback the export falls back to STL then F3D
     and reports what happened instead of erroring."""
@@ -654,12 +691,16 @@ def bom(include_mass: bool = True, csv_path: str = '') -> dict:
 @mcp.tool()
 def sketch_text(sketch: str, text: str, x: float = 0.0, y: float = 0.0,
                 height: float = 10.0, font: str = '', bold: bool = False,
-                italic: bool = False, angle: float = 0.0) -> dict:
-    """Add text to a sketch at (x, y) mm with cap height `height` mm. Optional
-    font name, bold/italic, rotation angle (deg). The returned text token can be
-    extruded directly or passed to emboss for engraving."""
+                italic: bool = False, angle: float = 0.0,
+                path: str = '') -> dict:
+    """Add text to a sketch at (x, y) mm with cap height `height` mm — or along
+    a curve when `path` (sketch line/arc/circle/spline token) is given (labels
+    on arcs, ring engravings). Optional font name, bold/italic, rotation angle
+    (deg). The returned text token can be extruded directly or passed to emboss
+    for engraving."""
     return _call('sketch_text', sketch=sketch, text=text, x=x, y=y, height=height,
-                 font=font or None, bold=bold, italic=italic, angle=angle)
+                 font=font or None, bold=bold, italic=italic, angle=angle,
+                 path=path or None)
 
 
 @mcp.tool()
@@ -736,6 +777,110 @@ def create_drawing() -> dict:
     sheet setup in the UI). For fully scripted 2D output use export_sketch_dxf
     or export_flat_pattern."""
     return _call('create_drawing')
+
+
+# --------------------------------------------------------------------------- #
+# Mass report, parameter CSV round-trip, CAM
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def mass_properties(body: str) -> dict:
+    """Full mass report for a body token: mass (kg), volume (mm^3), surface
+    area (mm^2), centre of mass (mm) and moments of inertia (kg*mm^2). Set the
+    material first (set_material) for correct density."""
+    return _call('mass_properties', body=body)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def export_parameters(csv_path: str) -> dict:
+    """Write all model/user parameters to a CSV file (name, kind, expression,
+    unit, comment) for spreadsheet editing; re-apply with import_parameters."""
+    return _call('export_parameters', csv_path=csv_path)
+
+
+@mcp.tool()
+def import_parameters(csv_path: str) -> dict:
+    """Apply parameters from a CSV (columns: name, expression; optional unit,
+    comment). Existing parameters are updated, unknown names become new user
+    parameters; returns per-row results."""
+    return _call('import_parameters', csv_path=csv_path)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def cam_setups() -> dict:
+    """List MANUFACTURE (CAM) setups with their operations and toolpath state.
+    Note: the Fusion API cannot CREATE setups — the user makes them once in the
+    MANUFACTURE workspace; generation and posting are then scriptable."""
+    return _call('cam_setups')
+
+
+@mcp.tool()
+def cam_generate(setup: str = '', timeout: float = 240.0) -> dict:
+    """(Re)generate CAM toolpaths — one setup by name, or all when omitted.
+    Blocks until done or `timeout` seconds; check cam_setups afterwards."""
+    return _call('cam_generate', setup=setup or None, timeout=timeout)
+
+
+@mcp.tool()
+def cam_post(setup: str, path: str, post_config: str = '',
+             units: str = 'mm') -> dict:
+    """Post-process a setup's toolpaths to NC/G-code at `path`. post_config: a
+    .cps file path or a name from Fusion's generic post library (default
+    fanuc.cps); units: mm|in|document. Run cam_generate first."""
+    return _call('cam_post', setup=setup, path=path,
+                 post_config=post_config or None, units=units)
+
+
+# --------------------------------------------------------------------------- #
+# Assembly motion and cloud documents
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+def drive_joint(joint: str, value: float, kind: str = 'auto') -> dict:
+    """Set a joint's motion value: rotation in degrees (revolute/cylindrical)
+    or slide in mm (slider/cylindrical). kind: "auto" (pick what the joint
+    supports), "rotation", "slide". Drive the joint through its range and use
+    interference + multi_screenshot to verify a mechanism."""
+    return _call('drive_joint', joint=joint, value=value, kind=kind)
+
+
+@mcp.tool()
+def set_joint_limits(joint: str, kind: str = 'rotation', min: float | None = None,
+                     max: float | None = None, rest: float | None = None) -> dict:
+    """Limit a joint's motion range. kind: "rotation" (deg) or "slide" (mm).
+    Only the limits you pass are changed; rest is the neutral position."""
+    return _call('set_joint_limits', joint=joint, kind=kind, min=min, max=max,
+                 rest=rest)
+
+
+@mcp.tool()
+def move_occurrence(occurrence: str, dx: float = 0.0, dy: float = 0.0,
+                    dz: float = 0.0, rx: float = 0.0, ry: float = 0.0,
+                    rz: float = 0.0) -> dict:
+    """Move (mm) and/or rotate (deg, about world axes through its origin) a
+    whole occurrence — position components before adding joints. The
+    assembly-level counterpart of move_body."""
+    return _call('move_occurrence', occurrence=occurrence, dx=dx, dy=dy, dz=dz,
+                 rx=rx, ry=ry, rz=rz)
+
+
+@mcp.tool()
+def ground_occurrence(occurrence: str, grounded: bool = True) -> dict:
+    """Ground (anchor) an occurrence so joints move other parts relative to
+    it; grounded=False releases it."""
+    return _call('ground_occurrence', occurrence=occurrence, grounded=grounded)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def list_documents(project: str = '') -> dict:
+    """List cloud projects and the documents in their root folders (the data
+    panel). Optional project-name filter. First cloud access can be slow."""
+    return _call('list_documents', project=project or None)
+
+
+@mcp.tool()
+def open_document(name: str, project: str = '') -> dict:
+    """Open a cloud document by name (optionally within a given project); it
+    becomes the active document — call get_state afterwards to re-orient."""
+    return _call('open_document', name=name, project=project or None)
 
 
 # --------------------------------------------------------------------------- #
