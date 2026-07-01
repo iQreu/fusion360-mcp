@@ -1,10 +1,18 @@
 [project]
 name = "fusion360-mcp"
-version = "1.0.0"
+version = "1.2.0"
 description = "Model Context Protocol server for Autodesk Fusion 360"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.2.0",
+    # 1.9+ carries tool annotations (readOnlyHint/destructiveHint); the server
+    # degrades gracefully to plain tools on older SDKs (see _annot in server.py).
+    "mcp>=1.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
 ]
 
 [tool.uv]

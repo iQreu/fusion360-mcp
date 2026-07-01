@@ -13,11 +13,12 @@ Conventions
 * Sketch planes: "XY" | "XZ" | "YZ", or a planar-face token.
 * Axes: "X" | "Y" | "Z", or a token (sketch line / edge).
 """
+import json
 import os
 
-from mcp.server.fastmcp import FastMCP, Image
-
+import updater
 from fusion_client import FusionClient, FusionError, FusionNotConnected
+from mcp.server.fastmcp import FastMCP, Image
 
 HOST = os.environ.get('FUSION_MCP_HOST', '127.0.0.1')
 PORT = int(os.environ.get('FUSION_MCP_PORT', '9123'))
@@ -26,18 +27,70 @@ mcp = FastMCP('fusion360')
 fusion = FusionClient(HOST, PORT)
 
 
+# Tool annotations (readOnlyHint/destructiveHint/idempotentHint) let MCP clients
+# reason about a tool's safety. They arrived in the SDK ~1.9; on older versions
+# ToolAnnotations is absent, so _annot yields no kwargs and tools stay plain.
+try:
+    from mcp.types import ToolAnnotations
+
+    def _annot(**kw):
+        return {'annotations': ToolAnnotations(**kw)}
+except Exception:  # pragma: no cover - depends on installed SDK
+    def _annot(**kw):
+        return {}
+
+
 def _call(op, **params):
-    """Forward to the add-in, turning transport errors into readable strings."""
+    """Forward to the add-in, turning transport errors into readable strings.
+    The first result of a session also carries the pending-update notice (new
+    version + release notes) gathered by the startup background check."""
     try:
-        return fusion.call(op, params)
+        result = fusion.call(op, params)
     except (FusionError, FusionNotConnected) as exc:
         return {'error': str(exc)}
+    if isinstance(result, dict):
+        notice = updater.consume_notice()
+        if notice:
+            result['fusionmcp_update'] = notice
+    return result
 
 
 # --------------------------------------------------------------------------- #
 # State / inspection
 # --------------------------------------------------------------------------- #
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
+def server_info() -> dict:
+    """Report the add-in version, uptime and per-operation telemetry
+    (call counts, average/max execution time in ms, error counts). Useful for
+    checking the connection is live and for spotting slow operations."""
+    info = _call('server_info')
+    if isinstance(info, dict):
+        info['server_version'] = updater.LOCAL_VERSION
+    return info
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def check_for_updates() -> dict:
+    """Check GitHub for a newer FusionMCP release. Returns current vs latest
+    version, whether an update is available, release notes, and whether the
+    startup auto-check already pre-downloaded the package ("downloaded"). It
+    never installs anything. If an update is available, ASK THE USER before
+    calling apply_update."""
+    return updater.check()
+
+
+@mcp.tool(**_annot(destructiveHint=True))
+def apply_update(confirm: bool = False, method: str = 'auto') -> dict:
+    """Install the latest FusionMCP version (uses the pre-downloaded package
+    from the startup check when present, else downloads). Requires the user's
+    consent: only call with confirm=True after the user has agreed to a specific
+    update reported by check_for_updates or the startup notice. method: "auto"
+    (git pull for a clean checkout, else release zip), "git", or "zip". After it
+    succeeds the user must restart the Fusion add-in and Claude Desktop."""
+    return updater.apply(confirm=confirm, method=method)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
 def get_state(include_mass_props: bool = False) -> dict:
     """Summarise the active Fusion design: document, units, design_type, bodies,
     sketches and parameters, each with a reusable token. Call this first to orient
@@ -45,13 +98,16 @@ def get_state(include_mass_props: bool = False) -> dict:
     return _call('get_state', include_mass_props=include_mass_props)
 
 
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
 def query_entities(kind: str, target: str = '', include_mass_props: bool = False) -> dict:
     """List sub-entities with tokens and geometry, for picking edges/faces/profiles.
 
-    kind: "bodies" | "sketches" | "profiles" | "faces" | "edges".
+    kind: "bodies" | "sketches" | "profiles" | "faces" | "edges" | "occurrences"
+    | "meshes".
     target: required for profiles (a sketch token) and for faces/edges (a body
-    token). Edges report length/endpoints; faces report centroid/type.
+    token). Edges report length/endpoints; faces report centroid/type;
+    occurrences report component name and body count; meshes are imported
+    scan/mesh bodies.
     Set include_mass_props=True to also compute face/profile area (slower solve)."""
     return _call('query_entities', kind=kind, target=target or None,
                  include_mass_props=include_mass_props)
@@ -99,6 +155,27 @@ def sketch_polygon(sketch: str, cx: float, cy: float, r: float, sides: int,
     """Add a regular polygon inscribed in radius r (mm), with `sides` vertices."""
     return _call('sketch_polygon', sketch=sketch, cx=cx, cy=cy, r=r,
                  sides=sides, start_angle=start_angle)
+
+
+@mcp.tool()
+def sketch_points(sketch: str, points: list[list[float]]) -> dict:
+    """Add many sketch points (mm) in one call. points: [[x,y], ...]. Returns a
+    point token per input point. Fewer round-trips than one call per point."""
+    return _call('sketch_points', sketch=sketch, points=points)
+
+
+@mcp.tool()
+def sketch_polyline(sketch: str, points: list[list[float]],
+                    closed: bool = False) -> dict:
+    """Add a connected polyline through points (mm) in one call. points:
+    [[x,y], ...]. closed=True joins the last point back to the first."""
+    return _call('sketch_polyline', sketch=sketch, points=points, closed=closed)
+
+
+@mcp.tool()
+def sketch_spline(sketch: str, points: list[list[float]]) -> dict:
+    """Add a fitted spline through points (mm) in one call. points: [[x,y], ...]."""
+    return _call('sketch_spline', sketch=sketch, points=points)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,16 +259,253 @@ def move_body(body: str, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> d
     return _call('move_body', body=body, dx=dx, dy=dy, dz=dz)
 
 
-@mcp.tool()
+@mcp.tool(**_annot(destructiveHint=True))
 def delete(token: str) -> dict:
     """Delete the entity referenced by a token (body, feature, sketch, ...)."""
     return _call('delete', token=token)
 
 
 # --------------------------------------------------------------------------- #
-# Parameters
+# Holes, construction geometry, sketch constraints/dimensions/editing
 # --------------------------------------------------------------------------- #
 @mcp.tool()
+def hole(sketch: str, x: float, y: float, diameter: float, depth: float = 0.0,
+         through_all: bool = False, kind: str = 'simple',
+         cbore_diameter: float = 0.0, cbore_depth: float = 0.0,
+         csink_diameter: float = 0.0, csink_angle: float = 90.0) -> dict:
+    """Create a hole at point (x,y) mm on a sketch. kind: simple|counterbore|
+    countersink. Set through_all=True or give depth (mm). Counterbore needs
+    cbore_diameter/cbore_depth; countersink needs csink_diameter/csink_angle."""
+    return _call('hole', sketch=sketch, x=x, y=y, diameter=diameter, depth=depth,
+                 through_all=through_all, kind=kind, cbore_diameter=cbore_diameter,
+                 cbore_depth=cbore_depth, csink_diameter=csink_diameter,
+                 csink_angle=csink_angle)
+
+
+@mcp.tool()
+def construction_plane(method: str = 'offset', base: str = 'XY', offset: float = 0.0,
+                       axis: str = 'X', angle: float = 0.0, points: list[str] = [],
+                       face: str = '') -> dict:
+    """Create a construction plane. method: "offset" (base plane/face + offset mm),
+    "angle" (base + axis + angle deg), "three_points" (3 point tokens),
+    "tangent" (cylindrical face + angle). Returns a plane token usable anywhere a
+    plane is accepted."""
+    return _call('construction_plane', method=method, base=base, offset=offset,
+                 axis=axis, angle=angle, points=points, face=face or None)
+
+
+@mcp.tool()
+def construction_axis(method: str = 'edge', edge: str = '', points: list[str] = [],
+                      face: str = '') -> dict:
+    """Create a construction axis. method: "edge" (linear edge token), "two_points"
+    (2 point tokens), "cylinder" (cylindrical face token). Returns an axis token."""
+    return _call('construction_axis', method=method, edge=edge or None,
+                 points=points, face=face or None)
+
+
+@mcp.tool()
+def construction_point(method: str = 'at_point', point: str = '', edges: list[str] = [],
+                       edge: str = '', plane: str = '') -> dict:
+    """Create a construction point. method: "at_point" (vertex/sketch-point token),
+    "two_edges" (2 edge tokens), "edge_plane" (edge token + plane)."""
+    return _call('construction_point', method=method, point=point or None,
+                 edges=edges, edge=edge or None, plane=plane or None)
+
+
+@mcp.tool()
+def sketch_constraint(sketch: str, kind: str, entities: list[str]) -> dict:
+    """Add a geometric constraint. kind: horizontal|vertical (1 line),
+    parallel|perpendicular|equal|collinear (2 lines), tangent|concentric
+    (2 curves), coincident (point+curve/point), midpoint (point+line).
+    entities are curve/point tokens (see sketch_line/sketch_circle returns)."""
+    return _call('sketch_constraint', sketch=sketch, kind=kind, entities=entities)
+
+
+@mcp.tool()
+def sketch_dimension(sketch: str, kind: str, entities: list[str],
+                     text_x: float = 0.0, text_y: float = 0.0,
+                     parameter: str = '') -> dict:
+    """Add a driving dimension. kind: distance (2 tokens), radius|diameter
+    (circle/arc token), angle (2 lines). text_x/text_y (mm) place the dimension
+    text. Pass parameter to name the created dimension parameter for later reuse."""
+    return _call('sketch_dimension', sketch=sketch, kind=kind, entities=entities,
+                 text_x=text_x, text_y=text_y, parameter=parameter or None)
+
+
+@mcp.tool()
+def project_to_sketch(sketch: str, entities: list[str]) -> dict:
+    """Project edges/faces/vertices (tokens) onto a sketch. Returns tokens of the
+    new projected sketch curves."""
+    return _call('project_to_sketch', sketch=sketch, entities=entities)
+
+
+@mcp.tool()
+def sketch_offset(sketch: str, curves: list[str], distance: float,
+                  dir_x: float = 0.0, dir_y: float = 0.0) -> dict:
+    """Offset sketch curve tokens by `distance` mm. (dir_x,dir_y) mm picks the
+    side to offset toward. Returns tokens of the new offset curves."""
+    return _call('sketch_offset', sketch=sketch, curves=curves, distance=distance,
+                 dir_x=dir_x, dir_y=dir_y)
+
+
+@mcp.tool()
+def sketch_fillet(sketch: str, line1: str, line2: str, radius: float) -> dict:
+    """Add a 2D fillet of `radius` mm between two sketch lines sharing an endpoint."""
+    return _call('sketch_fillet', sketch=sketch, line1=line1, line2=line2, radius=radius)
+
+
+# --------------------------------------------------------------------------- #
+# Advanced features
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+def loft(profiles: list[str], rails: list[str] = [], operation: str = 'new') -> dict:
+    """Loft through 2+ profile tokens (ordered). Optional rails (curve/edge
+    tokens) guide the shape. operation: new|join|cut|intersect."""
+    return _call('loft', profiles=profiles, rails=rails, operation=operation)
+
+
+@mcp.tool()
+def sweep(profile: str, path: str, twist_angle: float = 0.0,
+          operation: str = 'new') -> dict:
+    """Sweep a profile token along a path (curve/edge token). twist_angle in deg.
+    operation: new|join|cut|intersect."""
+    return _call('sweep', profile=profile, path=path, twist_angle=twist_angle,
+                 operation=operation)
+
+
+@mcp.tool()
+def rib(curves: list[str], thickness: float, symmetric: bool = True,
+        depth: float = 0.0) -> dict:
+    """Create a rib from open sketch curve tokens with `thickness` mm.
+    symmetric centres thickness on the curves; depth (mm) sets extent if given."""
+    return _call('rib', curves=curves, thickness=thickness, symmetric=symmetric,
+                 depth=depth)
+
+
+@mcp.tool()
+def draft(faces: list[str], neutral_plane: str, angle: float,
+          tangent_chain: bool = True) -> dict:
+    """Apply a draft `angle` deg to face tokens, pulled from a neutral plane
+    (plane name or planar-face token)."""
+    return _call('draft', faces=faces, neutral_plane=neutral_plane, angle=angle,
+                 tangent_chain=tangent_chain)
+
+
+@mcp.tool()
+def thread(face: str, internal: bool = False, modeled: bool = True) -> dict:
+    """Add a thread to a cylindrical face token, sized from Fusion's recommended
+    thread data. modeled=True cuts real geometry; False is cosmetic."""
+    return _call('thread', face=face, internal=internal, modeled=modeled)
+
+
+@mcp.tool()
+def split_body(body: str, tool: str, extend_tool: bool = True) -> dict:
+    """Split a body token with a tool: a body/face token, or a plane name
+    ("XY"/"XZ"/"YZ") / construction-plane token."""
+    return _call('split_body', body=body, tool=tool, extend_tool=extend_tool)
+
+
+# --------------------------------------------------------------------------- #
+# Assemblies: components, joints, rename, copy
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+def create_component(name: str = '') -> dict:
+    """Create a new empty component (as an occurrence under the root).
+    Returns component + occurrence tokens."""
+    return _call('create_component', name=name or None)
+
+
+@mcp.tool()
+def rename(token: str, new_name: str) -> dict:
+    """Rename any named entity by token: body, sketch, component, feature or
+    occurrence."""
+    return _call('rename', token=token, new_name=new_name)
+
+
+@mcp.tool()
+def copy_body(bodies: list[str], target: str = '') -> dict:
+    """Copy body tokens (into an optional target component/occurrence token).
+    Returns tokens of the pasted bodies."""
+    return _call('copy_body', bodies=bodies, target=target or None)
+
+
+@mcp.tool()
+def joint(geo0: str, geo1: str, motion: str = 'rigid', axis: str = 'Z') -> dict:
+    """Create a joint between two geometry tokens (planar faces recommended).
+    motion: rigid|revolute|slider|cylindrical|pin_slot|planar|ball. axis
+    ("X"/"Y"/"Z") sets the rotation/slide axis for the relevant motions."""
+    return _call('joint', geo0=geo0, geo1=geo1, motion=motion, axis=axis)
+
+
+# --------------------------------------------------------------------------- #
+# Materials, measurement, import, timeline
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+def set_material(body: str, material: str, library: str = '') -> dict:
+    """Assign a physical material (e.g. "Steel", "Aluminum 6061") to a body
+    token — changes its computed mass. Optional library name to disambiguate."""
+    return _call('set_material', body=body, material=material, library=library or None)
+
+
+@mcp.tool()
+def set_appearance(body: str, appearance: str, library: str = '') -> dict:
+    """Assign an appearance (colour/finish) to a body token. Optional library."""
+    return _call('set_appearance', body=body, appearance=appearance,
+                 library=library or None)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def measure(a: str, b: str, kind: str = 'distance') -> dict:
+    """Measure between two geometry tokens. kind: "distance" (minimum distance,
+    mm) or "angle" (degrees)."""
+    return _call('measure', a=a, b=b, kind=kind)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def bounding_box(body: str = '') -> dict:
+    """Axis-aligned bounding box in mm (min/max points and x/y/z size). Pass a
+    body token, or omit for the whole model."""
+    return _call('bounding_box', body=body or None)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def center_of_mass(body: str) -> dict:
+    """Centre of mass of a body token, in mm (runs a mass-properties solve)."""
+    return _call('center_of_mass', body=body)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def interference(bodies: list[str]) -> dict:
+    """Detect interference (overlap) between two or more body tokens. Returns
+    interfering pairs with overlap volume (mm^3)."""
+    return _call('interference', bodies=bodies)
+
+
+@mcp.tool()
+def import_file(format: str, path: str, plane: str = 'XY') -> dict:
+    """Import a CAD file. format: step|iges|sat|smt|f3d (into the root) or dxf
+    (2D sketch onto `plane`: "XY"/"XZ"/"YZ" or a planar-face token)."""
+    return _call('import_file', format=format, path=path, plane=plane)
+
+
+@mcp.tool()
+def timeline(action: str = 'list', position: int = 0) -> dict:
+    """Inspect or roll back the parametric timeline. action: "list" (items with
+    index/name/suppressed) or "rollback" (move the marker to `position`)."""
+    return _call('timeline', action=action, position=position)
+
+
+@mcp.tool()
+def suppress_feature(feature: str, suppress: bool = True) -> dict:
+    """Suppress (or unsuppress with suppress=False) a feature token in the
+    timeline. Parametric designs only."""
+    return _call('suppress_feature', feature=feature, suppress=suppress)
+
+
+# --------------------------------------------------------------------------- #
+# Parameters
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
 def list_parameters() -> dict:
     """List all model and user parameters with names, expressions and units."""
     return _call('list_parameters')
@@ -223,7 +537,7 @@ def export(format: str, path: str, allow_fallback: bool = True) -> dict:
     return _call('export', format=format, path=path, allow_fallback=allow_fallback)
 
 
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
 def screenshot(path: str = '', width: int = 1024, height: int = 768,
                direction: str = 'current', fit: bool = False) -> Image:
     """Capture the active viewport and return it as an image so you can SEE the
@@ -246,7 +560,7 @@ def screenshot(path: str = '', width: int = 1024, height: int = 768,
     return Image(data=base64.b64decode(b64), format='png')
 
 
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
 def capture_to_file(path: str, width: int = 1024, height: int = 768,
                     direction: str = 'current', fit: bool = False) -> dict:
     """Save the viewport to a PNG file WITHOUT returning the image bytes. Use
@@ -326,5 +640,168 @@ def run_fusion_code(code: str) -> dict:
     return _call('run_code', code=code)
 
 
+# --------------------------------------------------------------------------- #
+# BOM, sketch text / engraving, sheet metal, meshes, drawings
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def bom(include_mass: bool = True, csv_path: str = '') -> dict:
+    """Bill of materials for the active design: one row per component with
+    quantity, body count, materials and per-unit mass (kg) plus the assembly's
+    total mass. Set csv_path (absolute path) to also write the table as CSV."""
+    return _call('bom', include_mass=include_mass, csv_path=csv_path or None)
+
+
+@mcp.tool()
+def sketch_text(sketch: str, text: str, x: float = 0.0, y: float = 0.0,
+                height: float = 10.0, font: str = '', bold: bool = False,
+                italic: bool = False, angle: float = 0.0) -> dict:
+    """Add text to a sketch at (x, y) mm with cap height `height` mm. Optional
+    font name, bold/italic, rotation angle (deg). The returned text token can be
+    extruded directly or passed to emboss for engraving."""
+    return _call('sketch_text', sketch=sketch, text=text, x=x, y=y, height=height,
+                 font=font or None, bold=bold, italic=italic, angle=angle)
+
+
+@mcp.tool()
+def emboss(profile: str, depth: float, engrave: bool = True) -> dict:
+    """Engrave (engrave=True, cuts into the solid below the sketch plane) or
+    emboss (engrave=False, raises material above it) a sketch-text or profile
+    token, `depth` mm deep. Typical flow: sketch on a face -> sketch_text ->
+    emboss."""
+    return _call('emboss', profile=profile, depth=depth, engrave=engrave)
+
+
+@mcp.tool()
+def flat_pattern(face: str = '', body: str = '') -> dict:
+    """Create (or reuse) the flat pattern of a sheet-metal body. Pass the
+    stationary planar face token, or just the body token (its largest planar
+    face is used). The body must be sheet metal (uniform thickness)."""
+    return _call('flat_pattern', face=face or None, body=body or None)
+
+
+@mcp.tool()
+def export_flat_pattern(path: str, face: str = '', body: str = '') -> dict:
+    """Export the flat pattern as a DXF outline ready for laser/waterjet
+    cutting. Creates the flat pattern first when a face/body token is given and
+    none exists yet."""
+    return _call('export_flat_pattern', path=path, face=face or None,
+                 body=body or None)
+
+
+@mcp.tool()
+def export_sketch_dxf(sketch: str, path: str) -> dict:
+    """Save a sketch (token) as a 2D DXF file — fully scripted 2D output for
+    laser cutting or documentation, no drawing sheet needed."""
+    return _call('export_sketch_dxf', sketch=sketch, path=path)
+
+
+@mcp.tool()
+def import_mesh(path: str, units: str = 'mm') -> dict:
+    """Insert an STL/OBJ/3MF scan or mesh file and return mesh tokens. units:
+    mm|cm|m|in|ft — mesh files carry no units, so pick what the scan was
+    exported in. Reverse-engineering entry point (see mesh_to_brep,
+    mesh_section)."""
+    return _call('import_mesh', path=path, units=units)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def mesh_info(mesh: str = '') -> dict:
+    """Triangle/node counts and bounding box of mesh bodies. Pass a mesh token,
+    or omit to report every mesh in the design."""
+    return _call('mesh_info', mesh=mesh or None)
+
+
+@mcp.tool()
+def mesh_to_brep(meshes: list[str] = []) -> dict:
+    """Convert mesh bodies (tokens; all meshes when omitted) into solid BRep
+    bodies so every solid tool works on them (combine, split_body, measure,
+    export STEP...). Dense scans convert as faceted solids — consider reducing
+    the mesh in Fusion first."""
+    return _call('mesh_to_brep', meshes=meshes)
+
+
+@mcp.tool()
+def mesh_section(mesh: str, plane: str = 'XY', offset: float = 0.0) -> dict:
+    """Slice a mesh with a plane ("XY"/"XZ"/"YZ" or a plane token) at `offset`
+    mm, producing a section sketch of the scan's cross-section — trace it with
+    sketch_polyline/sketch_spline and dimensions to rebuild the part
+    parametrically."""
+    return _call('mesh_section', mesh=mesh, plane=plane, offset=offset)
+
+
+@mcp.tool()
+def create_drawing() -> dict:
+    """Open Fusion's "Drawing from Design" dialog for the active design (the
+    Fusion API cannot build drawing sheets headlessly — the user completes the
+    sheet setup in the UI). For fully scripted 2D output use export_sketch_dxf
+    or export_flat_pattern."""
+    return _call('create_drawing')
+
+
+# --------------------------------------------------------------------------- #
+# Resources — read-only views a client can fetch without invoking a tool
+# --------------------------------------------------------------------------- #
+@mcp.resource('fusion://design/state')
+def resource_state() -> str:
+    """Current design summary (bodies, sketches, parameters) as JSON."""
+    return json.dumps(_call('get_state'), ensure_ascii=False)
+
+
+@mcp.resource('fusion://design/parameters')
+def resource_parameters() -> str:
+    """All model/user parameters as JSON."""
+    return json.dumps(_call('list_parameters'), ensure_ascii=False)
+
+
+@mcp.resource('fusion://design/tree')
+def resource_tree() -> str:
+    """Component/occurrence hierarchy as JSON."""
+    return json.dumps(_call('query_entities', kind='occurrences'), ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
+# Prompts — reusable, parameterised task templates
+# --------------------------------------------------------------------------- #
+@mcp.prompt()
+def parametric_bracket(width_mm: float = 60, height_mm: float = 40,
+                       thickness_mm: float = 5) -> str:
+    """Guide the model to build a parametric mounting bracket."""
+    return (
+        'Build a parametric L-bracket in Fusion 360 using the FusionMCP tools.\n'
+        f'Target size: {width_mm}x{height_mm} mm, wall thickness {thickness_mm} mm.\n'
+        'Steps: (1) call get_state to orient; (2) add user parameters for width, '
+        'height and thickness with add_parameter; (3) sketch the L-profile and '
+        'extrude it; (4) add mounting holes with the hole tool; (5) fillet the '
+        'inner corner; (6) screenshot direction="iso" fit=True to verify. Prefer '
+        'batch for multi-step construction.'
+    )
+
+
+@mcp.prompt()
+def prepare_for_3d_print(clearance_mm: float = 0.2) -> str:
+    """Guide the model to sanity-check a part for 3D printing."""
+    return (
+        'Review the active Fusion design for 3D printing. Use get_state and '
+        'bounding_box to report overall size. Check wall thickness and add '
+        f'{clearance_mm} mm clearance to mating features by editing parameters. '
+        'Finally export STL with the export tool and confirm the file path.'
+    )
+
+
+@mcp.prompt()
+def assemble_components() -> str:
+    """Guide the model to build a multi-component assembly with joints."""
+    return (
+        'Create a multi-component assembly. For each part call create_component, '
+        'build its geometry inside, then use query_entities kind="occurrences" to '
+        'list them and the joint tool (planar-face tokens) to constrain motion. '
+        'Verify with a screenshot direction="iso" fit=True.'
+    )
+
+
 if __name__ == '__main__':
+    # Non-blocking: checks GitHub and pre-downloads a newer version so the
+    # first tool result can announce it (with release notes). Installation
+    # still happens only via apply_update(confirm=True).
+    updater.start_background_check()
     mcp.run()

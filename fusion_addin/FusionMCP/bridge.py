@@ -15,11 +15,12 @@ import json
 import socket
 import struct
 import threading
+import time
 import traceback
 
 import adsk.core
-
 import commands
+import logutil
 
 HOST = '127.0.0.1'
 PORT = 9123
@@ -87,16 +88,27 @@ class _ExecHandler(adsk.core.CustomEventHandler):
             job = _state['pending'].get(job_id)
             if not job:
                 return
+            op = job['op']
+            start = time.time()
+            ok = True
             try:
-                result = commands.dispatch(_state['app'], job['op'], job['params'])
+                result = commands.dispatch(_state['app'], op, job['params'])
                 job['response'] = {'ok': True, 'result': result}
             except Exception as exc:  # noqa: BLE001 - report any API error back to client
+                ok = False
                 job['response'] = {
                     'ok': False,
                     'error': '{}: {}'.format(type(exc).__name__, exc),
                     'traceback': traceback.format_exc(),
                 }
             finally:
+                elapsed_ms = (time.time() - start) * 1000.0
+                try:
+                    logutil.record(op, elapsed_ms, ok)
+                    logutil.get_logger().info(
+                        '%s %s %.1fms', op, 'ok' if ok else 'error', elapsed_ms)
+                except Exception:
+                    pass
                 job['event'].set()
         except Exception:
             # Last-ditch: never let an exception escape the handler.
@@ -199,6 +211,10 @@ def start_server(app):
     thread = threading.Thread(target=_serve, name='FusionMCPServer', daemon=True)
     thread.start()
     _state['thread'] = thread
+    try:
+        logutil.get_logger().info('bridge started on %s:%s', HOST, PORT)
+    except Exception:
+        pass
 
 
 def stop_server():

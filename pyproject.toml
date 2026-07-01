@@ -1,0 +1,18 @@
+# Repo-level tooling config (ruff + pytest). The runtime package lives in
+# mcp_server/pyproject.toml; this file only drives linting and the test suite.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["**/__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+# The codebase intentionally uses %/.format() (UP not selected). S102 (exec) is
+# a deliberate escape hatch in run_code and BLE001 broad-except keeps API errors
+# from escaping the socket loop. B006/B904 flag existing patterns kept as-is.
+ignore = ["B006", "B008", "B904"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
