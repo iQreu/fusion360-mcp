@@ -12,7 +12,9 @@ import contextlib
 import csv
 import io
 import math
+import os
 import re
+import tempfile
 import traceback
 
 import adsk.core
@@ -20,7 +22,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -35,6 +37,7 @@ _READ_ONLY_OPS = frozenset({
     'ping', 'server_info', 'get_state', 'query_entities', 'list_parameters',
     'measure', 'bounding_box', 'center_of_mass', 'interference', 'screenshot',
     'fit_view', 'timeline', 'bom', 'mesh_info',
+    'get_selection', 'highlight', 'multi_screenshot',
 })
 
 
@@ -1469,6 +1472,233 @@ def op_create_drawing(app, p):
 
 
 # --------------------------------------------------------------------------- #
+# Interaction: user selection, highlighting, visibility, isolate, undo
+# --------------------------------------------------------------------------- #
+# Token prefix per API object type for selection/highlight round-tripping.
+_SELECTION_KINDS = {
+    'BRepFace': ('fac', 'face'),
+    'BRepEdge': ('edg', 'edge'),
+    'BRepVertex': ('vtx', 'vertex'),
+    'BRepBody': ('bdy', 'body'),
+    'MeshBody': ('msh', 'mesh'),
+    'Occurrence': ('occ', 'occurrence'),
+    'Sketch': ('skt', 'sketch'),
+    'Profile': ('prf', 'profile'),
+    'SketchLine': ('lin', 'sketch_line'),
+    'SketchCircle': ('cir', 'sketch_circle'),
+    'SketchArc': ('arc', 'sketch_arc'),
+    'SketchPoint': ('spt', 'sketch_point'),
+    'ConstructionPlane': ('pln', 'construction_plane'),
+    'ConstructionAxis': ('cax', 'construction_axis'),
+    'ConstructionPoint': ('cpt', 'construction_point'),
+    'JointOrigin': ('jor', 'joint_origin'),
+}
+
+
+def op_get_selection(app, p):
+    """What the user currently has selected in the Fusion UI, as tokens — so
+    they can click a face/edge/body and say "here". Faces report centroid and
+    surface type, edges report length, so the geometry is identifiable."""
+    out = []
+    for sel in app.userInterface.activeSelections:
+        ent = sel.entity
+        type_name = ent.objectType.split('::')[-1]
+        prefix, kind = _SELECTION_KINDS.get(type_name, ('ent', type_name))
+        item = {'token': _registry.add(prefix, ent), 'kind': kind}
+        with contextlib.suppress(Exception):
+            item['name'] = ent.name
+        if kind == 'face':
+            with contextlib.suppress(Exception):
+                item['type'] = _surface_type(ent)
+                item['centroid_mm'] = _xyz_mm(ent.centroid)
+        elif kind == 'edge':
+            with contextlib.suppress(Exception):
+                item['length_mm'] = round(ent.length / MM, 3)
+        elif kind == 'sketch_point':
+            with contextlib.suppress(Exception):
+                item['point_mm'] = _xyz_mm(ent.worldGeometry)
+        out.append(item)
+    return {'count': len(out), 'selection': out}
+
+
+def op_highlight(app, p):
+    """Select the given tokens in the Fusion UI so the user SEES which entities
+    are meant ("I would fillet these edges — OK?"). Replaces the current
+    selection; empty tokens list just clears it."""
+    sels = app.userInterface.activeSelections
+    sels.clear()
+    added = []
+    for tok in p.get('tokens') or []:
+        try:
+            sels.add(_registry.get(tok))
+            added.append(tok)
+        except Exception:
+            pass  # entity may be hidden or not selectable; highlight the rest
+    return {'highlighted': added, 'count': len(added)}
+
+
+def _set_visible(obj, visible):
+    """Toggle visibility via isLightBulbOn (the settable toggle on bodies,
+    occurrences, construction geometry) falling back to isVisible (sketches)."""
+    try:
+        obj.isLightBulbOn = bool(visible)
+        return 'isLightBulbOn'
+    except Exception:
+        obj.isVisible = bool(visible)
+        return 'isVisible'
+
+
+def _get_visible(obj):
+    for attr in ('isLightBulbOn', 'isVisible'):
+        with contextlib.suppress(Exception):
+            return bool(getattr(obj, attr))
+    return True
+
+
+def op_set_visibility(app, p):
+    """Show/hide entities by token (bodies, occurrences, sketches, meshes,
+    construction geometry). Hidden bodies don't render on screenshots."""
+    visible = bool(p.get('visible', True))
+    done, failed = [], []
+    for tok in p.get('tokens') or []:
+        try:
+            _set_visible(_registry.get(tok), visible)
+            done.append(tok)
+        except Exception as exc:
+            failed.append({'token': tok, 'error': str(exc)})
+    out = {'visible': visible, 'changed': done}
+    if failed:
+        out['failed'] = failed
+    return out
+
+
+def _same_entity(a, b):
+    """Identity across Fusion API proxy objects (each collection access returns
+    a fresh proxy, so `is` never matches)."""
+    with contextlib.suppress(Exception):
+        return a.entityToken == b.entityToken
+    with contextlib.suppress(Exception):
+        return a == b
+    return a is b
+
+
+_isolate_stash = None  # [(proxy, previous_visibility)] while isolated
+
+
+def op_isolate(app, p):
+    """Show ONLY the given body/occurrence/mesh token: hides every other root
+    body, occurrence and mesh, remembering their state for unisolate. Great
+    before screenshots of a single part inside an assembly."""
+    global _isolate_stash
+    if _isolate_stash is not None:
+        raise RuntimeError('Already isolated; call unisolate first.')
+    target = _registry.get(p['token'])
+    keep = [target]
+    # An occurrence chain that owns the target must stay visible too.
+    with contextlib.suppress(Exception):
+        ctx = target.assemblyContext
+        while ctx:
+            keep.append(ctx)
+            ctx = ctx.assemblyContext
+    root = _root(app)
+    stash, hidden = [], 0
+    for coll in (root.bRepBodies, root.occurrences, root.meshBodies):
+        for obj in coll:
+            if any(_same_entity(obj, k) for k in keep):
+                continue
+            prev = _get_visible(obj)
+            stash.append((obj, prev))
+            if prev:
+                with contextlib.suppress(Exception):
+                    _set_visible(obj, False)
+                    hidden += 1
+    _set_visible(target, True)
+    _isolate_stash = stash
+    return {'isolated': p['token'], 'hidden': hidden}
+
+
+def op_unisolate(app, p):
+    """Restore the visibility state saved by isolate."""
+    global _isolate_stash
+    if _isolate_stash is None:
+        return {'restored': 0, 'note': 'Nothing is isolated.'}
+    restored = 0
+    for obj, prev in _isolate_stash:
+        with contextlib.suppress(Exception):
+            _set_visible(obj, prev)
+            restored += 1
+    _isolate_stash = None
+    return {'restored': restored}
+
+
+def op_multi_screenshot(app, p):
+    """Capture several camera presets in ONE round-trip (e.g. iso/front/top/
+    right) so the model is visible from all sides at once. Returns one base64
+    PNG per direction."""
+    directions = p.get('directions') or ['iso', 'front', 'top', 'right']
+    width = int(p.get('width', 800))
+    height = int(p.get('height', 600))
+    base = p.get('base_path') or ''
+    shots = []
+    for d in directions:
+        vp = _apply_camera_direction(app, d, p.get('fit', True))
+        path = ((base + '_' + d + '.png') if base
+                else os.path.join(tempfile.gettempdir(), 'fusion_mcp_%s.png' % d))
+        vp.saveAsImageFile(path, width, height)
+        with open(path, 'rb') as fh:
+            b64 = base64.b64encode(fh.read()).decode('ascii')
+        shots.append({'direction': d, 'path': path, 'image_base64': b64})
+    return {'count': len(shots), 'shots': shots}
+
+
+def op_section_view(app, p):
+    """Turn on a section-analysis view: slices the display (not the geometry)
+    with a plane at `offset` mm — see inside pockets, shells and housings on
+    screenshots. Requires Fusion with the section-analysis API (2023+)."""
+    design = _design(app)
+    analyses = getattr(design, 'analyses', None)
+    sections = getattr(analyses, 'sectionAnalyses', None) if analyses else None
+    if sections is None:
+        raise RuntimeError('Section analysis is not available in this Fusion '
+                           'version; use split_body on a copy instead.')
+    plane = _resolve_plane(app, p.get('plane', 'XY'))
+    sin = sections.createInput(plane, p.get('offset', 0.0) * MM)
+    section = sections.add(sin)
+    return {'section': _registry.add('sec', section),
+            'plane': str(p.get('plane', 'XY')), 'offset_mm': p.get('offset', 0.0)}
+
+
+def op_section_off(app, p):
+    """Remove all section-analysis views (restore the full display)."""
+    design = _design(app)
+    analyses = getattr(design, 'analyses', None)
+    sections = getattr(analyses, 'sectionAnalyses', None) if analyses else None
+    removed = 0
+    if sections is not None:
+        for i in range(sections.count - 1, -1, -1):
+            with contextlib.suppress(Exception):
+                sections.item(i).deleteMe()
+                removed += 1
+    return {'removed': removed}
+
+
+def op_undo(app, p):
+    """Undo the last `steps` operations via Fusion's undo stack. Entity tokens
+    issued before the undo may now point at deleted objects — re-query with
+    get_state/query_entities before reusing them."""
+    steps = max(1, int(p.get('steps', 1)))
+    done = 0
+    for _ in range(steps):
+        try:
+            app.executeTextCommand('Commands.Start UndoCommand')
+            done += 1
+        except Exception:
+            break
+    return {'undone': done, 'tokens_may_be_stale': True,
+            'note': 'Re-run get_state/query_entities before reusing old tokens.'}
+
+
+# --------------------------------------------------------------------------- #
 # I/O
 # --------------------------------------------------------------------------- #
 def _swap_ext(path, ext):
@@ -1835,6 +2065,15 @@ DISPATCH = {
     'mesh_to_brep': op_mesh_to_brep,
     'mesh_section': op_mesh_section,
     'create_drawing': op_create_drawing,
+    'get_selection': op_get_selection,
+    'highlight': op_highlight,
+    'set_visibility': op_set_visibility,
+    'isolate': op_isolate,
+    'unisolate': op_unisolate,
+    'multi_screenshot': op_multi_screenshot,
+    'section_view': op_section_view,
+    'section_off': op_section_off,
+    'undo': op_undo,
     'timeline': op_timeline,
     'suppress_feature': op_suppress_feature,
     'list_parameters': op_list_parameters,

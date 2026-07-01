@@ -52,8 +52,18 @@ Jednostki na łączu: **długości w mm, kąty w stopniach**. Geometria adresowa
 
 **Stan i inspekcja**: `get_state(include_mass_props=False)`,
 `query_entities(kind, target, include_mass_props=False)` (kind:
-`bodies|sketches|profiles|faces|edges|occurrences`), `server_info` (wersja,
-uptime, telemetria czasów per-operacja)
+`bodies|sketches|profiles|faces|edges|occurrences|meshes`), `server_info`
+(wersja, uptime, telemetria czasów per-operacja)
+**Interakcja z użytkownikiem**: `get_selection` — tokeny tego, co użytkownik
+zaznaczył myszą w Fusion („kliknij ścianę i powiedz: tutaj"), `highlight(tokens)`
+— Claude podświetla encje w UI, żeby pokazać, o co mu chodzi, **zanim** wykona
+operację; `undo(steps)` — cofnięcie ostatnich operacji (tokeny sprzed undo mogą
+być nieaktualne — po nim odpytaj `get_state`)
+**Widok**: `set_visibility(tokens, visible)`, `isolate(token)` / `unisolate()`
+(pokaż tylko jedną część złożenia), `multi_screenshot(directions)` — kilka ujęć
+(np. iso/front/top/right) w **jednym** round-tripie, `section_view(plane, offset)`
+/ `section_off()` — przekrój widoku (wgląd do środka bez cięcia geometrii;
+Fusion 2023+)
 **Szkice**: `create_sketch`, `sketch_rectangle`, `sketch_circle`, `sketch_line`,
 `sketch_arc`, `sketch_polygon`, `sketch_points`, `sketch_polyline`, `sketch_spline`
 **Więzy i wymiary**: `sketch_constraint` (horizontal/vertical/parallel/
@@ -141,6 +151,7 @@ Co robi ten serwer:
 | Lżejszy payload | `screenshot` domyślnie 1024×768; `capture_to_file` zapisuje PNG bez zwracania base64 |
 | Cache stanu | `get_state`/`query_entities` są cache'owane i inwalidowane po każdej mutacji (licznik generacji) oraz przy zmianach struktury/parametrów w UI (sygnatura designu) — powtórne odpytania są natychmiastowe |
 | Mniej round-tripów w szkicu | `sketch_points`/`sketch_polyline`/`sketch_spline` — dziesiątki punktów/segmentów w jednym wywołaniu |
+| Mniej round-tripów w podglądzie | `multi_screenshot` — komplet ujęć (iso/front/top/right) w jednym wywołaniu i jednym dispatchu |
 | Telemetria | `server_info` zwraca liczbę wywołań i czasy (avg/max ms) per operacja — łatwe wykrycie wolnych operacji |
 
 **Personal — eksport.** Wersja Personal bywa ograniczona w formatach neutralnych

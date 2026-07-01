@@ -739,6 +739,90 @@ def create_drawing() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Interaction: selection, highlighting, visibility, multi-view, section, undo
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def get_selection() -> dict:
+    """What the user currently has selected in the Fusion UI, as reusable
+    tokens. Lets the user point with the mouse: ask them to click the
+    face/edge/body they mean, then call this instead of guessing geometry.
+    Faces report centroid/type, edges report length."""
+    return _call('get_selection')
+
+
+@mcp.tool()
+def highlight(tokens: list[str] = []) -> dict:
+    """Select the given tokens in the Fusion UI so the USER can see which
+    entities you mean — confirm before destructive edits ("I'll fillet these 4
+    edges — the highlighted ones — OK?"). Replaces the current selection; an
+    empty list clears it."""
+    return _call('highlight', tokens=tokens)
+
+
+@mcp.tool()
+def set_visibility(tokens: list[str], visible: bool = True) -> dict:
+    """Show or hide entities by token (bodies, occurrences, sketches, meshes,
+    construction geometry). Hidden bodies don't block screenshots."""
+    return _call('set_visibility', tokens=tokens, visible=visible)
+
+
+@mcp.tool()
+def isolate(token: str) -> dict:
+    """Show ONLY this body/occurrence/mesh, hiding everything else (state is
+    remembered). Ideal before screenshots of one part inside an assembly.
+    Restore with unisolate."""
+    return _call('isolate', token=token)
+
+
+@mcp.tool()
+def unisolate() -> dict:
+    """Restore the visibility state saved by isolate."""
+    return _call('unisolate')
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def multi_screenshot(directions: list[str] = [], width: int = 800,
+                     height: int = 600, fit: bool = True) -> list[Image]:
+    """Capture SEVERAL camera presets in one round-trip and return all images —
+    see the model from every side at once instead of one screenshot at a time.
+    directions defaults to ["iso", "front", "top", "right"]; presets as in
+    `screenshot`. Keep the resolution modest — this returns len(directions)
+    images."""
+    result = fusion.call('multi_screenshot', {
+        'directions': directions or None, 'width': width, 'height': height,
+        'fit': fit})
+    shots = result.get('shots') if isinstance(result, dict) else None
+    if not shots:
+        raise RuntimeError('multi_screenshot failed: {}'.format(result))
+    import base64
+    return [Image(data=base64.b64decode(s['image_base64']), format='png')
+            for s in shots if s.get('image_base64')]
+
+
+@mcp.tool()
+def section_view(plane: str = 'XY', offset: float = 0.0) -> dict:
+    """Slice the DISPLAY (not the geometry) with a section plane at `offset` mm
+    — screenshots then show the inside of pockets, shells and housings. plane:
+    "XY"/"XZ"/"YZ", a construction-plane or planar-face token. Turn off with
+    section_off. Requires Fusion 2023+."""
+    return _call('section_view', plane=plane, offset=offset)
+
+
+@mcp.tool()
+def section_off() -> dict:
+    """Remove all section-analysis views and restore the full display."""
+    return _call('section_off')
+
+
+@mcp.tool(**_annot(destructiveHint=True))
+def undo(steps: int = 1) -> dict:
+    """Undo the last `steps` operations in Fusion — the safety net after a
+    feature came out wrong. Tokens issued before the undo may point at deleted
+    entities: re-run get_state/query_entities before reusing them."""
+    return _call('undo', steps=steps)
+
+
+# --------------------------------------------------------------------------- #
 # Resources — read-only views a client can fetch without invoking a tool
 # --------------------------------------------------------------------------- #
 @mcp.resource('fusion://design/state')
