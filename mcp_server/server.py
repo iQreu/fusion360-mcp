@@ -925,9 +925,13 @@ def unisolate() -> dict:
     return _call('unisolate')
 
 
+# NOTE: deliberately no return annotation — `-> list[Image]` makes FastMCP try
+# to build a structured-output schema and pydantic cannot schematize Image,
+# which kills the whole server at import time. Unannotated, the Image list is
+# converted to image content blocks at runtime.
 @mcp.tool(**_annot(readOnlyHint=True))
 def multi_screenshot(directions: list[str] = [], width: int = 800,
-                     height: int = 600, fit: bool = True) -> list[Image]:
+                     height: int = 600, fit: bool = True):
     """Capture SEVERAL camera presets in one round-trip and return all images —
     see the model from every side at once instead of one screenshot at a time.
     directions defaults to ["iso", "front", "top", "right"]; presets as in
