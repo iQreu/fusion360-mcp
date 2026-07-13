@@ -112,9 +112,14 @@ klasyfikacja otwór/czop), grubość ścianek — gotowy plan odbudowy;
 parametrycznej odbudowy jednym `batch`; `scan_deviation(scan, model_stl)` —
 raport odchyłek odbudowa↔skan (pętla: buduj → mierz → poprawiaj).
 Prompt `reverse_engineer_scan` prowadzi cały przepływ skan→CAD.
-**Rysunki 2D**: `create_drawing` — otwiera kreator „Drawing from Design"
-(API Fusion nie tworzy arkuszy w pełni automatycznie; skryptowalne 2D to
-`export_sketch_dxf` / `export_flat_pattern`)
+**Rysunki 2D**: `create_drawing(template)` — na Fusion 2026+ tworzy rysunek
+headless (opcjonalnie z szablonu), na starszych otwiera kreator „Drawing from
+Design"; `drawing_export(path, pdf|dxf)` — eksport aktywnego rysunku;
+w pełni skryptowalne 2D bez arkusza: `export_sketch_dxf` / `export_flat_pattern`
+**Panel interaktywny (MCP Apps)**: `open_viewer` — w klientach z obsługą MCP
+Apps (m.in. Claude Desktop) otwiera w czacie panel z podglądem modelu
+(przyciski iso/front/top/…, Fit) i tabelą BOM — oglądanie modelu bez proszenia
+o kolejne screenshoty
 **Parametry**: `list_parameters`, `set_parameter`, `add_parameter`,
 `export_parameters(csv)` / `import_parameters(csv)` — tabela parametrów do/z
 arkusza kalkulacyjnego

@@ -18,6 +18,7 @@ import os
 
 import scan
 import updater
+import viewer
 from fusion_client import FusionClient, FusionError, FusionNotConnected
 from mcp.server.fastmcp import FastMCP, Image
 
@@ -815,12 +816,21 @@ def mesh_section(mesh: str, plane: str = 'XY', offset: float = 0.0) -> dict:
 
 
 @mcp.tool()
-def create_drawing() -> dict:
-    """Open Fusion's "Drawing from Design" dialog for the active design (the
-    Fusion API cannot build drawing sheets headlessly — the user completes the
-    sheet setup in the UI). For fully scripted 2D output use export_sketch_dxf
-    or export_flat_pattern."""
-    return _call('create_drawing')
+def create_drawing(template: str = '', headless: bool = True) -> dict:
+    """Create a drawing for the active design. Fusion 2026+ can do this
+    headlessly (optionally from a `template`); older versions get the
+    "Drawing from Design" dialog, which the user completes in the UI. Then
+    export it with drawing_export. For fully scripted 2D output without a
+    drawing sheet use export_sketch_dxf / export_flat_pattern."""
+    return _call('create_drawing', template=template or None, headless=headless)
+
+
+@mcp.tool()
+def drawing_export(path: str, format: str = 'pdf') -> dict:
+    """Export the active drawing document to "pdf" or "dxf" at `path` — the
+    final documentation step after create_drawing (and any manual sheet
+    tweaks the user made)."""
+    return _call('drawing_export', path=path, format=format)
 
 
 # --------------------------------------------------------------------------- #
@@ -1060,6 +1070,29 @@ def undo(steps: int = 1) -> dict:
     feature came out wrong. Tokens issued before the undo may point at deleted
     entities: re-run get_state/query_entities before reusing them."""
     return _call('undo', steps=steps)
+
+
+# --------------------------------------------------------------------------- #
+# MCP Apps: interactive viewer panel rendered in the chat (spec 2026-01-26).
+# Clients without the ui extension just see a normal tool result.
+# --------------------------------------------------------------------------- #
+@mcp.resource(viewer.VIEWER_URI, mime_type=viewer.VIEWER_MIME)
+def viewer_app() -> str:
+    """HTML for the interactive Fusion viewer panel (MCP Apps)."""
+    return viewer.VIEWER_HTML
+
+
+@mcp.tool(meta={'ui': {'resourceUri': viewer.VIEWER_URI}},
+          **_annot(readOnlyHint=True))
+def open_viewer() -> dict:
+    """Open an interactive viewport panel in the chat (MCP Apps): camera
+    preset buttons (iso/front/top/...), fit, and a live BOM table — the user
+    can look around the model without asking for screenshots one by one.
+    On clients without MCP Apps support this returns a plain message."""
+    return {'ok': True,
+            'note': 'Viewer panel requested. If no panel appeared, this MCP '
+                    'client does not support MCP Apps — use screenshot / '
+                    'multi_screenshot instead.'}
 
 
 # --------------------------------------------------------------------------- #

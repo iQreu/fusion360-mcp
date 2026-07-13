@@ -23,7 +23,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.5.0'
+VERSION = '1.6.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -1891,26 +1891,100 @@ def op_mesh_section(app, p):
 # --------------------------------------------------------------------------- #
 # Drawings (2D documentation)
 # --------------------------------------------------------------------------- #
+def _try_headless_drawing(app, template):
+    """Best-effort headless drawing creation via the 2026 Drawings API. The
+    exact creation surface is young and thinly documented, so this probes a
+    few shapes and cleans up after itself; None means 'fall back to the UI'."""
+    try:
+        import adsk.drawing
+    except ImportError:
+        return None
+    doc = None
+    try:
+        doc_type = getattr(adsk.core.DocumentTypes, 'DrawingDocumentType', None)
+        if doc_type is None:
+            return None
+        doc = app.documents.add(doc_type)
+        product = doc.products.itemByProductType('DrawingProductType')
+        drawing = adsk.drawing.Drawing.cast(product) if product else None
+        if drawing is None:
+            raise RuntimeError('no DrawingProductType on the new document')
+        if template:
+            applied = False
+            for attr in ('applyTemplate', 'loadTemplate', 'setTemplate'):
+                fn = getattr(drawing, attr, None)
+                if fn:
+                    with contextlib.suppress(Exception):
+                        fn(template)
+                        applied = True
+                        break
+            if not applied:
+                raise RuntimeError('this Fusion build exposes no template API')
+        out = {'created': doc.name, 'headless': True}
+        with contextlib.suppress(Exception):
+            out['sheets'] = drawing.sheets.count
+        return out
+    except Exception:  # noqa: BLE001 - close the stray document, use the dialog
+        if doc is not None:
+            with contextlib.suppress(Exception):
+                doc.close(False)
+        return None
+
+
 def op_create_drawing(app, p):
-    """Open Fusion's "Drawing from Design" dialog for the active design. The
-    Fusion API cannot build drawing sheets headlessly, so the user finishes the
-    sheet setup in the UI. For fully scripted 2D output use export_sketch_dxf
-    or export_flat_pattern."""
+    """Create a drawing for the active design. Tries the headless Drawings API
+    first (Fusion 2026+; optional `template` path/name); when that is not
+    available it opens the "Drawing from Design" dialog for the user to finish.
+    For fully scripted 2D output use export_sketch_dxf / export_flat_pattern;
+    export a finished drawing with drawing_export."""
+    if p.get('headless', True):
+        result = _try_headless_drawing(app, p.get('template'))
+        if result is not None:
+            return result
     ui = app.userInterface
     cmd = None
-    for cmd_id in ('DrawingFromDesignCommand', 'NewDrawingFromDesignCommand',
-                   'FusionDrawingFromDesignCommand'):
+    for cmd_id in ('NewFusionDrawingDocumentCommand', 'DrawingFromDesignCommand',
+                   'NewDrawingFromDesignCommand', 'FusionDrawingFromDesignCommand'):
         cmd = ui.commandDefinitions.itemById(cmd_id)
         if cmd:
             break
     if not cmd:
-        raise RuntimeError('The drawing-from-design command is not available in '
-                           'this Fusion version. Use export_sketch_dxf / '
-                           'export_flat_pattern for scripted 2D output.')
+        raise RuntimeError('Headless drawing creation is unavailable and no '
+                           'drawing-from-design command was found. Use '
+                           'export_sketch_dxf / export_flat_pattern instead.')
     cmd.execute()
-    return {'launched': cmd.id,
+    return {'launched': cmd.id, 'headless': False,
             'note': 'Fusion opened the drawing dialog; the user completes the '
-                    'sheet setup interactively.'}
+                    'sheet setup interactively. Afterwards drawing_export can '
+                    'save it as PDF/DXF.'}
+
+
+def op_drawing_export(app, p):
+    """Export the ACTIVE drawing document to PDF or DXF. Open/create the
+    drawing first (create_drawing); works on whatever sheets it contains."""
+    doc = app.activeDocument
+    product = doc.products.itemByProductType('DrawingProductType') if doc else None
+    if not product:
+        raise RuntimeError('The active document is not a drawing. Switch to the '
+                           'drawing tab (or run create_drawing) first.')
+    try:
+        import adsk.drawing
+        drawing = adsk.drawing.Drawing.cast(product) or product
+    except ImportError:
+        drawing = product
+    em = getattr(drawing, 'exportManager', None)
+    if em is None:
+        raise RuntimeError('This Fusion version exposes no drawing export API.')
+    fmt = (p.get('format') or 'pdf').lower()
+    creators = {'pdf': 'createPDFExportOptions', 'dxf': 'createDXFExportOptions'}
+    if fmt not in creators:
+        raise ValueError('format must be pdf|dxf, got %r' % fmt)
+    creator = getattr(em, creators[fmt], None)
+    if creator is None:
+        raise RuntimeError('Drawing %s export is not available in this Fusion '
+                           'version.' % fmt.upper())
+    em.execute(creator(p['path']))
+    return {'exported': p['path'], 'format': fmt, 'document': doc.name}
 
 
 # --------------------------------------------------------------------------- #
@@ -2606,6 +2680,7 @@ DISPATCH = {
     'canvas_add': op_canvas_add,
     'mesh_section': op_mesh_section,
     'create_drawing': op_create_drawing,
+    'drawing_export': op_drawing_export,
     'get_selection': op_get_selection,
     'highlight': op_highlight,
     'set_visibility': op_set_visibility,

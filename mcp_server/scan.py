@@ -220,6 +220,9 @@ def _ransac_primitives(mesh, scale, max_primitives):
     pts, face_idx = _sample_surface(mesh, _SAMPLE_PRIMITIVES)
     normals = mesh.face_normals[face_idx]
     thresh = max(0.003 * scale, 0.02)
+    # pyransac3d draws with the global stdlib RNG; seed it so reports are
+    # reproducible run-to-run.
+    random.seed(0)
     cylinders = []
     remaining = np.arange(len(pts))
     for _ in range(max_primitives):
