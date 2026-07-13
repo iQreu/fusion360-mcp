@@ -95,10 +95,23 @@ token tekstu działa też w zwykłym `extrude`
 **Blachy**: `flat_pattern(face|body)` — rozwinięcie blachy,
 `export_flat_pattern(path, ...)` — DXF rozwinięcia pod laser/waterjet,
 `export_sketch_dxf(sketch, path)` — dowolny szkic jako DXF
-**Siatki / reverse engineering**: `import_mesh(path, units)` (stl/obj/3mf),
-`mesh_info`, `mesh_to_brep(meshes)` — konwersja skanu na bryłę,
-`mesh_section(mesh, plane, offset)` — szkic przekroju siatki do odrysowania;
+**Siatki / reverse engineering (w Fusion)**: `import_mesh(path, units)`
+(stl/obj/3mf), `mesh_info`, `mesh_reduce` (redukcja trójkątów: target_faces/
+proportion/max_deviation, adaptive|uniform), `mesh_remesh`,
+`mesh_plane_cut(mesh, plane, offset, mode)` — odcięcie stołu skanera / połówka
+symetrycznej części, `mesh_to_brep(meshes, method)` — konwersja skanu na bryłę
+(**faceted | prismatic** — rozpoznaje płaszczyzny i walce | organic),
+`mesh_section(mesh, plane, offset)` — szkic przekroju siatki,
+`canvas_add(image, plane, width_mm)` — skalibrowane zdjęcie jako podkład;
 `query_entities(kind="meshes")` listuje siatki
+**Analiza skanów (w serwerze, bez obciążania Fusion)** — wymaga opcjonalnych
+zależności `pip install -e "mcp_server[re]"` (numpy/trimesh/pyransac3d):
+`scan_analyze(path)` — wymiary, symetrie, płaszczyzny/walce/sfery (RANSAC,
+klasyfikacja otwór/czop), grubość ścianek — gotowy plan odbudowy;
+`scan_sections(path, axis, count)` — stos przekrojów jako okręgi/polilinie do
+parametrycznej odbudowy jednym `batch`; `scan_deviation(scan, model_stl)` —
+raport odchyłek odbudowa↔skan (pętla: buduj → mierz → poprawiaj).
+Prompt `reverse_engineer_scan` prowadzi cały przepływ skan→CAD.
 **Rysunki 2D**: `create_drawing` — otwiera kreator „Drawing from Design"
 (API Fusion nie tworzy arkuszy w pełni automatycznie; skryptowalne 2D to
 `export_sketch_dxf` / `export_flat_pattern`)

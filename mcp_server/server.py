@@ -16,6 +16,7 @@ Conventions
 import json
 import os
 
+import scan
 import updater
 from fusion_client import FusionClient, FusionError, FusionNotConnected
 from mcp.server.fastmcp import FastMCP, Image
@@ -753,12 +754,55 @@ def mesh_info(mesh: str = '') -> dict:
 
 
 @mcp.tool()
-def mesh_to_brep(meshes: list[str] = []) -> dict:
+def mesh_to_brep(meshes: list[str] = [], method: str = 'faceted') -> dict:
     """Convert mesh bodies (tokens; all meshes when omitted) into solid BRep
     bodies so every solid tool works on them (combine, split_body, measure,
-    export STEP...). Dense scans convert as faceted solids — consider reducing
-    the mesh in Fusion first."""
-    return _call('mesh_to_brep', meshes=meshes)
+    export STEP...). method: "faceted" (triangles as-is), "prismatic"
+    (recognises planes/cylinders — much cleaner solids from machine-part
+    scans; try it first), "organic" (T-Spline fit for freeform shapes).
+    Dense scans should go through mesh_reduce first."""
+    return _call('mesh_to_brep', meshes=meshes, method=method)
+
+
+@mcp.tool()
+def mesh_reduce(meshes: list[str] = [], target_faces: int = 0,
+                proportion: float = 0.0, max_deviation: float = 0.0,
+                method: str = 'adaptive') -> dict:
+    """Reduce a scan's triangle count (all meshes when tokens omitted) before
+    converting or sectioning. Pick ONE target: target_faces (absolute count),
+    proportion (percent of original, 0-100) or max_deviation (mm; the default,
+    0.05 mm, preserves shape). method: adaptive (keeps detail) | uniform."""
+    return _call('mesh_reduce', meshes=meshes, target_faces=target_faces or None,
+                 proportion=proportion or None,
+                 max_deviation=max_deviation or None, method=method)
+
+
+@mcp.tool()
+def mesh_remesh(meshes: list[str] = []) -> dict:
+    """Regenerate mesh triangulation (fixes slivers/degenerate triangles that
+    break mesh_to_brep). Default Fusion remesh settings."""
+    return _call('mesh_remesh', meshes=meshes)
+
+
+@mcp.tool()
+def mesh_plane_cut(mesh: str, plane: str = 'XY', offset: float = 0.0,
+                   mode: str = 'trim') -> dict:
+    """Cut a mesh with a plane at `offset` mm — chop scanner-table junk off a
+    scan, or keep half of a symmetric part and mirror it later. mode: "trim"
+    (discard one side) or "split" (keep both as separate meshes)."""
+    return _call('mesh_plane_cut', mesh=mesh, plane=plane, offset=offset,
+                 mode=mode)
+
+
+@mcp.tool()
+def canvas_add(image: str, plane: str = 'XY', width_mm: float = 0.0,
+               opacity: int = 100) -> dict:
+    """Attach an image file (photo of a part) as a canvas on a plane —
+    reverse-engineer from a photo by tracing it with sketches. width_mm scales
+    the image to a known width; the user can fine-tune with right-click >
+    Calibrate in Fusion."""
+    return _call('canvas_add', image=image, plane=plane,
+                 width_mm=width_mm or None, opacity=opacity)
 
 
 @mcp.tool()
@@ -777,6 +821,53 @@ def create_drawing() -> dict:
     sheet setup in the UI). For fully scripted 2D output use export_sketch_dxf
     or export_flat_pattern."""
     return _call('create_drawing')
+
+
+# --------------------------------------------------------------------------- #
+# Scan analysis — runs IN THE SERVER PROCESS (no Fusion needed, no load on
+# Fusion's UI thread). Requires the optional "re" extras (numpy, scipy,
+# trimesh, pyransac3d); returns a clear install hint when they are missing.
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_analyze(path: str, max_primitives: int = 8) -> dict:
+    """Analyse a scan/mesh file (STL/OBJ/3MF, mm) WITHOUT Fusion: size, volume,
+    symmetry planes, RANSAC-fitted planes/cylinders/spheres with hole-vs-boss
+    classification, and wall thickness. The output is a rebuild plan: turn the
+    primitives into sketches/extrudes/holes with the parametric tools, then
+    check the result with scan_deviation."""
+    try:
+        return scan.analyze(path, max_primitives=max_primitives)
+    except Exception as exc:  # noqa: BLE001 - surface as a readable tool error
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_sections(path: str, axis: str = 'z', count: int = 8,
+                  heights: list[float] = [], max_points: int = 80) -> dict:
+    """Slice a scan file into cross-sections perpendicular to a world axis
+    (x|y|z) — at `count` even heights or explicit `heights` (mm). Returns per
+    slice: fitted circles (center/radius) and decimated polylines in
+    sketch-plane coordinates, ready to rebuild with construction_plane +
+    sketch_circle/sketch_polyline in one batch."""
+    try:
+        return scan.sections(path, axis=axis, count=count,
+                             heights=heights or None, max_points=max_points)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_deviation(scan_path: str, model_path: str, samples: int = 4000,
+                   tolerance: float = 0.2) -> dict:
+    """Compare the original scan with the rebuilt model: export the solid with
+    export("stl", ...) first, then call this. Returns two-way surface-distance
+    stats (mean/rms/p50/p90/p99/max) and the fraction within `tolerance` mm —
+    the verification loop of reverse engineering: rebuild, measure, refine."""
+    try:
+        return scan.deviation(scan_path, model_path, samples=samples,
+                              tolerance=tolerance)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1018,6 +1109,30 @@ def prepare_for_3d_print(clearance_mm: float = 0.2) -> str:
         'bounding_box to report overall size. Check wall thickness and add '
         f'{clearance_mm} mm clearance to mating features by editing parameters. '
         'Finally export STL with the export tool and confirm the file path.'
+    )
+
+
+@mcp.prompt()
+def reverse_engineer_scan(scan_path: str = '', tolerance_mm: float = 0.2) -> str:
+    """Guide the model through a full scan-to-parametric-CAD workflow."""
+    return (
+        'Reverse-engineer the scan%s into a clean parametric Fusion design '
+        '(target deviation <= %s mm).\n'
+        '1) scan_analyze(path) — size, symmetry, planes, cylinders (holes vs '
+        'bosses), wall thickness. If units look wrong, ask the user.\n'
+        '2) Choose a strategy: (a) prismatic machine part -> rebuild from the '
+        'fitted primitives with sketches, extrude, hole, fillet; (b) complex '
+        'silhouette -> scan_sections(axis=...) and rebuild contours per slice '
+        '(construction_plane + sketch_circle/sketch_polyline + loft/extrude, '
+        'in one batch); (c) organic shape -> import_mesh + mesh_reduce + '
+        'mesh_to_brep(method="organic" or "prismatic").\n'
+        '3) Exploit symmetry: model half, then mirror.\n'
+        '4) Add parameters (add_parameter) for key dimensions so the rebuild '
+        'is editable.\n'
+        '5) Verify: export("stl", temp_path) then scan_deviation(scan, temp) '
+        '— iterate on the worst regions until within tolerance.\n'
+        '6) Show the result: multi_screenshot + the deviation summary.'
+        % ((' at %r' % scan_path) if scan_path else '', tolerance_mm)
     )
 
 

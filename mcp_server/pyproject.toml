@@ -1,6 +1,6 @@
 [project]
 name = "fusion360-mcp"
-version = "1.4.0"
+version = "1.5.0"
 description = "Model Context Protocol server for Autodesk Fusion 360"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,13 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+]
+# Scan analysis for reverse engineering (scan_analyze/scan_sections/
+# scan_deviation) — heavy, so opt-in. The server runs fine without them.
+re = [
+    "numpy>=1.26",
+    "trimesh>=4.0",
+    "pyransac3d>=0.6",
 ]
 
 [tool.uv]

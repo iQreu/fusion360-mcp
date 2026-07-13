@@ -23,7 +23,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.4.0'
+VERSION = '1.5.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -1649,28 +1649,70 @@ def op_mesh_info(app, p):
     return {'count': len(out), 'meshes': out}
 
 
-def op_mesh_to_brep(app, p):
-    """Convert mesh bodies (tokens; all meshes when omitted) into BRep bodies —
-    the reverse-engineering gateway: after conversion the body works with every
-    solid tool (combine, split, measure, export STEP...). Uses the native
-    convert-mesh feature when this Fusion exposes it, else drives Fusion's
-    Convert Mesh command. Dense scans convert as faceted solids."""
-    root = _root(app)
-    meshes = ([_registry.get(t) for t in p.get('meshes') or []]
+def _fusion_enum(value_name):
+    """Look up an adsk.fusion enum VALUE by its name without knowing the enum
+    class (exact holder names vary across Fusion releases)."""
+    for attr in dir(adsk.fusion):
+        holder = getattr(adsk.fusion, attr, None)
+        value = getattr(holder, value_name, None)
+        if value is not None and not callable(value):
+            return value
+    raise RuntimeError('Enum value %r not found — this Fusion version may not '
+                       'support the requested option.' % value_name)
+
+
+def _mesh_targets(root, p, key='meshes'):
+    meshes = ([_registry.get(t) for t in p.get(key) or []]
               or list(root.meshBodies))
     if not meshes:
-        raise RuntimeError('No mesh bodies to convert; import one with import_mesh')
+        raise RuntimeError('No mesh bodies; import one with import_mesh')
+    return meshes
+
+
+_CONVERT_METHODS = {
+    'faceted': 'FacetedMeshConvertMethodType',
+    'prismatic': 'PrismaticMeshConvertMethodType',
+    'organic': 'OrganicMeshConvertMethodType',
+}
+
+
+def op_mesh_to_brep(app, p):
+    """Convert mesh bodies (tokens; all meshes when omitted) into BRep bodies —
+    the reverse-engineering gateway: after conversion every solid tool works
+    (combine, split, measure, export STEP...). method: faceted (default,
+    triangles as-is), prismatic (recognises planes/cylinders — much cleaner
+    solids from machine-part scans), organic (T-Spline fit). Uses the native
+    mesh-convert feature when available, else drives Fusion's Convert Mesh
+    command (faceted only)."""
+    root = _root(app)
+    meshes = _mesh_targets(root, p)
+    method = (p.get('method') or 'faceted').lower()
+    if method not in _CONVERT_METHODS:
+        raise ValueError('method must be faceted|prismatic|organic, got %r' % method)
     before = root.bRepBodies.count
-    native = getattr(root.features, 'convertMeshBodyFeatures', None)
     used = None
-    if native is not None:
+    feats = getattr(root.features, 'meshConvertFeatures', None)
+    if feats is not None:
         try:
             for m in meshes:
-                native.add(native.createInput(m))
-            used = 'convertMeshBodyFeatures'
-        except Exception:
+                try:
+                    cin = feats.createInput()
+                except TypeError:
+                    cin = feats.createInput(m)
+                coll = adsk.core.ObjectCollection.create()
+                coll.add(m)
+                with contextlib.suppress(Exception):
+                    cin.inputBodies = coll
+                if method != 'faceted':
+                    cin.meshConvertMethodType = _fusion_enum(_CONVERT_METHODS[method])
+                feats.add(cin)
+            used = 'meshConvertFeatures(%s)' % method
+        except Exception:  # noqa: BLE001 - fall back to the UI command below
             used = None
     if used is None:
+        if method != 'faceted':
+            raise RuntimeError('This Fusion version has no mesh-convert API; the '
+                               'command fallback only supports method="faceted".')
         # Documented workaround: select the meshes and run the UI command.
         sels = app.userInterface.activeSelections
         sels.clear()
@@ -1685,9 +1727,141 @@ def op_mesh_to_brep(app, p):
               for i in range(before, root.bRepBodies.count)]
     if not bodies:
         raise RuntimeError('Mesh conversion produced no BRep bodies (method: %s). '
-                           'Very dense scans may need Reduce in the MESH workspace '
-                           'first.' % used)
+                           'Dense scans usually need mesh_reduce first.' % used)
     return {'bodies': bodies, 'method': used}
+
+
+def _mesh_info_entry(m):
+    entry = {'token': _registry.add('msh', m), 'name': m.name}
+    with contextlib.suppress(Exception):
+        dm = m.displayMesh or m.mesh
+        entry['triangles'] = dm.triangleCount
+    return entry
+
+
+def op_mesh_reduce(app, p):
+    """Reduce a scan's triangle count before converting/sectioning. Target:
+    target_faces (absolute), proportion (0-100 % of the original), or
+    max_deviation (mm, default 0.05). method: adaptive (default, keeps detail)
+    or uniform. Requires the mesh-feature API (Fusion 2024+)."""
+    root = _root(app)
+    feats = getattr(root.features, 'meshReduceFeatures', None)
+    if feats is None:
+        raise RuntimeError('meshReduceFeatures not available in this Fusion '
+                           'version — use the MESH workspace Reduce command.')
+    out = []
+    for m in _mesh_targets(root, p):
+        try:
+            rin = feats.createInput()
+        except TypeError:
+            rin = feats.createInput(m)
+        with contextlib.suppress(Exception):
+            rin.mesh = m
+        if p.get('target_faces'):
+            rin.meshReduceTargetType = _fusion_enum('FaceCountMeshReduceTargetType')
+            rin.facecount = int(p['target_faces'])
+        elif p.get('proportion'):
+            rin.meshReduceTargetType = _fusion_enum('ProportionMeshReduceTargetType')
+            rin.proportion = float(p['proportion'])
+        else:
+            rin.meshReduceTargetType = _fusion_enum(
+                'MaximumDeviationMeshReduceTargetType')
+            rin.maximumDeviation = float(p.get('max_deviation', 0.05)) * MM
+        if (p.get('method') or 'adaptive').lower() == 'uniform':
+            rin.meshReduceMethodType = _fusion_enum('UniformReduceType')
+        feats.add(rin)
+        out.append(_mesh_info_entry(m))
+    return {'reduced': out}
+
+
+def op_mesh_remesh(app, p):
+    """Regenerate a mesh's triangulation (fixes long slivers before convert).
+    Requires the mesh-feature API (Fusion 2024+); defaults are used for the
+    remesh settings."""
+    root = _root(app)
+    feats = getattr(root.features, 'meshRemeshFeatures', None)
+    if feats is None:
+        raise RuntimeError('meshRemeshFeatures not available in this Fusion '
+                           'version — use the MESH workspace Remesh command.')
+    out = []
+    for m in _mesh_targets(root, p):
+        try:
+            rin = feats.createInput()
+        except TypeError:
+            rin = feats.createInput(m)
+        with contextlib.suppress(Exception):
+            rin.mesh = m
+        feats.add(rin)
+        out.append(_mesh_info_entry(m))
+    return {'remeshed': out}
+
+
+def op_mesh_plane_cut(app, p):
+    """Cut a mesh (token) with a plane ("XY"/"XZ"/"YZ", plane/face token) at
+    optional `offset` mm — chop off scanner-table junk or keep half of a
+    symmetric scan. mode: trim (drop one side, default), split (two bodies).
+    Requires the mesh-feature API (Fusion 2024+)."""
+    root = _root(app)
+    feats = getattr(root.features, 'meshPlaneCutFeatures', None)
+    if feats is None:
+        raise RuntimeError('meshPlaneCutFeatures not available in this Fusion '
+                           'version — use the MESH workspace Plane Cut command.')
+    mesh = _registry.get(p['mesh'])
+    plane = _resolve_plane(app, p.get('plane', 'XY'))
+    if p.get('offset'):
+        planes = root.constructionPlanes
+        cin = planes.createInput()
+        cin.setByOffset(plane, _vi(p['offset'] * MM))
+        plane = planes.add(cin)
+    try:
+        pin = feats.createInput()
+    except TypeError:
+        pin = feats.createInput(mesh, plane)
+    with contextlib.suppress(Exception):
+        pin.mesh = mesh
+    for attr in ('plane', 'cutPlane', 'cuttingPlane'):
+        with contextlib.suppress(Exception):
+            setattr(pin, attr, plane)
+            break
+    mode = (p.get('mode') or 'trim').lower()
+    if mode == 'split':
+        for name in ('SplitBodyMeshPlaneCutType', 'SplitMeshPlaneCutType'):
+            with contextlib.suppress(Exception):
+                pin.meshPlaneCutType = _fusion_enum(name)
+                break
+    feats.add(pin)
+    return {'cut': p['mesh'], 'mode': mode,
+            'meshes': [_mesh_info_entry(m) for m in root.meshBodies]}
+
+
+def op_canvas_add(app, p):
+    """Attach an image (photo of the part) as a canvas on a plane, optionally
+    scaled — trace it with sketches for reverse engineering without a 3D scan.
+    width_mm sets the printed width of the image on the plane; fine-tune with
+    Fusion's right-click Calibrate."""
+    root = _root(app)
+    canvases = getattr(root, 'canvases', None)
+    if canvases is None:
+        raise RuntimeError('Canvases are not available in this Fusion version.')
+    plane = _resolve_plane(app, p.get('plane', 'XY'))
+    cin = canvases.createInput(p['image'], plane)
+    with contextlib.suppress(Exception):
+        cin.opacity = int(p.get('opacity', 100))
+    if p.get('width_mm'):
+        with contextlib.suppress(Exception):
+            t = cin.transform
+            # transform is unitless: scale image pixels to the requested width.
+            current = abs(t.getCell(0, 0)) or 1.0
+            factor = (p['width_mm'] * MM) / current
+            scale = adsk.core.Matrix3D.create()
+            scale.setCell(0, 0, factor)
+            scale.setCell(1, 1, factor)
+            t.transformBy(scale)
+            cin.transform = t
+    canvas = canvases.add(cin)
+    return {'canvas': _registry.add('cnv', canvas),
+            'note': 'Use right-click > Calibrate in Fusion for exact two-point '
+                    'scaling if width_mm was approximate.'}
 
 
 def op_mesh_section(app, p):
@@ -2426,6 +2600,10 @@ DISPATCH = {
     'import_mesh': op_import_mesh,
     'mesh_info': op_mesh_info,
     'mesh_to_brep': op_mesh_to_brep,
+    'mesh_reduce': op_mesh_reduce,
+    'mesh_remesh': op_mesh_remesh,
+    'mesh_plane_cut': op_mesh_plane_cut,
+    'canvas_add': op_canvas_add,
     'mesh_section': op_mesh_section,
     'create_drawing': op_create_drawing,
     'get_selection': op_get_selection,
