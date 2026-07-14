@@ -19,6 +19,8 @@ EXPECTED = {
     'suppress_feature', 'list_parameters',
     'set_parameter', 'add_parameter', 'export', 'screenshot', 'fit_view',
     'save', 'set_design_mode', 'batch', 'run_code', 'reset_registry',
+    'electronics_info', 'electronics_components', 'electronics_nets',
+    'electronics_layers', 'electronics_library', 'electronics_export',
 }
 
 

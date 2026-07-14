@@ -23,7 +23,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.6.0'
+VERSION = '1.7.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -40,6 +40,8 @@ _READ_ONLY_OPS = frozenset({
     'fit_view', 'timeline', 'bom', 'mesh_info',
     'get_selection', 'highlight', 'multi_screenshot', 'list_documents',
     'mass_properties', 'cam_setups', 'export_parameters',
+    'electronics_info', 'electronics_components', 'electronics_nets',
+    'electronics_layers', 'electronics_library', 'electronics_export',
 })
 
 
@@ -2548,6 +2550,405 @@ def op_reset_registry(app, p):
 
 
 # --------------------------------------------------------------------------- #
+# Electronics (read-only) — schematics, PCBs and libraries via adsk.electron.
+# The Electronics API (Fusion May 2026+) is a read-only preview: inspect and
+# export, no editing. Its coordinates are ints in internal editor units
+# (1/320000 mm) and are converted to millimetres on the wire like everything
+# else in this file.
+# --------------------------------------------------------------------------- #
+def _electron():
+    try:
+        import adsk.electron
+    except ImportError:
+        raise RuntimeError(
+            'This Fusion has no Electronics API (adsk.electron) — it ships '
+            'with the May 2026 update. Update Fusion to use electronics_* ops.')
+    return adsk.electron
+
+
+def _eitems(coll):
+    """Iterate a count/item(i) Electronics collection (None-safe)."""
+    if coll is None:
+        return
+    for i in range(int(coll.count)):
+        item = coll.item(i)
+        if item is not None:
+            yield item
+
+
+def _u2mm(value):
+    return round(_electron().Units.u2mm(int(value)), 4)
+
+
+def _ecount(obj, prop):
+    with contextlib.suppress(Exception):
+        coll = getattr(obj, prop, None)
+        if coll is not None:
+            return int(coll.count)
+    return None
+
+
+def _ecad_attrs(obj):
+    """EcadAttributes on a part/element -> {name: value} (best effort)."""
+    out = {}
+    with contextlib.suppress(Exception):
+        for a in _eitems(obj.attributes):
+            with contextlib.suppress(Exception):
+                if a.name:
+                    out[str(a.name)] = '' if a.value is None else str(a.value)
+    return out
+
+
+def _ecad_context(app):
+    """Resolve (schematic, board, library, active_kind) from the active product.
+
+    Any Electronics product works as an entry point: an EcadDesign reaches
+    both sides, a schematic reaches its linked board and vice versa.
+    """
+    electron = _electron()
+    product = app.activeProduct
+    sch = electron.Schematic.cast(product)
+    brd = electron.Board.cast(product)
+    lib = electron.Library.cast(product)
+    des = electron.EcadDesign.cast(product)
+    active = ('schematic' if sch else 'board' if brd else 'library' if lib
+              else 'design' if des else None)
+    if active is None:
+        raise RuntimeError(
+            'The active product is not an Electronics document. Open a '
+            'schematic, 2D PCB, electronics design or library tab first.')
+    if des:
+        with contextlib.suppress(Exception):
+            sch = sch or des.schematic
+        with contextlib.suppress(Exception):
+            brd = brd or des.board
+    if sch and not brd:
+        with contextlib.suppress(Exception):
+            brd = sch.linkedBoard
+    if brd and not sch:
+        with contextlib.suppress(Exception):
+            sch = brd.linkedSchematic
+    return sch, brd, lib, active
+
+
+def op_electronics_info(app, p):
+    """Overview of the open electronics design: which product is active
+    (schematic/board/library/design), summary counts for each reachable side,
+    per-sheet breakdown and ERC/DRC error counts. The electronics get_state."""
+    sch, brd, lib, active = _ecad_context(app)
+    out = {'active': active}
+    if sch:
+        info = {'name': getattr(sch, 'name', None)}
+        with contextlib.suppress(Exception):
+            info['headline'] = sch.headline
+        for prop, key in (('sheets', 'sheets'), ('parts', 'parts'),
+                          ('nets', 'nets'), ('modules', 'modules'),
+                          ('errors', 'erc_errors')):
+            n = _ecount(sch, prop)
+            if n is not None:
+                info[key] = n
+        sheets = []
+        with contextlib.suppress(Exception):
+            for sh in _eitems(sch.sheets):
+                entry = {}
+                with contextlib.suppress(Exception):
+                    entry['number'] = int(sh.number)
+                with contextlib.suppress(Exception):
+                    entry['name'] = sh.name
+                for prop in ('instances', 'wires', 'nets', 'busses', 'texts'):
+                    n = _ecount(sh, prop)
+                    if n is not None:
+                        entry[prop] = n
+                sheets.append(entry)
+        if sheets:
+            info['per_sheet'] = sheets
+        out['schematic'] = info
+    if brd:
+        info = {'name': getattr(brd, 'name', None)}
+        with contextlib.suppress(Exception):
+            info['headline'] = brd.headline
+        for prop, key in (('elements', 'elements'), ('signals', 'signals'),
+                          ('layers', 'layers'), ('holes', 'holes'),
+                          ('errors', 'drc_errors')):
+            n = _ecount(brd, prop)
+            if n is not None:
+                info[key] = n
+        out['board'] = info
+    if lib:
+        info = {'name': getattr(lib, 'name', None)}
+        with contextlib.suppress(Exception):
+            info['id'] = lib.id
+        with contextlib.suppress(Exception):
+            info['editable'] = bool(lib.editable)
+        for prop, key in (('deviceSets', 'device_sets'), ('devices', 'devices'),
+                          ('symbols', 'symbols'), ('packages', 'packages'),
+                          ('packages3d', 'packages_3d')):
+            n = _ecount(lib, prop)
+            if n is not None:
+                info[key] = n
+        out['library'] = info
+    return out
+
+
+def op_electronics_components(app, p):
+    """List components: board elements (position mm / rotation deg, footprint,
+    populated flag) or schematic parts (value, device set, attributes such as
+    MPN). side: auto|board|schematic; optional name substring filter, limit."""
+    sch, brd, lib, active = _ecad_context(app)
+    side = (p.get('side') or 'auto').lower()
+    if side == 'auto':
+        side = 'board' if (brd and active != 'schematic') else 'schematic'
+    flt = (p.get('filter') or '').lower()
+    limit = int(p.get('limit') or 0)
+    items = []
+    if side == 'board':
+        if not brd:
+            raise RuntimeError('No board is reachable from the active document.')
+        source = brd.elements
+    elif side == 'schematic':
+        if not sch:
+            raise RuntimeError('No schematic is reachable from the active '
+                               'document.')
+        source = sch.parts
+    else:
+        raise ValueError('side must be auto|board|schematic, got %r' % side)
+    for it in _eitems(source):
+        name = str(getattr(it, 'name', '') or '')
+        if flt and flt not in name.lower():
+            continue
+        entry = {'name': name}
+        with contextlib.suppress(Exception):
+            entry['value'] = '' if it.value is None else str(it.value)
+        if side == 'board':
+            with contextlib.suppress(Exception):
+                entry['x_mm'] = _u2mm(it.x)
+                entry['y_mm'] = _u2mm(it.y)
+            with contextlib.suppress(Exception):
+                entry['angle_deg'] = round(float(it.angle), 3)
+            with contextlib.suppress(Exception):
+                entry['mirrored'] = bool(it.mirror)
+            with contextlib.suppress(Exception):
+                entry['locked'] = bool(it.locked)
+            with contextlib.suppress(Exception):
+                entry['populated'] = bool(it.populate)
+            with contextlib.suppress(Exception):
+                if it.package is not None:
+                    entry['package'] = it.package.name
+        else:
+            with contextlib.suppress(Exception):
+                if it.deviceset is not None:
+                    entry['device_set'] = it.deviceset.name
+            with contextlib.suppress(Exception):
+                if it.device is not None and it.device.package is not None:
+                    entry['package'] = it.device.package.name
+            n = _ecount(it, 'instances')
+            if n is not None:
+                entry['gates_placed'] = n
+        with contextlib.suppress(Exception):
+            if it.package3d is not None:
+                entry['package3d'] = it.package3d.name
+        attrs = _ecad_attrs(it)
+        if attrs:
+            entry['attributes'] = attrs
+        items.append(entry)
+        if limit and len(items) >= limit:
+            break
+    return {'side': side, 'count': len(items), 'components': items}
+
+
+def op_electronics_nets(app, p):
+    """Connectivity: schematic nets with their pin connections (part + pin),
+    or board copper signals with trace/via/pour counts and pad contacts.
+    side: auto|schematic|board; optional name substring filter, limit."""
+    sch, brd, lib, active = _ecad_context(app)
+    side = (p.get('side') or 'auto').lower()
+    if side == 'auto':
+        side = 'board' if (brd and active == 'board') else \
+               'schematic' if sch else 'board'
+    flt = (p.get('filter') or '').lower()
+    limit = int(p.get('limit') or 0)
+    nets = []
+    if side == 'schematic':
+        if not sch:
+            raise RuntimeError('No schematic is reachable from the active '
+                               'document.')
+        for net in _eitems(sch.nets):
+            name = str(getattr(net, 'name', '') or '')
+            if flt and flt not in name.lower():
+                continue
+            entry = {'name': name}
+            with contextlib.suppress(Exception):
+                if net.netClass is not None:
+                    entry['class'] = net.netClass.name
+            pins = []
+            with contextlib.suppress(Exception):
+                for pr in _eitems(net.pinRefs):
+                    ref = {}
+                    with contextlib.suppress(Exception):
+                        ref['part'] = pr.part.name
+                    with contextlib.suppress(Exception):
+                        ref['pin'] = pr.pin.name
+                    if ref:
+                        pins.append(ref)
+            entry['pins'] = pins
+            nets.append(entry)
+            if limit and len(nets) >= limit:
+                break
+    elif side == 'board':
+        if not brd:
+            raise RuntimeError('No board is reachable from the active document.')
+        for sig in _eitems(brd.signals):
+            name = str(getattr(sig, 'name', '') or '')
+            if flt and flt not in name.lower():
+                continue
+            entry = {'name': name}
+            with contextlib.suppress(Exception):
+                if sig.netClass is not None:
+                    entry['class'] = sig.netClass.name
+            for prop, key in (('wires', 'traces'), ('vias', 'vias'),
+                              ('polyPours', 'pours')):
+                n = _ecount(sig, prop)
+                if n is not None:
+                    entry[key] = n
+            contacts = []
+            with contextlib.suppress(Exception):
+                for cr in _eitems(sig.contactRefs):
+                    ref = {}
+                    with contextlib.suppress(Exception):
+                        ref['element'] = cr.element.name
+                    with contextlib.suppress(Exception):
+                        ref['pad'] = cr.contact.name
+                    if ref:
+                        contacts.append(ref)
+            entry['contacts'] = contacts
+            nets.append(entry)
+            if limit and len(nets) >= limit:
+                break
+    else:
+        raise ValueError('side must be auto|schematic|board, got %r' % side)
+    return {'side': side, 'count': len(nets), 'nets': nets}
+
+
+def op_electronics_layers(app, p):
+    """Layer table of the board (fallback: schematic/library): number, name,
+    used, visible, color. used_only=True hides unused layers."""
+    sch, brd, lib, active = _ecad_context(app)
+    src = brd or sch or lib
+    if src is None:
+        raise RuntimeError('No layer table is reachable from the active '
+                           'document.')
+    used_only = bool(p.get('used_only', False))
+    layers = []
+    for ly in _eitems(src.layers):
+        entry = {}
+        with contextlib.suppress(Exception):
+            entry['number'] = int(ly.number)
+        with contextlib.suppress(Exception):
+            entry['name'] = ly.name
+        with contextlib.suppress(Exception):
+            entry['used'] = bool(ly.used)
+        with contextlib.suppress(Exception):
+            entry['visible'] = bool(ly.visible)
+        with contextlib.suppress(Exception):
+            entry['color'] = str(ly.color)
+        if used_only and not entry.get('used'):
+            continue
+        layers.append(entry)
+    source = 'board' if src is brd else 'schematic' if src is sch else 'library'
+    return {'source': source, 'count': len(layers), 'layers': layers}
+
+
+def op_electronics_library(app, p):
+    """Inspect component libraries. With a library document active: its device
+    sets, each with devices and their packages. With a schematic/board/design
+    active: the libraries embedded in that document, with content counts.
+    Optional name substring filter and limit (applies to device sets)."""
+    sch, brd, lib, active = _ecad_context(app)
+    flt = (p.get('filter') or '').lower()
+    limit = int(p.get('limit') or 0)
+    if lib:
+        out = {'library': getattr(lib, 'name', None)}
+        with contextlib.suppress(Exception):
+            out['editable'] = bool(lib.editable)
+        for prop, key in (('symbols', 'symbols'), ('packages', 'packages'),
+                          ('packages3d', 'packages_3d')):
+            n = _ecount(lib, prop)
+            if n is not None:
+                out[key] = n
+        sets = []
+        for ds in _eitems(lib.deviceSets):
+            name = str(getattr(ds, 'name', '') or '')
+            if flt and flt not in name.lower():
+                continue
+            entry = {'name': name}
+            with contextlib.suppress(Exception):
+                entry['description'] = ds.description
+            devices = []
+            with contextlib.suppress(Exception):
+                for d in _eitems(ds.devices):
+                    dev = {'name': str(getattr(d, 'name', '') or '')}
+                    with contextlib.suppress(Exception):
+                        if d.package is not None:
+                            dev['package'] = d.package.name
+                    devices.append(dev)
+            entry['devices'] = devices
+            sets.append(entry)
+            if limit and len(sets) >= limit:
+                break
+        out['count'] = len(sets)
+        out['device_sets'] = sets
+        return out
+    src = brd if active == 'board' else sch if active == 'schematic' else (brd or sch)
+    libs = []
+    with contextlib.suppress(Exception):
+        for l in _eitems(src.libraries):
+            name = str(getattr(l, 'name', '') or '')
+            if flt and flt not in name.lower():
+                continue
+            entry = {'name': name}
+            for prop, key in (('deviceSets', 'device_sets'),
+                              ('devices', 'devices'), ('symbols', 'symbols'),
+                              ('packages', 'packages'),
+                              ('packages3d', 'packages_3d')):
+                n = _ecount(l, prop)
+                if n is not None:
+                    entry[key] = n
+            libs.append(entry)
+            if limit and len(libs) >= limit:
+                break
+    return {'count': len(libs), 'libraries': libs}
+
+
+def op_electronics_export(app, p):
+    """Export electronics to EAGLE 9.6.2 files — .brd (board), .sch (schematic)
+    or .lbr (library), chosen by the path extension. The matching product must
+    be reachable from the active document."""
+    sch, brd, lib, active = _ecad_context(app)
+    path = p['path']
+    ext = os.path.splitext(path)[1].lower()
+    targets = {'.brd': (brd, 'createEagleBrdExportOptions', 'board'),
+               '.sch': (sch, 'createEagleSchExportOptions', 'schematic'),
+               '.lbr': (lib, 'createEagleLbrExportOptions', 'library')}
+    if ext not in targets:
+        raise ValueError('path must end in .brd, .sch or .lbr, got %r' % ext)
+    product, factory_name, kind = targets[ext]
+    if product is None:
+        raise RuntimeError('No %s is reachable from the active document.' % kind)
+    em = getattr(product, 'exportManager', None)
+    if em is None:
+        raise RuntimeError('This Fusion version exposes no electronics export '
+                           'API.')
+    factory = getattr(em, factory_name, None)
+    options = factory(path) if factory else None
+    if options is None:
+        raise RuntimeError('Fusion refused to create %s export options — is '
+                           'the right document open?' % ext)
+    if not em.execute(options):
+        raise RuntimeError('Electronics export to %r failed.' % path)
+    return {'exported': path, 'kind': kind}
+
+
+# --------------------------------------------------------------------------- #
 # Batch — many operations in ONE main-thread dispatch / round-trip
 # --------------------------------------------------------------------------- #
 _PATH_PART = re.compile(r'\.([A-Za-z_]\w*)|\[(\d+)\]')
@@ -2705,6 +3106,12 @@ DISPATCH = {
     'cam_setups': op_cam_setups,
     'cam_generate': op_cam_generate,
     'cam_post': op_cam_post,
+    'electronics_info': op_electronics_info,
+    'electronics_components': op_electronics_components,
+    'electronics_nets': op_electronics_nets,
+    'electronics_layers': op_electronics_layers,
+    'electronics_library': op_electronics_library,
+    'electronics_export': op_electronics_export,
     'timeline': op_timeline,
     'suppress_feature': op_suppress_feature,
     'list_parameters': op_list_parameters,

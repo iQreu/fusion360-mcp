@@ -932,6 +932,71 @@ def cam_post(setup: str, path: str, post_config: str = '',
 
 
 # --------------------------------------------------------------------------- #
+# Electronics — schematics, PCBs, libraries (read-only preview API, Fusion
+# May 2026+). Inspect and export only: Fusion's Electronics API cannot create
+# or edit schematic/board content yet.
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def electronics_info() -> dict:
+    """Overview of the open electronics design: which product is active
+    (schematic / 2D PCB / library / design), name, sheet/part/net or
+    element/signal/layer counts, per-sheet breakdown, ERC/DRC error counts.
+    Call this first when working with electronics documents. Requires an
+    electronics tab to be the active document (Fusion May 2026+)."""
+    return _call('electronics_info')
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def electronics_components(side: str = 'auto', filter: str = '',
+                           limit: int = 0) -> dict:
+    """List electronics components. side="board": placed elements with
+    position (mm), rotation (deg), mirrored/locked/populated flags and
+    footprint. side="schematic": parts with value, device set, package and
+    attributes (MPN, manufacturer, ...) — the raw material for a BOM.
+    side="auto" picks the active side. filter: case-insensitive name
+    substring; limit: cap the list (0 = all)."""
+    return _call('electronics_components', side=side, filter=filter or None,
+                 limit=limit)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def electronics_nets(side: str = 'auto', filter: str = '',
+                     limit: int = 0) -> dict:
+    """Connectivity of the electronics design. side="schematic": nets with
+    their pin connections (part + pin) — the netlist. side="board": copper
+    signals with trace/via/pour counts and pad contacts (element + pad).
+    side="auto" picks the active side. filter: name substring; limit: cap."""
+    return _call('electronics_nets', side=side, filter=filter or None,
+                 limit=limit)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def electronics_layers(used_only: bool = False) -> dict:
+    """Layer table of the PCB (fallback: schematic/library): number, name,
+    used, visible, color. used_only=True hides unused layers. Layers 1-16 are
+    copper (1 = Top, 16 = Bottom in the EAGLE convention)."""
+    return _call('electronics_layers', used_only=used_only)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def electronics_library(filter: str = '', limit: int = 0) -> dict:
+    """Inspect electronics component libraries. With a library document
+    active: its device sets, each with devices and packages. With a
+    schematic/PCB active: the libraries embedded in that document with
+    content counts. filter: name substring; limit: cap (device sets)."""
+    return _call('electronics_library', filter=filter or None, limit=limit)
+
+
+@mcp.tool()
+def electronics_export(path: str) -> dict:
+    """Export the electronics design to an EAGLE 9.6.2 file. The extension
+    picks the product: .brd (board), .sch (schematic), .lbr (library); it
+    must be reachable from the active document. Path is the full output file
+    path."""
+    return _call('electronics_export', path=path)
+
+
+# --------------------------------------------------------------------------- #
 # Assembly motion and cloud documents
 # --------------------------------------------------------------------------- #
 @mcp.tool()
