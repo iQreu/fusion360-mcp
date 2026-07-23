@@ -1,5 +1,7 @@
 # Pushnięcie tagu `vX.Y.Z` publikuje release z auto-generowanymi release notes;
 # updater FusionMCP czyta z niego tag_name (wersję) i body (notes).
+# Release jest BRAMKOWANY testami (needs: test): auto-updater roznosi „latest"
+# na maszyny użytkowników, więc zielony pytest+ruff+import serwera jest warunkiem.
 name: Release
 
 on:
@@ -10,7 +12,24 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev tooling + runtime deps
+        run: >-
+          python -m pip install --upgrade pip pytest ruff
+          "mcp>=1.9,<2" numpy trimesh pyransac3d
+      - name: Ruff lint
+        run: python -m ruff check .
+      - name: Run tests
+        run: python -m pytest -rs
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

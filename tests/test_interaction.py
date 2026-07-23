@@ -4,23 +4,47 @@ import commands
 
 
 class LightbulbObj:
-    """Body/occurrence-like: settable isLightBulbOn."""
+    """Body/occurrence-like: class-level isLightBulbOn AND isVisible properties
+    (mirrors real adsk proxy classes, which define these on the class)."""
 
     def __init__(self, on=True):
-        self.isLightBulbOn = on
-        self.isVisible = on
+        self._on = on
+        self._vis = on
+
+    @property
+    def isLightBulbOn(self):
+        return self._on
+
+    @isLightBulbOn.setter
+    def isLightBulbOn(self, v):
+        self._on = v
+
+    @property
+    def isVisible(self):
+        return self._vis
+
+    @isVisible.setter
+    def isVisible(self, v):
+        self._vis = v
 
 
 class VisibleOnlyObj:
-    """Sketch-like: isLightBulbOn raises, only isVisible is settable."""
+    """Sketch-like: only isVisible is defined on the class (no isLightBulbOn)."""
 
     def __init__(self, on=True):
-        object.__setattr__(self, 'isVisible', on)
+        self._vis = on
 
-    def __setattr__(self, name, value):
-        if name == 'isLightBulbOn':
-            raise RuntimeError('read-only in this fake')
-        object.__setattr__(self, name, value)
+    @property
+    def isVisible(self):
+        return self._vis
+
+    @isVisible.setter
+    def isVisible(self, v):
+        self._vis = v
+
+
+class NoVisibilityObj:
+    """Face/edge-like: the class defines NO visibility toggle at all."""
 
 
 def test_set_visible_prefers_lightbulb_then_isvisible():
@@ -31,6 +55,12 @@ def test_set_visible_prefers_lightbulb_then_isvisible():
     b = VisibleOnlyObj(on=True)
     assert commands._set_visible(b, False) == 'isVisible'
     assert b.isVisible is False
+
+
+def test_set_visible_raises_on_objects_without_a_toggle():
+    import pytest
+    with pytest.raises(RuntimeError):
+        commands._set_visible(NoVisibilityObj(), False)
 
 
 def test_get_visible_reads_either_attribute():

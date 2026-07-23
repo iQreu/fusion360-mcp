@@ -13,6 +13,7 @@ Design notes
   fast-forward ``git pull`` when the install is a clean git checkout; otherwise
   it downloads the release/branch zip and overwrites the working copy.
 """
+import hashlib
 import io
 import json
 import os
@@ -41,6 +42,22 @@ _SKIP = {'.git', '.venv', 'venv', '__pycache__', '.python-version'}
 def _repo_root():
     """The FusionMCP checkout root (parent of this mcp_server/ directory)."""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _version_on_disk(root):
+    """Read __version__ straight from mcp_server/_version.py on disk (not the
+    imported module, which is frozen at server startup)."""
+    path = os.path.join(root, 'mcp_server', '_version.py')
+    try:
+        with open(path, encoding='utf-8') as fh:
+            m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', fh.read())
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def _sha256(blob):
+    return hashlib.sha256(blob).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -183,23 +200,49 @@ def staged_zip_path(version):
 
 def download_to_staging(info):
     """Pre-download the release zip for `info` so a later apply_update is
-    instant and works offline. Returns the staged path, or None on failure."""
+    instant and works offline. Returns the staged path, or None on failure.
+    Writes a .sha256 sidecar so apply_update can detect a staged file that was
+    corrupted or tampered with (a different process planting a zip) between
+    pre-download and install."""
     zip_url = info.get('zip_url')
     if not zip_url:
         return None
     path = staged_zip_path(info['version'])
-    if os.path.isfile(path) and os.path.getsize(path) > 0:
+    if os.path.isfile(path) and os.path.getsize(path) > 0 and _staged_ok(path):
         return path
     try:
         blob = _http_get(zip_url, accept='application/zip')
+        # Reject a non-zip / truncated download before promoting it.
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            if zf.testzip() is not None:
+                return None
         os.makedirs(staging_dir(), exist_ok=True)
-        tmp = path + '.part'
+        # Unique temp name so two concurrent server instances don't interleave
+        # writes into the same file and promote a spliced, corrupt zip.
+        tmp = '%s.part.%d' % (path, os.getpid())
         with open(tmp, 'wb') as fh:
             fh.write(blob)
         os.replace(tmp, path)
+        with open(path + '.sha256', 'w', encoding='utf-8') as fh:
+            fh.write(_sha256(blob))
         return path
     except Exception:  # noqa: BLE001 - pre-download is best-effort
         return None
+
+
+def _staged_ok(path):
+    """True if a staged zip matches its recorded digest and is a valid archive."""
+    try:
+        with open(path + '.sha256', encoding='utf-8') as fh:
+            expected = fh.read().strip()
+        with open(path, 'rb') as fh:
+            blob = fh.read()
+        if not expected or _sha256(blob) != expected:
+            return False
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            return zf.testzip() is None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _background_check():
@@ -220,8 +263,11 @@ def _background_check():
             if AUTO_MODE == 'download':
                 root = _repo_root()
                 if os.path.isdir(os.path.join(root, '.git')):
-                    _git(root, 'fetch', '--tags', '--quiet')
-                    result['downloaded'] = 'git fetch (apply runs git pull --ff-only)'
+                    fetch = _git(root, 'fetch', '--tags', '--quiet')
+                    # Only claim "downloaded" if the fetch actually succeeded —
+                    # else consume_notice would wrongly tell the user it is ready.
+                    if getattr(fetch, 'returncode', 1) == 0:
+                        result['downloaded'] = 'git fetch (apply runs git pull --ff-only)'
                 else:
                     result['downloaded'] = download_to_staging(info)
     except Exception as exc:  # noqa: BLE001 - never break the server at startup
@@ -286,8 +332,11 @@ def _apply_git(root):
     if pull.returncode != 0:
         return {'applied': False, 'method': 'git', 'reason': out or 'git pull failed'}
     _sync_addin(root)
+    # git pull rewrote _version.py on disk; report the NEW version, not the
+    # value captured in memory at server startup.
+    new_version = _version_on_disk(root) or LOCAL_VERSION
     return {'applied': True, 'method': 'git', 'output': out,
-            'new_version': LOCAL_VERSION, 'next_steps': _NEXT_STEPS}
+            'new_version': new_version, 'next_steps': _NEXT_STEPS}
 
 
 def _apply_zip(root):
@@ -297,31 +346,53 @@ def _apply_zip(root):
     zip_url = info.get('zip_url')
     if not zip_url:
         return {'applied': False, 'method': 'zip', 'reason': 'No download URL available'}
+    def _clear_staged():
+        for leftover in (staged, staged + '.sha256'):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+
     staged = staged_zip_path(info['version'])
-    from_staging = os.path.isfile(staged) and os.path.getsize(staged) > 0
+    # Trust the staged file only if it still matches the digest recorded at
+    # download time — otherwise a corrupted or planted zip would be extracted.
+    from_staging = (os.path.isfile(staged) and os.path.getsize(staged) > 0
+                    and _staged_ok(staged))
     if from_staging:
         with open(staged, 'rb') as fh:
             blob = fh.read()
     else:
+        # A stale/corrupt/mismatched staged file is worthless — remove it and
+        # its sidecar so we don't re-validate-and-reject it on every apply.
+        if os.path.isfile(staged):
+            _clear_staged()
         try:
             blob = _http_get(zip_url, accept='application/zip')
         except Exception as exc:  # noqa: BLE001
             return {'applied': False, 'method': 'zip', 'reason': 'Download failed: %s' % exc}
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            if zf.testzip() is not None:
+                return {'applied': False, 'method': 'zip',
+                        'reason': 'Update archive is corrupt (failed CRC check).'}
+    except zipfile.BadZipFile:
+        return {'applied': False, 'method': 'zip',
+                'reason': 'Downloaded file is not a valid zip archive.'}
     written = _extract_over(blob, root)
     _sync_addin(root)
-    if from_staging:
-        try:
-            os.remove(staged)
-        except OSError:
-            pass
+    _clear_staged()
     return {'applied': True, 'method': 'zip', 'files_updated': written,
             'new_version': info['version'], 'from_staging': from_staging,
             'next_steps': _NEXT_STEPS}
 
 
 def _extract_over(blob, root):
-    """Extract a GitHub zip (single top-level dir) over `root`, skipping _SKIP."""
+    """Extract a GitHub zip (single top-level dir) over `root`, skipping _SKIP.
+    Guards against zip-slip: any entry whose resolved path escapes `root` (via
+    '..' or absolute components) is refused, so a crafted archive cannot write
+    outside the install."""
     written = 0
+    root_real = os.path.realpath(root)
     with zipfile.ZipFile(io.BytesIO(blob)) as zf:
         names = zf.namelist()
         top = names[0].split('/', 1)[0] + '/' if names else ''
@@ -329,9 +400,16 @@ def _extract_over(blob, root):
             if name.endswith('/'):
                 continue
             rel = name[len(top):] if name.startswith(top) else name
-            if not rel or any(part in _SKIP for part in rel.split('/')):
+            parts = rel.split('/')
+            if not rel or any(part in _SKIP for part in parts):
                 continue
-            dest = os.path.join(root, *rel.split('/'))
+            if any(part in ('..', '') for part in parts) or os.path.isabs(rel):
+                raise RuntimeError('Refusing unsafe archive path %r (zip-slip).' % name)
+            dest = os.path.join(root, *parts)
+            if os.path.realpath(dest) != root_real and \
+                    not os.path.realpath(dest).startswith(root_real + os.sep):
+                raise RuntimeError('Refusing archive path %r outside the install '
+                                   'root (zip-slip).' % name)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with zf.open(name) as src, open(dest, 'wb') as out:
                 shutil.copyfileobj(src, out)

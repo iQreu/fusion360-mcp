@@ -55,6 +55,12 @@ VIEWER_HTML = """<!doctype html>
   var panel = document.getElementById('panel');
 
   function send(msg) { window.parent.postMessage(msg, '*'); }
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;',
+               '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
   function request(method, params) {
     return new Promise(function (resolve, reject) {
       var id = nextId++;
@@ -62,7 +68,25 @@ VIEWER_HTML = """<!doctype html>
       send({ jsonrpc: '2.0', id: id, method: method, params: params || {} });
     });
   }
+  function toolError(r) {
+    // FastMCP reports a failed tool as a result with isError:true (relayed to
+    // the .then branch), or the add-in returns {error: ...} in the payload.
+    if (!r) return null;
+    if (r.isError) {
+      var c = r.content || [];
+      for (var i = 0; i < c.length; i++) {
+        if (c[i].type === 'text') return c[i].text;
+      }
+      return 'tool error';
+    }
+    var sc = r.structuredContent;
+    if (sc && sc.error) return sc.error;
+    return null;
+  }
   window.addEventListener('message', function (ev) {
+    // Only trust messages from the host frame — otherwise any window with a
+    // reference to this iframe could spoof tool results or resolve requests.
+    if (ev.source !== window.parent) return;
     var m = ev.data;
     if (!m || m.jsonrpc !== '2.0') return;
     if (m.id !== undefined && (m.result !== undefined || m.error !== undefined)) {
@@ -94,7 +118,12 @@ VIEWER_HTML = """<!doctype html>
     status('Rendering ' + direction + '\\u2026');
     callTool('screenshot', { direction: direction, fit: true,
                              width: 800, height: 500 })
-      .then(function (r) { showImage(r); status(''); })
+      .then(function (r) {
+        var err = toolError(r);
+        if (err) { status('Error: ' + err); return; }
+        if (!showImage(r)) { status('No image returned (is Fusion running?)'); return; }
+        status('');
+      })
       .catch(function (e) {
         status('Error: ' + (e && e.message ? e.message : JSON.stringify(e)));
       });
@@ -103,6 +132,8 @@ VIEWER_HTML = """<!doctype html>
     status('Loading BOM\\u2026');
     callTool('bom', { include_mass: true })
       .then(function (r) {
+        var err = toolError(r);
+        if (err) { status('Error: ' + err); return; }
         var data = r && r.structuredContent;
         if (!data && r && r.content && r.content[0] && r.content[0].type === 'text') {
           try { data = JSON.parse(r.content[0].text); } catch (e) { data = null; }
@@ -116,14 +147,16 @@ VIEWER_HTML = """<!doctype html>
   }
   function renderBom(data) {
     var items = (data && data.items) || [];
+    // esc() every design-derived field: component/material names can contain
+    // HTML metacharacters, and this panel can issue tool calls (XSS = tool RCE).
     var html = '<table><tr><th>Component</th><th>Qty</th>' +
                '<th>Material</th><th>Mass [kg]</th></tr>';
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
-      html += '<tr><td>' + (it.component || '') + '</td><td>' +
-              (it.quantity || '') + '</td><td>' +
-              ((it.materials || []).join('; ')) + '</td><td>' +
-              (it.unit_mass_kg != null ? it.unit_mass_kg : '') + '</td></tr>';
+      html += '<tr><td>' + esc(it.component) + '</td><td>' +
+              esc(it.quantity) + '</td><td>' +
+              esc((it.materials || []).join('; ')) + '</td><td>' +
+              esc(it.unit_mass_kg != null ? it.unit_mass_kg : '') + '</td></tr>';
     }
     panel.innerHTML = html + '</table>';
   }

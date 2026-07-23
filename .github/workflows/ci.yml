@@ -17,9 +17,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dev tooling
-        run: python -m pip install --upgrade pip pytest ruff
+      - name: Install dev tooling + runtime deps
+        # mcp: so the server-import smoke test actually imports server.py (a
+        #      broken decorator/annotation there once shipped green — 16aa6b2).
+        # re extras: so the scan-geometry tests run instead of silently skipping.
+        run: >-
+          python -m pip install --upgrade pip pytest ruff
+          "mcp>=1.9,<2" numpy trimesh pyransac3d
       - name: Ruff lint
         run: python -m ruff check .
-      - name: Run tests
-        run: python -m pytest
+      - name: Run tests (no skips allowed for missing deps)
+        run: python -m pytest -rs

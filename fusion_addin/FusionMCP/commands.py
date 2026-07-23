@@ -23,10 +23,17 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.8.0'
+VERSION = '1.9.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
+
+# Persistent cloud id of the active document, so dispatch() can drop entity
+# tokens when the user (or open_document) switches to a DIFFERENT saved document
+# — tokens are per-document, and a stale doc-A token must never resolve against
+# doc B. Keyed on dataFile.id (not the name) so saving a new design is not
+# mistaken for a switch.
+_active_doc_id = None
 
 # Cross-call object store for run_code: store('jig', obj) in one snippet,
 # fetch('jig') in a later one. Session-lived, like the token registry, but
@@ -48,6 +55,8 @@ _READ_ONLY_OPS = frozenset({
     'electronics_info', 'electronics_components', 'electronics_nets',
     'electronics_layers', 'electronics_library', 'electronics_export',
     'mesh_compare', 'thread_types', 'api_introspect', 'selection_filter',
+    'list_materials', 'list_appearances', 'data_folders', 'version_history',
+    'share_link', 'annotate', 'annotations_clear',
 })
 
 
@@ -202,6 +211,13 @@ def op_server_info(app, p):
         info['has_active_design'] = design is not None
     except Exception:
         info['has_active_design'] = False
+    # Surface ops that finished AFTER their client timed out (see bridge.py) so
+    # a stuck/slow machine is diagnosable.
+    with contextlib.suppress(Exception):
+        import bridge
+        late = bridge._state.get('late_completions', 0)
+        if late:
+            info['late_completions'] = late
     return info
 
 
@@ -500,8 +516,20 @@ def op_chamfer(app, p):
 
 
 def op_shell(app, p):
+    faces = p.get('faces', [])
     feats = _root(app).features.shellFeatures
-    sin = feats.createInput(_collection(p.get('faces', [])), False)
+    if faces:
+        entities = _collection(faces)
+    else:
+        # No faces to remove -> hollow the whole body (closed shell). The input
+        # collection still needs the target body, or Fusion has nothing to act on.
+        body = _registry.get_opt(p.get('body')) if p.get('body') else None
+        if body is None:
+            raise ValueError('shell needs either faces=[tokens] to remove, or a '
+                             'body token to hollow with no opening')
+        entities = adsk.core.ObjectCollection.create()
+        entities.add(body)
+    sin = feats.createInput(entities, False)
     sin.insideThickness = _vi(p['thickness'] * MM)
     return _feature_result(feats.add(sin), 'shell')
 
@@ -561,6 +589,10 @@ def op_move_body(app, p):
 def op_delete(app, p):
     obj = _registry.get(p['token'])
     obj.deleteMe()
+    # Forget the token so a later call gets the registry's helpful "stale token"
+    # KeyError instead of a cryptic Fusion "object is invalid" from deep inside a
+    # feature add.
+    _registry.remove(p['token'])
     return {'deleted': p['token']}
 
 
@@ -651,7 +683,9 @@ def op_construction_axis(app, p):
         pts = [_registry.get(t) for t in p['points']]
         ain.setByTwoPoints(pts[0], pts[1])
     elif method == 'edge':
-        ain.setByLine(_registry.get(p['edge']))
+        # setByEdge takes a linear BRepEdge/SketchLine and works in parametric
+        # designs; setByLine wants a transient Line3D (direct-edit only).
+        ain.setByEdge(_registry.get(p['edge']))
     elif method == 'cylinder':
         ain.setByCircularFace(_registry.get(p['face']))
     else:
@@ -727,9 +761,21 @@ def op_sketch_constraint(app, p):
     return {'constraint': _registry.add('con', c), 'kind': kind}
 
 
+def _dim_point(entity):
+    """A SketchPoint usable by addDistanceDimension. Passes SketchPoints
+    through; for a SketchLine returns an endpoint (its start), since
+    addDistanceDimension only accepts SketchPoints."""
+    for attr in ('startSketchPoint',):
+        pt = getattr(entity, attr, None)
+        if pt is not None:
+            return pt
+    return entity
+
+
 def op_sketch_dimension(app, p):
-    """Add a driving dimension to a sketch. kind: distance (2 point/line tokens +
-    at x,y mm text position), radius|diameter (circle/arc token), angle (2 lines).
+    """Add a driving dimension to a sketch. kind: distance (2 point OR line
+    tokens — a line uses its start endpoint + at x,y mm text position),
+    radius|diameter (circle/arc token), angle (2 lines).
     Optional parameter=name renames the dimension's parameter."""
     sk = _registry.get(p['sketch'])
     dims = sk.sketchDimensions
@@ -738,7 +784,9 @@ def op_sketch_dimension(app, p):
     tx = _pt(p.get('text_x', 0), p.get('text_y', 0))
     if kind == 'distance':
         orient = adsk.fusion.DimensionOrientations.AlignedDimensionOrientation
-        d = dims.addDistanceDimension(ents[0], ents[1], orient, tx)
+        # addDistanceDimension needs SketchPoints; map line tokens to endpoints.
+        a, b = _dim_point(ents[0]), _dim_point(ents[1])
+        d = dims.addDistanceDimension(a, b, orient, tx)
     elif kind == 'radius':
         d = dims.addRadialDimension(ents[0], tx)
     elif kind == 'diameter':
@@ -776,14 +824,38 @@ def op_sketch_offset(app, p):
             'curves': [_registry.add('off', created.item(i)) for i in range(created.count)]}
 
 
+def _curve_endpoints(curve):
+    """{'start': Point3D, 'end': Point3D} for an open sketch curve."""
+    out = {}
+    for which, attr in (('start', 'startSketchPoint'), ('end', 'endSketchPoint')):
+        with contextlib.suppress(Exception):
+            out[which] = getattr(curve, attr).geometry
+    return out
+
+
+def _closest_endpoint_pair(curve_a, curve_b):
+    """The (Point3D, Point3D) endpoints of two curves nearest each other — the
+    shared/near corner, regardless of how each line was drawn."""
+    ea, eb = _curve_endpoints(curve_a), _curve_endpoints(curve_b)
+    if not ea or not eb:
+        raise RuntimeError('a sketch curve has no endpoints (closed curve?)')
+
+    def dist2(u, v):
+        return (u.x - v.x) ** 2 + (u.y - v.y) ** 2 + (u.z - v.z) ** 2
+
+    return min(((pa, pb) for pa in ea.values() for pb in eb.values()),
+               key=lambda pair: dist2(*pair))
+
+
 def op_sketch_fillet(app, p):
-    """Add a 2D fillet of `radius` mm between two sketch lines that share an
-    endpoint (line tokens)."""
+    """Add a 2D fillet of `radius` mm between two sketch lines that share (or
+    nearly share) an endpoint (line tokens). The fillet is anchored at the two
+    endpoints closest to each other, so it works no matter which way each line
+    was drawn."""
     sk = _registry.get(p['sketch'])
     l0, l1 = _registry.get(p['line1']), _registry.get(p['line2'])
-    # Anchor the fillet near each line's endpoint closest to the shared corner.
-    arc = sk.sketchCurves.sketchArcs.addFillet(
-        l0, l0.endSketchPoint.geometry, l1, l1.startSketchPoint.geometry, p['radius'] * MM)
+    pt0, pt1 = _closest_endpoint_pair(l0, l1)
+    arc = sk.sketchCurves.sketchArcs.addFillet(l0, pt0, l1, pt1, p['radius'] * MM)
     return {'sketch': _registry.add('skt', sk), 'arc': _registry.add('arc', arc)}
 
 
@@ -800,26 +872,15 @@ def op_sketch_blend_curve(app, p):
     if adder is None:
         raise RuntimeError('addBlendCurve needs Fusion July 2026+')
     c1, c2 = _registry.get(p['curve1']), _registry.get(p['curve2'])
-
-    def endpoints(curve):
-        out = {}
-        for which, attr in (('start', 'startSketchPoint'), ('end', 'endSketchPoint')):
-            with contextlib.suppress(Exception):
-                out[which] = getattr(curve, attr).geometry
-        if not out:
-            raise RuntimeError('curve has no endpoints — closed curves cannot blend')
-        return out
-
-    e1, e2 = endpoints(c1), endpoints(c2)
+    e1, e2 = _curve_endpoints(c1), _curve_endpoints(c2)
+    if not e1 or not e2:
+        raise RuntimeError('curve has no endpoints — closed curves cannot blend')
     pick1 = (p.get('end1') or '').lower()
     pick2 = (p.get('end2') or '').lower()
     if pick1 in e1 and pick2 in e2:
         p1, p2 = e1[pick1], e2[pick2]
     else:
-        def dist2(a, b):
-            return (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2
-        p1, p2 = min(((pa, pb) for pa in e1.values() for pb in e2.values()),
-                     key=lambda pair: dist2(*pair))
+        p1, p2 = _closest_endpoint_pair(c1, c2)
     spline = adder(c1, p1, c2, p2, bool(p.get('curvature', False)))
     out = _profiles_summary(sk)
     out['curve'] = _registry.add('spl', spline)
@@ -908,12 +969,13 @@ def op_thread(app, p):
     query = feats.threadDataQuery
     thread_type = query.defaultMetricThreadType
     is_internal = bool(p.get('internal', False))
-    # recommendThreadData returns (ok, designation, size, class) for the face.
-    ok, designation, size, cls = query.recommendThreadData(
+    # recommendThreadData returns (ok, designation, threadClass) — a 3-tuple; the
+    # designation (e.g. "M10x1.5") already encodes the size.
+    ok, designation, cls = query.recommendThreadData(
         face.geometry.radius * 2, is_internal, thread_type)
     if not ok:
         raise RuntimeError('No recommended thread data for this face diameter')
-    info = feats.createThreadInfo(is_internal, thread_type, size, designation, cls)
+    info = feats.createThreadInfo(is_internal, thread_type, designation, cls)
     tin = feats.createInput(face, info)
     tin.isModeled = bool(p.get('modeled', True))
     return _feature_result(feats.add(tin), 'thread')
@@ -1014,21 +1076,39 @@ def op_rename(app, p):
     return {'token': p['token'], 'name': obj.name}
 
 
+def _as_component(obj):
+    """The Component for a component/occurrence token (or None)."""
+    if obj is None:
+        return None
+    comp = getattr(obj, 'component', None)  # Occurrence -> its component
+    if comp is not None:
+        return comp
+    if getattr(obj, 'objectType', '').endswith('Component'):
+        return obj
+    return None
+
+
 def op_copy_body(app, p):
     """Copy body tokens into a target component/occurrence token (or root if
     omitted) using copy/paste. Returns tokens of the pasted bodies."""
     root = _root(app)
     bodies = _collection(p['bodies'])
-    target = _registry.get_opt(p.get('target')) if p.get('target') else root
-    result = root.features.copyPasteBodies.add(bodies)
+    target_comp = root
+    if p.get('target'):
+        target_comp = _as_component(_registry.get(p['target']))
+        if target_comp is None:
+            raise ValueError('target must be a component or occurrence token, '
+                             'got %r' % p['target'])
+    # copyPasteBodies pastes into the component that owns the collection, so use
+    # the TARGET component's collection — not always the root's.
+    result = target_comp.features.copyPasteBodies.add(bodies)
     out = []
     try:
         for i in range(result.bodies.count):
             out.append(_registry.add('bdy', result.bodies.item(i)))
     except Exception:
         pass
-    _ = target
-    return {'bodies': out}
+    return {'bodies': out, 'target': target_comp.name}
 
 
 _JOINT_MOTION = ('rigid', 'revolute', 'slider', 'cylindrical', 'pin_slot',
@@ -1046,15 +1126,9 @@ def _joint_geometry(token):
         return adsk.fusion.JointGeometry.createByCurve(obj, key)
 
 
-def op_joint(app, p):
-    """Create a joint between two geometry tokens (planar faces recommended).
-    motion: rigid|revolute|slider|cylindrical|pin_slot|planar|ball. For
-    revolute/cylindrical an axis ("X"/"Y"/"Z") sets the rotation axis."""
-    root = _root(app)
-    geo0 = _joint_geometry(p['geo0'])
-    geo1 = _joint_geometry(p['geo1'])
-    jin = root.joints.createInput(geo0, geo1)
-    motion = (p.get('motion') or 'rigid').lower()
+def _apply_joint_motion(jin, motion, axis_name):
+    """Set the motion type on a JointInput OR AsBuiltJointInput (both expose the
+    same setAs*JointMotion family)."""
     if motion not in _JOINT_MOTION:
         raise ValueError('motion must be one of %s, got %r' % (list(_JOINT_MOTION), motion))
     axis_map = {
@@ -1062,7 +1136,7 @@ def op_joint(app, p):
         'Y': adsk.fusion.JointDirections.YAxisJointDirection,
         'Z': adsk.fusion.JointDirections.ZAxisJointDirection,
     }
-    axis = axis_map.get((p.get('axis') or 'Z').upper(), axis_map['Z'])
+    axis = axis_map.get((axis_name or 'Z').upper(), axis_map['Z'])
     if motion == 'revolute':
         jin.setAsRevoluteJointMotion(axis)
     elif motion == 'slider':
@@ -1072,15 +1146,62 @@ def op_joint(app, p):
     elif motion == 'planar':
         jin.setAsPlanarJointMotion(axis)
     elif motion == 'ball':
-        jin.setAsBallJointMotion(
-            adsk.fusion.JointDirections.ZAxisJointDirection,
-            adsk.fusion.JointDirections.XAxisJointDirection)
+        jin.setAsBallJointMotion(axis_map['Z'], axis_map['X'])
     elif motion == 'pin_slot':
         jin.setAsPinSlotJointMotion(axis, axis_map['X'])
     else:
         jin.setAsRigidJointMotion()
+
+
+def op_joint(app, p):
+    """Create a joint between two geometry tokens (planar faces recommended).
+    motion: rigid|revolute|slider|cylindrical|pin_slot|planar|ball. For
+    revolute/cylindrical an axis ("X"/"Y"/"Z") sets the rotation axis."""
+    root = _root(app)
+    geo0 = _joint_geometry(p['geo0'])
+    geo1 = _joint_geometry(p['geo1'])
+    jin = root.joints.createInput(geo0, geo1)
+    motion = (p.get('motion') or 'rigid').lower()
+    _apply_joint_motion(jin, motion, p.get('axis'))
     joint = root.joints.add(jin)
     return {'joint': _registry.add('jnt', joint), 'motion': motion}
+
+
+def op_as_built_joint(app, p):
+    """Joint two occurrences WHERE THEY ALREADY SIT (no geometry snapping) —
+    the right tool for imported/positioned assemblies. occ0/occ1 are occurrence
+    tokens; motion as in `joint`; optional geometry token (a face/edge for the
+    joint origin, required for revolute/cylindrical/etc., omit for rigid)."""
+    root = _root(app)
+    occ0 = _registry.get(p['occ0'])
+    occ1 = _registry.get(p['occ1'])
+    geometry = _joint_geometry(p['geometry']) if p.get('geometry') else None
+    joints = getattr(root, 'asBuiltJoints', None)
+    if joints is None:
+        raise RuntimeError('As-built joints are not available in this Fusion build.')
+    jin = joints.createInput(occ0, occ1, geometry)
+    motion = (p.get('motion') or 'rigid').lower()
+    _apply_joint_motion(jin, motion, p.get('axis'))
+    joint = joints.add(jin)
+    return {'joint': _registry.add('jnt', joint), 'motion': motion,
+            'kind': 'as_built'}
+
+
+def op_joint_origin(app, p):
+    """Create a named joint origin at a geometry token (face/edge/vertex/sketch
+    point) so later joints can snap to a stable, explicit reference point."""
+    root = _root(app)
+    origins = getattr(root, 'jointOrigins', None)
+    if origins is None:
+        raise RuntimeError('Joint origins are not available in this Fusion build.')
+    geo = _joint_geometry(p['geometry'])
+    oin = origins.createInput(geo)
+    origin = origins.add(oin)
+    if p.get('name'):
+        with contextlib.suppress(Exception):
+            origin.name = p['name']
+    return {'joint_origin': _registry.add('jor', origin),
+            'name': getattr(origin, 'name', None)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1255,10 +1376,16 @@ def op_set_parameter(app, p):
 def op_add_parameter(app, p):
     design = _design(app)
     value = p['value']
-    vi = (adsk.core.ValueInput.createByString(str(value))
-          if isinstance(value, str) else _vi(float(value)))
-    prm = design.userParameters.add(p['name'], vi, p.get('units', 'mm'),
-                                    p.get('comment', ''))
+    units = p.get('units', 'mm')
+    if isinstance(value, str):
+        vi = adsk.core.ValueInput.createByString(value)
+    else:
+        # createByReal is in Fusion internal units (cm for lengths), which would
+        # silently make value=25 units='mm' a 250 mm parameter. Embed the unit so
+        # the wire's mm/deg/etc. is honoured (matches set_parameter via expression).
+        # repr() round-trips the float exactly (unlike %g, which drops to 6 sig figs).
+        vi = adsk.core.ValueInput.createByString('%s %s' % (repr(float(value)), units))
+    prm = design.userParameters.add(p['name'], vi, units, p.get('comment', ''))
     return {'name': prm.name, 'value_internal': prm.value, 'expression': prm.expression}
 
 
@@ -1429,7 +1556,14 @@ def op_interference(app, p):
             vol = round(r.interferenceBody.volume / (MM ** 3), 3)
         except Exception:
             vol = None
-        hits.append({'volume_mm3': vol})
+        hit = {'volume_mm3': vol}
+        # Report WHICH pair overlaps, so callers with 3+ bodies can act.
+        for prop, key in (('entityOne', 'body_a'), ('entityTwo', 'body_b')):
+            with contextlib.suppress(Exception):
+                ent = getattr(r, prop)
+                hit[key] = _registry.add('bdy', ent)
+                hit[key + '_name'] = ent.name
+        hits.append(hit)
     return {'count': results.count, 'interferences': hits}
 
 
@@ -1694,7 +1828,9 @@ def op_export_flat_pattern(app, p):
         opts = creator(p['path'], flat)
     else:
         raise ValueError('format must be dxf|step, got %r' % fmt)
-    em.execute(opts)
+    if not em.execute(opts):
+        raise RuntimeError('Flat-pattern export of %r failed (execute returned '
+                           'false — file locked or path unwritable).' % p['path'])
     return {'exported': p['path'], 'format': fmt}
 
 
@@ -1782,6 +1918,7 @@ def op_import_mesh(app, p):
     units = getattr(adsk.fusion.MeshUnits, _MESH_UNITS[unit_key])
     parametric = design.designType == adsk.fusion.DesignTypes.ParametricDesignType
     base = None
+    ok = False
     if parametric:
         base = root.features.baseFeatures.add()
         base.startEdit()
@@ -1790,9 +1927,15 @@ def op_import_mesh(app, p):
             added = root.meshBodies.add(p['path'], units, base)
         else:
             added = root.meshBodies.add(p['path'], units)
+        ok = True
     finally:
         if base:
             base.finishEdit()
+            if not ok:
+                # A failed import (bad path/format) would otherwise leave an
+                # empty Base feature cluttering the timeline.
+                with contextlib.suppress(Exception):
+                    base.deleteMe()
     meshes = [{'token': _registry.add('msh', added.item(i)),
                'name': added.item(i).name} for i in range(added.count)]
     return {'meshes': meshes, 'count': len(meshes)}
@@ -2052,15 +2195,22 @@ def op_mesh_section(app, p):
     mesh = _registry.get(p['mesh'])
     root = _root(app)
     plane = _resolve_plane(app, p.get('plane', 'XY'))
+    made_plane = None
     if p.get('offset'):
         planes = root.constructionPlanes
         cin = planes.createInput()
         cin.setByOffset(plane, _vi(p['offset'] * MM))
-        plane = planes.add(cin)
+        plane = made_plane = planes.add(cin)
     sk = root.sketches.add(plane)
     try:
         sk.intersectWithSketchPlane([mesh])
     except Exception as exc:
+        # Don't leave a stray empty sketch + offset plane behind on failure.
+        with contextlib.suppress(Exception):
+            sk.deleteMe()
+        if made_plane is not None:
+            with contextlib.suppress(Exception):
+                made_plane.deleteMe()
         raise RuntimeError('This Fusion version cannot section a mesh into a '
                            'sketch (%s). Convert with mesh_to_brep first, then '
                            'section the solid.' % exc)
@@ -2383,13 +2533,25 @@ def op_highlight(app, p):
 
 def _set_visible(obj, visible):
     """Toggle visibility via isLightBulbOn (the settable toggle on bodies,
-    occurrences, construction geometry) falling back to isVisible (sketches)."""
-    try:
-        obj.isLightBulbOn = bool(visible)
-        return 'isLightBulbOn'
-    except Exception:
-        obj.isVisible = bool(visible)
-        return 'isVisible'
+    occurrences, construction geometry) falling back to isVisible (sketches).
+    Only assigns to a name the CLASS actually defines — otherwise the assignment
+    would silently create an instance attribute and falsely report success
+    (BRepFace/BRepEdge/Profile have no visibility toggle)."""
+    cls = type(obj)
+    last_exc = None
+    for attr in ('isLightBulbOn', 'isVisible'):
+        if not hasattr(cls, attr):
+            continue  # class doesn't define it -> don't create a phantom attr
+        try:
+            setattr(obj, attr, bool(visible))
+            return attr
+        except Exception as exc:  # noqa: BLE001 - getter-only? try the next name
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError('%s has no settable visibility (only bodies/occurrences/'
+                       'sketches/meshes/construction geometry can be shown/hidden)'
+                       % cls.__name__)
 
 
 def _get_visible(obj):
@@ -2438,6 +2600,12 @@ def op_isolate(app, p):
         raise RuntimeError('Already isolated; call unisolate first.')
     target = _registry.get(p['token'])
     keep = [target]
+    # If a face/edge/etc. token was passed, keep its OWNING body visible — else
+    # isolating a face would hide its own body and produce a blank screenshot.
+    body = getattr(target, 'body', None)
+    if body is not None:
+        keep.append(body)
+        target = body  # the thing we actually keep shown must be a body
     # An occurrence chain that owns the target must stay visible too.
     with contextlib.suppress(Exception):
         ctx = target.assemblyContext
@@ -2456,8 +2624,11 @@ def op_isolate(app, p):
                 with contextlib.suppress(Exception):
                     _set_visible(obj, False)
                     hidden += 1
-    _set_visible(target, True)
+    # Save the stash BEFORE the final show, so an error here still leaves
+    # unisolate able to restore the pre-isolate state.
     _isolate_stash = stash
+    with contextlib.suppress(Exception):
+        _set_visible(target, True)
     return {'isolated': p['token'], 'hidden': hidden}
 
 
@@ -2483,15 +2654,32 @@ def op_multi_screenshot(app, p):
     width = int(p.get('width', 800))
     height = int(p.get('height', 600))
     base = p.get('base_path') or ''
+    # Validate ALL presets up front so a typo doesn't discard already-captured
+    # shots halfway through.
+    bad = [d for d in directions
+           if (d or '').lower() not in _CAMERA_DIRS and (d or '').lower() not in ('current', '')]
+    if bad:
+        raise ValueError('unknown camera preset(s) %s; valid: current|%s'
+                         % (bad, '|'.join(_CAMERA_DIRS)))
+    # Remember the user's camera so we can put it back afterwards.
+    saved_cam = None
+    with contextlib.suppress(Exception):
+        saved_cam = app.activeViewport.camera
     shots = []
-    for d in directions:
-        vp = _apply_camera_direction(app, d, p.get('fit', True))
-        path = ((base + '_' + d + '.png') if base
-                else os.path.join(tempfile.gettempdir(), 'fusion_mcp_%s.png' % d))
-        vp.saveAsImageFile(path, width, height)
-        with open(path, 'rb') as fh:
-            b64 = base64.b64encode(fh.read()).decode('ascii')
-        shots.append({'direction': d, 'path': path, 'image_base64': b64})
+    try:
+        for d in directions:
+            vp = _apply_camera_direction(app, d, p.get('fit', True))
+            path = ((base + '_' + d + '.png') if base
+                    else os.path.join(tempfile.gettempdir(), 'fusion_mcp_%s.png' % d))
+            vp.saveAsImageFile(path, width, height)
+            with open(path, 'rb') as fh:
+                b64 = base64.b64encode(fh.read()).decode('ascii')
+            shots.append({'direction': d, 'path': path, 'image_base64': b64})
+    finally:
+        if saved_cam is not None:
+            with contextlib.suppress(Exception):
+                app.activeViewport.camera = saved_cam
+                app.activeViewport.refresh()
     return {'count': len(shots), 'shots': shots}
 
 
@@ -2531,14 +2719,28 @@ def op_undo(app, p):
     issued before the undo may now point at deleted objects — re-query with
     get_state/query_entities before reusing them."""
     steps = max(1, int(p.get('steps', 1)))
+
+    def _marker():
+        # Track real progress: a no-op undo (empty stack) leaves the timeline
+        # marker unchanged, so we can tell how many steps actually reverted.
+        with contextlib.suppress(Exception):
+            return _design(app).timeline.markerPosition
+        return None
+
     done = 0
     for _ in range(steps):
+        before = _marker()
         try:
             app.executeTextCommand('Commands.Start UndoCommand')
-            done += 1
         except Exception:
             break
-    return {'undone': done, 'tokens_may_be_stale': True,
+        after = _marker()
+        # If we can read the marker and it did not move, there was nothing left
+        # to undo — stop reporting phantom steps.
+        if before is not None and after is not None and after == before:
+            break
+        done += 1
+    return {'undone': done, 'requested': steps, 'tokens_may_be_stale': True,
             'note': 'Re-run get_state/query_entities before reusing old tokens.'}
 
 
@@ -2546,8 +2748,9 @@ def op_undo(app, p):
 # I/O
 # --------------------------------------------------------------------------- #
 def _swap_ext(path, ext):
-    base = path.rsplit('.', 1)[0] if '.' in path.rsplit('\\', 1)[-1] else path
-    return base + '.' + ext
+    # os.path.splitext handles both / and \ separators and leading-dot names,
+    # so a forward-slash path with a dotted directory isn't mangled.
+    return os.path.splitext(path)[0] + '.' + ext
 
 
 def _do_export(app, fmt, path):
@@ -2572,7 +2775,12 @@ def _do_export(app, fmt, path):
             opts.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
     else:
         raise ValueError('format must be step|iges|sat|smt|f3d|stl|3mf, got %r' % fmt)
-    em.execute(opts)
+    # execute() returns False for several failure modes (unwritable/locked file,
+    # license-restricted format) without raising; treat that as a real failure so
+    # op_export never reports success with no file and can trigger its fallback.
+    if not em.execute(opts):
+        raise RuntimeError('Export of %r failed (execute returned false — file '
+                           'locked, path unwritable, or format restricted).' % path)
     return path
 
 
@@ -2703,7 +2911,11 @@ def op_set_design_mode(app, p):
 # --------------------------------------------------------------------------- #
 def _cam_product(app):
     import adsk.cam
-    prod = app.activeDocument.products.itemByProductType('CAMProductType')
+    doc = app.activeDocument
+    if not doc:
+        raise RuntimeError('No document is open. Open a document with a '
+                           'MANUFACTURE setup first.')
+    prod = doc.products.itemByProductType('CAMProductType')
     cam = adsk.cam.CAM.cast(prod) if prod else None
     if not cam:
         raise RuntimeError('No MANUFACTURE data in this document. Create a '
@@ -2742,20 +2954,38 @@ def op_cam_setups(app, p):
     return {'count': len(out), 'setups': out}
 
 
+def _main_thread_ceiling():
+    """The bridge's per-op main-thread timeout (seconds). Read lazily to avoid a
+    circular import; falls back to the bridge default if unavailable."""
+    try:
+        import bridge
+        return float(getattr(bridge, 'MAIN_THREAD_TIMEOUT', 300))
+    except Exception:
+        return 300.0
+
+
 def op_cam_generate(app, p):
     """(Re)generate toolpaths — for one setup by name, or all setups when
-    omitted. Blocks until generation finishes or `timeout` s (default 240)."""
+    omitted. Blocks until generation finishes or `timeout` s (default 240). The
+    wait is capped a few seconds below the bridge main-thread ceiling so a long
+    job returns a graceful {completed: false} instead of a transport timeout
+    (which would leave the op running re-entrantly)."""
     cam = _cam_product(app)
     if p.get('setup'):
         future = cam.generateToolpath(_cam_setup_by_name(cam, p['setup']))
     else:
         future = cam.generateAllToolpaths(False)
-    deadline = time.time() + float(p.get('timeout', 240))
+    requested = float(p.get('timeout', 240))
+    ceiling = max(30.0, _main_thread_ceiling() - 15.0)
+    effective = min(requested, ceiling)
+    deadline = time.time() + effective
     while not future.isGenerationCompleted and time.time() < deadline:
         adsk.doEvents()
         time.sleep(0.2)
     return {'completed': bool(future.isGenerationCompleted),
-            'setup': p.get('setup') or 'all'}
+            'setup': p.get('setup') or 'all',
+            'waited_s': round(effective, 1),
+            'timeout_clamped': effective < requested}
 
 
 def op_cam_post(app, p):
@@ -2801,11 +3031,12 @@ def _jsonable(value):
 
 def _run_code_helpers(app):
     """Concise mm/degree helpers injected into run_code scope. They return LIVE
-    API objects (not token dicts), so a whole part can be built in a few lines."""
-    root = _root(app)
+    API objects (not token dicts), so a whole part can be built in a few lines.
+    The design-dependent helpers resolve _root(app) lazily, so importing the
+    scope never fails outside the DESIGN workspace."""
 
     def h_sketch(plane='XY', name=None):
-        sk = root.sketches.add(_resolve_plane(app, plane))
+        sk = _root(app).sketches.add(_resolve_plane(app, plane))
         if name:
             sk.name = name
         return sk
@@ -2819,7 +3050,7 @@ def _run_code_helpers(app):
         return sk
 
     def h_extrude(profile, dist_mm, operation='new', symmetric=False):
-        feats = root.features.extrudeFeatures
+        feats = _root(app).features.extrudeFeatures
         ein = feats.createInput(profile, _operation(operation))
         d = _vi(dist_mm * MM)
         if symmetric:
@@ -2855,14 +3086,24 @@ def op_run_code(app, p):
     new_sketch(plane), rect(sk,x1,y1,x2,y2), circle(sk,cx,cy,r),
     extrude_profile(profile, dist_mm, operation, symmetric).
     Assign to `result` to return a value.
+
+    design/root are bound lazily: a snippet that never touches them works even
+    when a drawing/CAM document is active (where there is no Design).
     """
     code = p['code']
+
+    def _lazy(fn):
+        try:
+            return fn(app)
+        except Exception:
+            return None
+
     g = {
         'adsk': adsk,
         'app': app,
         'ui': app.userInterface,
-        'design': _design(app),
-        'root': _root(app),
+        'design': _lazy(_design),
+        'root': _lazy(_root),
         'math': math,
         'MM': MM,
         'registry': _registry,
@@ -2872,12 +3113,13 @@ def op_run_code(app, p):
         'fetch': _code_store.get,
     }
     g.update(_run_code_helpers(app))
-    local = {}
     buf = io.StringIO()
+    # ONE namespace: with split globals/locals, names defined at top level are
+    # invisible inside def/lambda/comprehension bodies (they resolve against
+    # globals only) — ordinary multi-line snippets would raise NameError.
     with contextlib.redirect_stdout(buf):
-        exec(code, g, local)  # noqa: S102 - intentional escape hatch
-    result = local.get('result', g.get('result'))
-    return {'stdout': buf.getvalue(), 'result': _jsonable(result)}
+        exec(code, g)  # noqa: S102 - intentional escape hatch
+    return {'stdout': buf.getvalue(), 'result': _jsonable(g.get('result'))}
 
 
 def op_reset_registry(app, p):
@@ -3006,8 +3248,15 @@ def op_configurations(app, p):
         raise ValueError('No configuration named %r (have: %s)' % (
             target, ', '.join(e['name'] for e in row_entries()) or 'none'))
     if action == 'cell':
-        cell = table.getCell(int(p['row']), int(p['column']))
-        out = {'row': int(p['row']), 'column': int(p['column'])}
+        r, c = int(p['row']), int(p['column'])
+        ncols = table.columns.count
+        if not (0 <= r < rows.count) or not (0 <= c < ncols):
+            raise ValueError('cell (row=%d, column=%d) out of range; table is '
+                             '%d rows x %d columns' % (r, c, rows.count, ncols))
+        cell = table.getCell(r, c)
+        if cell is None:
+            raise ValueError('No cell at (row=%d, column=%d).' % (r, c))
+        out = {'row': r, 'column': c}
         for attr in ('value', 'expression', 'title', 'name'):
             with contextlib.suppress(Exception):
                 out[attr] = _jsonable(getattr(cell, attr))
@@ -3380,6 +3629,9 @@ def op_electronics_library(app, p):
         out['device_sets'] = sets
         return out
     src = brd if active == 'board' else sch if active == 'schematic' else (brd or sch)
+    if src is None:
+        raise RuntimeError('No schematic or board is reachable from the active '
+                           'document, so no embedded libraries can be listed.')
     libs = []
     with contextlib.suppress(Exception):
         for lib in _eitems(src.libraries):
@@ -3430,13 +3682,370 @@ def op_electronics_export(app, p):
 
 
 # --------------------------------------------------------------------------- #
+# Materials & appearances (read-only browse)
+# --------------------------------------------------------------------------- #
+def _collect_named(collection, flt, out, seen, source):
+    for i in range(collection.count):
+        item = collection.item(i)
+        name = getattr(item, 'name', None)
+        if not name or (flt and flt not in name.lower()):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({'name': name, 'source': source})
+
+
+def op_list_materials(app, p):
+    """Browse available materials by name so set_material has an exact target:
+    materials already in the document, your favourites, and the shipped
+    material libraries. filter = name substring; limit caps the result."""
+    design = _design(app)
+    flt = (p.get('filter') or '').lower()
+    limit = int(p.get('limit') or 200)
+    out, seen = [], set()
+    with contextlib.suppress(Exception):
+        _collect_named(design.materials, flt, out, seen, 'document')
+    with contextlib.suppress(Exception):
+        _collect_named(design.favoriteMaterials, flt, out, seen, 'favorite')
+    with contextlib.suppress(Exception):
+        libs = app.materialLibraries
+        for i in range(libs.count):
+            lib = libs.item(i)
+            with contextlib.suppress(Exception):
+                _collect_named(lib.materials, flt, out, seen, lib.name)
+            if len(out) >= limit:
+                break
+    shown = out[:limit]
+    return {'count': len(shown), 'total_matched': len(out), 'materials': shown}
+
+
+def op_list_appearances(app, p):
+    """Browse available appearances by name for set_appearance. Covers the
+    document's appearances and the shipped appearance libraries. filter = name
+    substring; limit caps the result."""
+    design = _design(app)
+    flt = (p.get('filter') or '').lower()
+    limit = int(p.get('limit') or 200)
+    out, seen = [], set()
+    with contextlib.suppress(Exception):
+        _collect_named(design.appearances, flt, out, seen, 'document')
+    with contextlib.suppress(Exception):
+        libs = app.materialLibraries
+        for i in range(libs.count):
+            lib = libs.item(i)
+            with contextlib.suppress(Exception):
+                _collect_named(lib.appearances, flt, out, seen, lib.name)
+            if len(out) >= limit:
+                break
+    shown = out[:limit]
+    return {'count': len(shown), 'total_matched': len(out), 'appearances': shown}
+
+
+# --------------------------------------------------------------------------- #
+# Parametric fasteners — ISO 4762 socket-head cap screws, built from a table
+# --------------------------------------------------------------------------- #
+# size -> (nominal d, head dia dk, head height k, socket across-flats s, pitch)
+_ISO4762 = {
+    'M3': (3.0, 5.5, 3.0, 2.5, 0.5),
+    'M4': (4.0, 7.0, 4.0, 3.0, 0.7),
+    'M5': (5.0, 8.5, 5.0, 4.0, 0.8),
+    'M6': (6.0, 10.0, 6.0, 5.0, 1.0),
+    'M8': (8.0, 13.0, 8.0, 6.0, 1.25),
+    'M10': (10.0, 16.0, 10.0, 8.0, 1.5),
+    'M12': (12.0, 18.0, 12.0, 10.0, 1.75),
+}
+
+
+def op_insert_fastener(app, p):
+    """Model a parametric ISO 4762 socket-head cap screw as its own component.
+    size: M3|M4|M5|M6|M8|M10|M12; length mm (shank under the head). Builds the
+    head, shank, hex socket, and (best effort) a cosmetic thread. thread=False
+    skips the thread. Returns the component/body tokens."""
+    size = str(p.get('size', 'M6')).upper()
+    if size not in _ISO4762:
+        raise ValueError('size must be one of %s, got %r'
+                         % (sorted(_ISO4762), p.get('size')))
+    length = float(p.get('length', 20.0))
+    if length <= 0:
+        raise ValueError('length must be > 0 mm')
+    d, dk, k, s, _pitch = _ISO4762[size]
+    root = _root(app)
+    occ = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+    comp = occ.component
+    comp.name = '%sx%g SHCS' % (size, length)
+    feats = comp.features
+    sketches = comp.sketches
+    xy = comp.xYConstructionPlane
+
+    def circle_extrude(diameter, z0_mm, height_mm, operation='new'):
+        sk = sketches.add(xy)
+        sk.sketchCurves.sketchCircles.addByCenterRadius(_pt(0, 0), diameter / 2.0 * MM)
+        prof = sk.profiles.item(0)
+        ein = feats.extrudeFeatures.createInput(prof, _operation(operation))
+        start = adsk.fusion.FromEntityStartDefinition.create(xy, _vi(z0_mm * MM)) \
+            if z0_mm else None
+        ein.setDistanceExtent(False, _vi(height_mm * MM))
+        if start is not None:
+            with contextlib.suppress(Exception):
+                ein.startExtent = start
+        return feats.extrudeFeatures.add(ein)
+
+    # Head: from z=0 up +k. Shank: from z=0 down -length.
+    head = circle_extrude(dk, 0.0, k, 'new')
+    circle_extrude(d, 0.0, -length, 'join')
+
+    # Hex socket cut into the head top (across-flats s, depth ~0.6k). The hex is
+    # drawn on the top plane and cut downward into the head.
+    with contextlib.suppress(Exception):
+        r_socket = s / math.sqrt(3.0)  # across-flats -> circumradius
+        top = comp.constructionPlanes.createInput()
+        top.setByOffset(xy, _vi(k * MM))
+        top_plane = comp.constructionPlanes.add(top)
+        sk2 = sketches.add(top_plane)
+        lines = sk2.sketchCurves.sketchLines
+        verts = [_pt(r_socket * math.cos(math.radians(60 * i + 30)),
+                     r_socket * math.sin(math.radians(60 * i + 30))) for i in range(6)]
+        for i in range(6):
+            lines.addByTwoPoints(verts[i], verts[(i + 1) % 6])
+        prof = sk2.profiles.item(0)
+        ein = feats.extrudeFeatures.createInput(
+            prof, adsk.fusion.FeatureOperations.CutFeatureOperation)
+        ein.setDistanceExtent(False, _vi(-0.6 * k * MM))
+        feats.extrudeFeatures.add(ein)
+
+    out = {'component': _registry.add('cmp', comp),
+           'occurrence': _registry.add('occ', occ), 'name': comp.name,
+           'size': size, 'length_mm': length}
+    # Cosmetic thread on the shank side face (best effort).
+    if p.get('thread', True):
+        with contextlib.suppress(Exception):
+            body = head.bodies.item(0)
+            shank_faces = [f for f in body.faces
+                           if _surface_type(f) == 'cylinder'
+                           and abs(f.geometry.radius - d / 2.0 * MM) < 1e-4 * 10]
+            if shank_faces:
+                tfeats = feats.threadFeatures
+                q = tfeats.threadDataQuery
+                tt = q.defaultMetricThreadType
+                ok, desig, cls = q.recommendThreadData(d * MM, False, tt)
+                if ok:
+                    info = tfeats.createThreadInfo(False, tt, desig, cls)
+                    tin = tfeats.createInput(shank_faces[0], info)
+                    tin.isModeled = False
+                    tfeats.add(tin)
+                    out['threaded'] = True
+    bodies = []
+    with contextlib.suppress(Exception):
+        for b in comp.bRepBodies:
+            bodies.append(_registry.add('bdy', b))
+    out['bodies'] = bodies
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Cloud data: folders, versions
+# --------------------------------------------------------------------------- #
+def _unix_to_iso(ts):
+    with contextlib.suppress(Exception):
+        import datetime
+        return datetime.datetime.utcfromtimestamp(int(ts)).isoformat() + 'Z'
+    return None
+
+
+def op_data_folders(app, p):
+    """Browse the cloud data structure: projects -> folders (recursive) with
+    file names. project = optional project-name filter; max_depth caps recursion
+    (default 3). A read-only map for finding documents to open_document."""
+    data = app.data
+    flt = p.get('project')
+    max_depth = int(p.get('max_depth', 3))
+
+    def walk_folder(folder, depth):
+        node = {'name': folder.name, 'files': [], 'folders': []}
+        with contextlib.suppress(Exception):
+            for i in range(folder.dataFiles.count):
+                node['files'].append(folder.dataFiles.item(i).name)
+        if depth < max_depth:
+            with contextlib.suppress(Exception):
+                subs = folder.dataFolders
+                for i in range(subs.count):
+                    node['folders'].append(walk_folder(subs.item(i), depth + 1))
+        return node
+
+    projects = []
+    for i in range(data.dataProjects.count):
+        proj = data.dataProjects.item(i)
+        if flt and proj.name != flt:
+            continue
+        with contextlib.suppress(Exception):
+            projects.append({'project': proj.name,
+                             'root': walk_folder(proj.rootFolder, 0)})
+    if flt and not projects:
+        raise RuntimeError('No cloud project named %r' % flt)
+    return {'count': len(projects), 'projects': projects}
+
+
+def _active_datafile(app):
+    doc = app.activeDocument
+    if not doc:
+        raise RuntimeError('No active document.')
+    df = getattr(doc, 'dataFile', None)
+    if df is None:
+        raise RuntimeError('The active document is not saved to the cloud, so it '
+                           'has no version history or share link. Save it first.')
+    return doc, df
+
+
+def op_version_history(app, p):
+    """Version history of the active (saved) document: version number, date and
+    id per version, newest first — narrate 'what changed since v12'."""
+    doc, df = _active_datafile(app)
+    out = []
+    with contextlib.suppress(Exception):
+        versions = df.versions
+        for i in range(versions.count):
+            v = versions.item(i)
+            entry = {}
+            for attr, key in (('versionNumber', 'version'), ('id', 'id')):
+                with contextlib.suppress(Exception):
+                    entry[key] = getattr(v, attr)
+            with contextlib.suppress(Exception):
+                entry['created'] = _unix_to_iso(v.dateCreated)
+            with contextlib.suppress(Exception):
+                entry['description'] = v.description or None
+            out.append(entry)
+    out.sort(key=lambda e: e.get('version', 0), reverse=True)
+    return {'document': doc.name, 'latest_version': getattr(df, 'latestVersionNumber', None),
+            'count': len(out), 'versions': out}
+
+
+def op_share_link(app, p):
+    """Get (or create, when create=True) a shareable link for the active saved
+    document. Returns the URL; sharing publishes the document to anyone with the
+    link, so create=True should follow explicit user consent."""
+    doc, df = _active_datafile(app)
+    link = getattr(df, 'sharedLink', None)
+    if link is None:
+        raise RuntimeError('This Fusion build exposes no shared-link API.')
+    out = {'document': doc.name}
+    with contextlib.suppress(Exception):
+        out['is_shared'] = bool(link.isShared)
+    if p.get('create') and not out.get('is_shared', False):
+        for attr in ('isShared',):
+            with contextlib.suppress(Exception):
+                setattr(link, attr, True)
+                out['is_shared'] = True
+    for attr, key in (('url', 'url'), ('isPasswordRequired', 'password_required')):
+        with contextlib.suppress(Exception):
+            out[key] = getattr(link, attr)
+    if not out.get('url') and not p.get('create'):
+        out['note'] = 'Not shared yet. Call share_link(create=true) to publish a link.'
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Viewport annotations (custom graphics overlay)
+# --------------------------------------------------------------------------- #
+_annotation_group = None
+
+
+def op_annotate(app, p):
+    """Overlay labels and leader lines on the viewport (custom graphics) so a
+    screenshot explains itself. texts: [{text, x, y, z, size}] (mm; size mm cap
+    height, default 5). lines: [{from:[x,y,z], to:[x,y,z]}] (mm). Overlays are
+    non-geometry; clear them with annotations_clear. Each call adds to the
+    current overlay."""
+    global _annotation_group
+    root = _root(app)
+    groups = getattr(root, 'customGraphicsGroups', None)
+    if groups is None:
+        raise RuntimeError('Custom graphics are not available in this Fusion build.')
+    if _annotation_group is None:
+        _annotation_group = groups.add()
+    grp = _annotation_group
+    n_text, n_line = 0, 0
+    for t in p.get('texts') or []:
+        with contextlib.suppress(Exception):
+            mat = adsk.core.Matrix3D.create()
+            mat.translation = adsk.core.Vector3D.create(
+                float(t.get('x', 0)) * MM, float(t.get('y', 0)) * MM,
+                float(t.get('z', 0)) * MM)
+            size_cm = float(t.get('size', 5.0)) * MM
+            grp.addText(str(t.get('text', '')), 'Arial', size_cm, mat)
+            n_text += 1
+    for ln in p.get('lines') or []:
+        with contextlib.suppress(Exception):
+            a, b = ln['from'], ln['to']
+            coords = adsk.fusion.CustomGraphicsCoordinates.create([
+                float(a[0]) * MM, float(a[1]) * MM, float(a[2]) * MM,
+                float(b[0]) * MM, float(b[1]) * MM, float(b[2]) * MM])
+            grp.addLines(coords, [0, 1], False)
+            n_line += 1
+    with contextlib.suppress(Exception):
+        app.activeViewport.refresh()
+    return {'texts_added': n_text, 'lines_added': n_line}
+
+
+def op_annotations_clear(app, p):
+    """Remove the viewport annotation overlay created by annotate."""
+    global _annotation_group
+    removed = False
+    if _annotation_group is not None:
+        with contextlib.suppress(Exception):
+            _annotation_group.deleteMe()
+            removed = True
+        _annotation_group = None
+    with contextlib.suppress(Exception):
+        app.activeViewport.refresh()
+    return {'cleared': removed}
+
+
+# --------------------------------------------------------------------------- #
+# Contact sets (mechanism motion respecting physical contact)
+# --------------------------------------------------------------------------- #
+def op_contact_set(app, p):
+    """Create a contact set so driven joints respect physical contact instead of
+    parts passing through each other. tokens: occurrence/body tokens (2+). Or
+    action="all"/"none" to toggle global all-contact. Pairs with drive_joint +
+    interference for mechanism checks."""
+    design = _design(app)
+    sets = getattr(design, 'contactSets', None)
+    if sets is None:
+        raise RuntimeError('Contact sets are not available in this Fusion build.')
+    action = (p.get('action') or 'add').lower()
+    if action in ('all', 'none'):
+        enabled = action == 'all'
+        for attr in ('isContactSetsEnabled', 'contactSetsEnabled', 'allContactEnabled'):
+            if hasattr(type(design), attr) or hasattr(design, attr):
+                with contextlib.suppress(Exception):
+                    setattr(design, attr, enabled)
+                    return {'all_contact': enabled}
+        raise RuntimeError('This Fusion build exposes no global all-contact toggle; '
+                           'create explicit contact sets instead.')
+    tokens = p.get('tokens') or []
+    if len(tokens) < 2:
+        raise ValueError('contact_set needs 2+ occurrence/body tokens')
+    coll = _collection(tokens)
+    cs = sets.add(coll)
+    if p.get('name'):
+        with contextlib.suppress(Exception):
+            cs.name = p['name']
+    return {'contact_set': _registry.add('cts', cs),
+            'name': getattr(cs, 'name', None), 'members': len(tokens)}
+
+
+# --------------------------------------------------------------------------- #
 # Batch — many operations in ONE main-thread dispatch / round-trip
 # --------------------------------------------------------------------------- #
-_PATH_PART = re.compile(r'\.([A-Za-z_]\w*)|\[(\d+)\]')
+_PATH_PART = re.compile(r'\.([A-Za-z_]\w*)|\[(-?\d+)\]')
 
 
 def _resolve_ref(ref, results):
-    """Resolve a "$alias.key[0].key2" reference against earlier batch results."""
+    """Resolve a "$alias.key[0].key2" reference against earlier batch results.
+    Supports negative list indices ([-1]). Raises on any unparseable segment
+    instead of silently skipping it, so typos surface at the reference."""
     body = ref[1:]
     m = re.match(r'[A-Za-z_]\w*', body)
     if not m:
@@ -3445,9 +4054,20 @@ def _resolve_ref(ref, results):
     if alias not in results:
         raise KeyError('Batch reference to unknown alias %r in %r' % (alias, ref))
     value = results[alias]
-    for part in _PATH_PART.finditer(body[m.end():]):
+    rest = body[m.end():]
+    cursor = 0
+    for part in _PATH_PART.finditer(rest):
+        # finditer skips non-matching text; require the path be consumed
+        # contiguously so a bad segment (e.g. "(0)") raises here, not later.
+        if part.start() != cursor:
+            raise ValueError('Unparseable segment in batch reference %r near %r'
+                             % (ref, rest[cursor:]))
+        cursor = part.end()
         key, idx = part.group(1), part.group(2)
         value = value[key] if key is not None else value[int(idx)]
+    if cursor != len(rest):
+        raise ValueError('Unparseable trailing segment in batch reference %r: %r'
+                         % (ref, rest[cursor:]))
     return value
 
 
@@ -3605,6 +4225,7 @@ DISPATCH = {
     'set_design_mode': op_set_design_mode,
     'batch': op_batch,
     'run_code': op_run_code,
+    'run_fusion_code': op_run_code,  # alias: matches the standalone tool name in batch
     'reset_registry': op_reset_registry,
     'mesh_compare': op_mesh_compare,
     'fold': op_fold,
@@ -3615,7 +4236,74 @@ DISPATCH = {
     'selection_filter': op_selection_filter,
     'configurations': op_configurations,
     'api_introspect': op_api_introspect,
+    'as_built_joint': op_as_built_joint,
+    'joint_origin': op_joint_origin,
+    'list_materials': op_list_materials,
+    'list_appearances': op_list_appearances,
+    'insert_fastener': op_insert_fastener,
+    'data_folders': op_data_folders,
+    'version_history': op_version_history,
+    'share_link': op_share_link,
+    'annotate': op_annotate,
+    'annotations_clear': op_annotations_clear,
+    'contact_set': op_contact_set,
 }
+
+
+def classify_error(exc):
+    """Map an exception to a stable {code, retriable} for the wire, so the model
+    can branch (retry vs re-query vs give up) without string-matching messages."""
+    msg = str(exc).lower()
+    if isinstance(exc, KeyError):
+        # registry.get raises KeyError for unknown/stale tokens.
+        return 'stale_token', False
+    if isinstance(exc, (ValueError, TypeError)):
+        return 'bad_params', False
+    if 'no active fusion design' in msg or 'no document' in msg or \
+            'switch to the design' in msg:
+        return 'no_design', True
+    if ('not available in this fusion' in msg or 'needs fusion' in msg
+            or 'preview' in msg or 'this fusion version' in msg
+            or 'this fusion build' in msg):
+        return 'unsupported', False
+    return 'fusion_error', False
+
+
+def _doc_id(app):
+    """The active document's persistent cloud id, or None when it has none yet
+    (unsaved, or no document). Deliberately NOT keyed on the document name: a
+    name appears/changes on first save, and keying on it would wrongly look like
+    a document switch and drop all tokens mid-build."""
+    try:
+        doc = app.activeDocument
+    except Exception:
+        return None
+    if doc is None:
+        return None
+    with contextlib.suppress(Exception):
+        df = doc.dataFile
+        if df is not None:
+            return df.id
+    return None
+
+
+def _drop_tokens_on_doc_switch(app):
+    """If the active document changed to a DIFFERENT saved document since the
+    last dispatch, invalidate all entity tokens (and caches) so stale tokens
+    raise the helpful KeyError instead of resolving against the wrong document.
+
+    Only a transition between two distinct non-None cloud ids counts as a
+    switch. Saving a new design (None -> id) is the SAME document and must not
+    reset — that was a regression that dropped every pre-save token."""
+    global _active_doc_id, _annotation_group
+    doc_id = _doc_id(app)
+    if doc_id is None:
+        return  # unsaved or no document context: can't tell, so leave state alone
+    if _active_doc_id is not None and doc_id != _active_doc_id:
+        _registry.reset()
+        _state_cache.clear()
+        _annotation_group = None  # the overlay belonged to the previous document
+    _active_doc_id = doc_id
 
 
 def dispatch(app, op, params):
@@ -3624,9 +4312,14 @@ def dispatch(app, op, params):
     if handler is None:
         raise RuntimeError('Unknown op: %r (available: %s)'
                            % (op, ', '.join(sorted(DISPATCH))))
+    if app is not None:
+        _drop_tokens_on_doc_switch(app)
     result = handler(app, params or {})
-    # Any mutating op invalidates the cached read-only views.
-    if op not in _READ_ONLY_OPS:
+    # Any mutating op invalidates the cached read-only views. timeline rollback
+    # mutates geometry but is otherwise read-only-shaped, so force it here.
+    mutating = op not in _READ_ONLY_OPS or (
+        op == 'timeline' and (params or {}).get('action') == 'rollback')
+    if mutating:
         _mutation_gen += 1
         _state_cache.clear()
     return result

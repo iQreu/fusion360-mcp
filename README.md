@@ -63,9 +63,11 @@ operację; `undo(steps)` — cofnięcie ostatnich operacji (tokeny sprzed undo m
 być nieaktualne — po nim odpytaj `get_state`)
 **Widok**: `set_visibility(tokens, visible)`, `isolate(token)` / `unisolate()`
 (pokaż tylko jedną część złożenia), `multi_screenshot(directions)` — kilka ujęć
-(np. iso/front/top/right) w **jednym** round-tripie, `section_view(plane, offset)`
-/ `section_off()` — przekrój widoku (wgląd do środka bez cięcia geometrii;
-Fusion 2023+)
+(np. iso/front/top/right) w **jednym** round-tripie (przywraca kamerę),
+`section_view(plane, offset)` / `section_off()` — przekrój widoku (wgląd do
+środka bez cięcia geometrii; Fusion 2023+), `annotate(texts, lines)` /
+`annotations_clear()` — nakładka etykiet i linii odniesienia na viewport
+(samoobjaśniające się screenshoty; nie dotyka geometrii)
 **Szkice**: `create_sketch`, `sketch_rectangle`, `sketch_circle`, `sketch_line`,
 `sketch_arc`, `sketch_polygon`, `sketch_points`, `sketch_polyline`, `sketch_spline`
 **Więzy i wymiary**: `sketch_constraint` (horizontal/vertical/parallel/
@@ -84,16 +86,28 @@ długości krawędzi/krzywej, lipiec 2026+)
 `rectangular_pattern`, `circular_pattern`, `mirror`, `move_body`, `delete`, `hole`
 (simple/counterbore/countersink), `loft`, `sweep`, `rib`, `draft`, `thread`,
 `split_body`, `offset_face` (press-pull), `scale`, `thicken` (powierzchnia→bryła)
-**Złożenia**: `create_component`, `rename`, `copy_body`, `joint`
-(rigid/revolute/slider/cylindrical/pin_slot/planar/ball), `move_occurrence`
-(przesunięcie/obrót całego komponentu), `ground_occurrence`, `drive_joint`
-(ustaw kąt/przesuw przegubu — z `interference` i `multi_screenshot` daje
-sprawdzenie mechanizmu w ruchu), `set_joint_limits`
+**Złożenia**: `create_component`, `rename`, `copy_body` (do wskazanego
+komponentu/occurrence), `joint`
+(rigid/revolute/slider/cylindrical/pin_slot/planar/ball),
+`as_built_joint(occ0, occ1, motion)` — łączy komponenty **tam, gdzie są**
+(bez dosuwania geometrii; do importowanych złożeń), `joint_origin` — nazwany
+punkt odniesienia, `move_occurrence` (przesunięcie/obrót całego komponentu),
+`ground_occurrence`, `drive_joint` (ustaw kąt/przesuw przegubu — z
+`interference` i `multi_screenshot` daje sprawdzenie mechanizmu w ruchu),
+`set_joint_limits`, `contact_set(tokens|action)` — kontakt fizyczny w
+mechanizmie (części nie przenikają), `insert_fastener(size, length)` —
+parametryczna śruba ISO 4762 (M3–M12) jako gotowy komponent
 **Dokumenty w chmurze**: `list_documents(project)`, `open_document(name)` —
-panel danych Fusion (projekty i dokumenty)
-**Materiały i pomiary**: `set_material`, `set_appearance`, `measure`
-(distance/angle), `bounding_box`, `center_of_mass`, `interference`,
-`mass_properties` (masa, objętość, pole, środek ciężkości, momenty bezwładności)
+panel danych Fusion (projekty i dokumenty), `data_folders(project, max_depth)`
+— rekurencyjne drzewo folderów (dokumenty w podfolderach),
+`version_history()` — historia wersji aktywnego dokumentu,
+`share_link(create)` — link do udostępnienia (publikacja tylko za zgodą)
+**Materiały i pomiary**: `set_material`, `set_appearance`,
+`list_materials(filter)` / `list_appearances(filter)` — przegląd nazw z
+bibliotek (żeby set_* miał trafną nazwę), `measure`
+(distance/angle), `bounding_box`, `center_of_mass`, `interference` (zwraca parę
+kolidujących brył + objętość), `mass_properties` (masa, objętość, pole, środek
+ciężkości, momenty bezwładności)
 **BOM**: `bom(include_mass, csv_path)` — lista części z ilościami, materiałami,
 masą jednostkową i całkowitą; opcjonalny zapis CSV
 **Tekst i grawer**: `sketch_text` (tekst w szkicu: czcionka/wysokość/pochylenie),
@@ -123,7 +137,10 @@ zależności `pip install -e "mcp_server[re]"` (numpy/trimesh/pyransac3d):
 klasyfikacja otwór/czop), grubość ścianek — gotowy plan odbudowy;
 `scan_sections(path, axis, count)` — stos przekrojów jako okręgi/polilinie do
 parametrycznej odbudowy jednym `batch`; `scan_deviation(scan, model_stl)` —
-raport odchyłek odbudowa↔skan (pętla: buduj → mierz → poprawiaj).
+raport odchyłek odbudowa↔skan (pętla: buduj → mierz → poprawiaj);
+`print_check(path, bed_x/y/z, overhang_deg, min_wall)` — ocena pliku pod druk
+FDM: zmieszczenie na stole (wszystkie orientacje), pole nawisów bez podpór,
+cienkie ścianki, szczelność + rekomendacje (bez Fusion; wymaga extras `re`).
 Prompt `reverse_engineer_scan` prowadzi cały przepływ skan→CAD.
 **Rysunki 2D**: `create_drawing(template, sheet_size, orientation, standard,
 drawing_units)` — na Fusion lipiec 2026+ w pełni headless przez oficjalne
@@ -146,11 +163,17 @@ niestandardowe z huba zespołu (lipiec 2026+)
 (przeliczenie ścieżek), `cam_post(setup, path, post_config)` — G-code przez
 post-procesor (.cps). Setup tworzy się raz w UI — API nie umie go założyć;
 regeneracja i post są już skryptowalne
+**Elektronika (read-only, preview API, Fusion maj 2026+)**: `electronics_info`,
+`electronics_components`, `electronics_nets`, `electronics_layers`,
+`electronics_library` — inspekcja schematu/PCB/bibliotek (bez edycji — API jest
+tylko do odczytu), `electronics_export(path)` — eksport EAGLE 9.6.2
+(.brd/.sch/.lbr wg rozszerzenia)
 **Timeline**: `timeline` (list/rollback), `suppress_feature`
 **Aktualizacje**: automatyczne sprawdzenie + pobranie przy starcie (patrz
 [Aktualizacje z GitHuba](#aktualizacje-z-githuba)); `check_for_updates` (odczyt:
 wersje + release notes), `apply_update(confirm=True, method="auto")` (instaluje
-**po zgodzie użytkownika**: `git pull` dla czystego checkoutu, inaczej zip)
+**po zgodzie użytkownika** — gdy klient wspiera elicitation, pyta wprost;
+`git pull` dla czystego checkoutu, inaczej zweryfikowany SHA-256 zip)
 **I/O**: `export(format, path, allow_fallback=True)` (step/iges/sat/smt/f3d/stl/3mf),
 `import_file(format, path)` (step/iges/sat/smt/f3d/dxf),
 `screenshot(direction, fit)`, `capture_to_file(direction, fit)`, `fit_view`, `save`
@@ -166,9 +189,12 @@ API (token, `$nazwa` ze store, ścieżka `adsk.*`) przed napisaniem snippetu
 **Resources** (odczyt bez wywołania narzędzia): `fusion://design/state`,
 `fusion://design/parameters`, `fusion://design/tree`.
 **Prompts** (gotowe szablony): `parametric_bracket`, `prepare_for_3d_print`,
-`assemble_components`.
+`reverse_engineer_scan`, `assemble_components`.
 Narzędzia inspekcyjne są oznaczone adnotacją `readOnlyHint`, a `delete` —
-`destructiveHint` (klient MCP wie, które operacje są bezpieczne).
+`destructiveHint` (klient MCP wie, które operacje są bezpieczne). Błędy niosą
+**kod strukturalny** (`code`: `stale_token`/`bad_params`/`no_design`/
+`unsupported`/`not_connected`/`fusion_error` + `retriable`), więc model wie,
+czy ponowić, odświeżyć tokeny, czy zrezygnować.
 
 `operation` ∈ `new|join|cut|intersect`. Płaszczyzny: `XY|XZ|YZ`, token ściany
 lub token płaszczyzny konstrukcyjnej. Osie: `X|Y|Z`, token linii/krawędzi lub

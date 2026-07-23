@@ -1,8 +1,19 @@
 """Tests for the version comparison, staging and startup-notice logic in the
 GitHub updater."""
+import io
 import os
+import zipfile
 
 import updater
+
+
+def _make_zip(entries):
+    """A real in-memory zip (download_to_staging/_apply_zip validate archives)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 
 def test_parse_strips_v_prefix_and_suffix():
@@ -44,21 +55,44 @@ def test_staged_zip_path_sanitises_version():
 
 def test_download_to_staging_writes_and_reuses(tmp_path, monkeypatch):
     monkeypatch.setattr(updater.tempfile, 'gettempdir', lambda: str(tmp_path))
+    blob = _make_zip({'repo-top/mcp_server/_version.py': "__version__ = '9.9.9'"})
     calls = []
 
     def fake_get(url, accept=''):
         calls.append(url)
-        return b'zipbytes'
+        return blob
 
     monkeypatch.setattr(updater, '_http_get', fake_get)
     info = {'version': 'v9.9.9', 'zip_url': 'https://example.test/z.zip'}
     path = updater.download_to_staging(info)
     assert path and os.path.isfile(path)
     with open(path, 'rb') as fh:
-        assert fh.read() == b'zipbytes'
-    # Second call reuses the staged file without re-downloading.
+        assert fh.read() == blob
+    # A digest sidecar is written so tampering/corruption can be detected.
+    assert os.path.isfile(path + '.sha256')
+    # Second call reuses the staged file (digest matches) without re-downloading.
     assert updater.download_to_staging(info) == path
     assert len(calls) == 1
+
+
+def test_download_to_staging_rejects_non_zip(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater.tempfile, 'gettempdir', lambda: str(tmp_path))
+    monkeypatch.setattr(updater, '_http_get', lambda url, accept='': b'not a zip')
+    assert updater.download_to_staging(
+        {'version': '3.0', 'zip_url': 'https://example.test/z.zip'}) is None
+
+
+def test_extract_over_blocks_zip_slip(tmp_path):
+    root = tmp_path / 'install'
+    root.mkdir()
+    (root / 'mcp_server').mkdir()
+    evil = _make_zip({'top/mcp_server/ok.py': 'x = 1',
+                      'top/../../escape.py': 'pwned = 1'})
+    import pytest
+    with pytest.raises(RuntimeError, match='zip-slip'):
+        updater._extract_over(evil, str(root))
+    # The escaping payload must NOT have been written outside the root.
+    assert not (tmp_path.parent / 'escape.py').exists()
 
 
 def test_download_to_staging_without_url_or_on_error(tmp_path, monkeypatch):

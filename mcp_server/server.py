@@ -42,15 +42,26 @@ except Exception:  # pragma: no cover - depends on installed SDK
         return {}
 
 
-def _call(op, **params):
-    """Forward to the add-in, turning transport errors into readable strings.
-    The first result of a session also carries the pending-update notice (new
-    version + release notes) gathered by the startup background check."""
+def _call(op, _consume_notice=True, **params):
+    """Forward to the add-in, turning transport errors into a readable dict with
+    a structured error `code`. A genuine model-facing tool result also carries
+    the one-shot pending-update notice; pass _consume_notice=False for calls the
+    model never reads directly (resource prefetches) so the notice isn't eaten
+    before the model sees it."""
     try:
         result = fusion.call(op, params)
-    except (FusionError, FusionNotConnected) as exc:
-        return {'error': str(exc)}
-    if isinstance(result, dict):
+    except FusionNotConnected as exc:
+        return {'error': str(exc), 'code': 'not_connected'}
+    except FusionError as exc:
+        out = {'error': str(exc)}
+        code = getattr(exc, 'code', None)
+        if code:
+            out['code'] = code
+        retriable = getattr(exc, 'retriable', None)
+        if retriable is not None:
+            out['retriable'] = retriable
+        return out
+    if _consume_notice and isinstance(result, dict):
         notice = updater.consume_notice()
         if notice:
             result['fusionmcp_update'] = notice
@@ -87,15 +98,75 @@ def check_for_updates() -> dict:
     return updater.check()
 
 
-@mcp.tool(**_annot(destructiveHint=True))
-def apply_update(confirm: bool = False, method: str = 'auto') -> dict:
-    """Install the latest FusionMCP version (uses the pre-downloaded package
-    from the startup check when present, else downloads). Requires the user's
-    consent: only call with confirm=True after the user has agreed to a specific
-    update reported by check_for_updates or the startup notice. method: "auto"
-    (git pull for a clean checkout, else release zip), "git", or "zip". After it
-    succeeds the user must restart the Fusion add-in and Claude Desktop."""
-    return updater.apply(confirm=confirm, method=method)
+# Elicitation (MCP): when the SDK/client supports it, apply_update asks the human
+# to accept the specific update in-band, instead of trusting a model-set flag.
+# Everything degrades gracefully to the confirm=True gate when unavailable.
+try:
+    from mcp.server.fastmcp import Context as _Context
+except Exception:  # pragma: no cover - depends on installed SDK
+    _Context = None
+
+try:
+    from pydantic import BaseModel
+
+    class _UpdateConsent(BaseModel):
+        """Elicitation response schema: the user's yes/no to installing."""
+        install: bool
+except Exception:  # pragma: no cover
+    _UpdateConsent = None
+
+
+async def _elicit_update_consent(ctx):
+    """Return True if the user explicitly accepted the update via elicitation,
+    False otherwise (declined, cancelled, or elicitation unavailable)."""
+    elicit = getattr(ctx, 'elicit', None)
+    if elicit is None or _UpdateConsent is None:
+        return False
+    info = updater.check()
+    if not info.get('update_available'):
+        return False
+    prompt = ('Install FusionMCP update %s -> %s now? It overwrites the local '
+              'install; you must restart the add-in and Claude Desktop after.'
+              % (info.get('current_version'), info.get('latest_version')))
+    try:
+        # Context.elicit requires a real response schema (a Pydantic model);
+        # schema=None makes the SDK raise, so pass a one-field consent model.
+        result = await elicit(message=prompt, schema=_UpdateConsent)
+    except Exception:  # noqa: BLE001 - client without elicitation, or shape drift
+        return False
+    # Accept a variety of result shapes across SDK versions.
+    action = getattr(result, 'action', None)
+    data = getattr(result, 'data', None)
+    if action is not None:
+        return action == 'accept' and bool(getattr(data, 'install', True))
+    if isinstance(result, tuple) and result:
+        accepted = str(result[0]).lower().startswith('accept')
+        payload = result[1] if len(result) > 1 else None
+        return accepted and bool(getattr(payload, 'install', True))
+    return bool(getattr(result, 'install', result))
+
+
+if _Context is not None:
+    @mcp.tool(**_annot(destructiveHint=True))
+    async def apply_update(confirm: bool = False, method: str = 'auto',
+                           ctx: _Context = None) -> dict:
+        """Install the latest FusionMCP version (uses the pre-downloaded package
+        from the startup check when present, else downloads). Consent is
+        required: when the client supports elicitation, this asks the user to
+        accept the specific update directly; otherwise pass confirm=True only
+        after the user agreed to an update from check_for_updates. method:
+        "auto" (git pull for a clean checkout, else release zip), "git", "zip".
+        After success the user must restart the Fusion add-in and Claude Desktop."""
+        if not confirm and ctx is not None:
+            confirm = await _elicit_update_consent(ctx)
+        return updater.apply(confirm=confirm, method=method)
+else:  # pragma: no cover - old SDK without Context
+    @mcp.tool(**_annot(destructiveHint=True))
+    def apply_update(confirm: bool = False, method: str = 'auto') -> dict:
+        """Install the latest FusionMCP version. Requires confirm=True (the
+        user's consent) after an update reported by check_for_updates. method:
+        "auto"|"git"|"zip". Restart the add-in and Claude Desktop afterwards."""
+        return updater.apply(confirm=confirm, method=method)
 
 
 @mcp.tool(**_annot(readOnlyHint=True))
@@ -244,10 +315,11 @@ def rectangular_pattern(entities: list[str], count1: int, spacing1: float,
                         direction1: str = 'X', count2: int = 0,
                         spacing2: float = 0.0, direction2: str = 'Y') -> dict:
     """Rectangular pattern of body/feature tokens. counts are instance counts,
-    spacings are mm. Set count2>0 for a second direction."""
+    spacings are mm. Set count2>0 for a second direction; spacing2 defaults to
+    spacing1 when left at 0."""
     return _call('rectangular_pattern', entities=entities, count1=count1,
                  spacing1=spacing1, direction1=direction1, count2=count2,
-                 spacing2=spacing2, direction2=direction2)
+                 spacing2=(spacing2 or spacing1), direction2=direction2)
 
 
 @mcp.tool()
@@ -511,21 +583,76 @@ def joint(geo0: str, geo1: str, motion: str = 'rigid', axis: str = 'Z') -> dict:
     return _call('joint', geo0=geo0, geo1=geo1, motion=motion, axis=axis)
 
 
+@mcp.tool()
+def as_built_joint(occ0: str, occ1: str, motion: str = 'rigid',
+                   geometry: str = '', axis: str = 'Z') -> dict:
+    """Joint two occurrences WHERE THEY ALREADY SIT — no geometry snapping — the
+    right tool for imported/positioned assemblies (plain `joint` would move the
+    parts together). occ0/occ1 are occurrence tokens; motion as in `joint`;
+    `geometry` is a face/edge token for the pivot (needed for revolute/slider/
+    cylindrical/etc., omit for rigid)."""
+    return _call('as_built_joint', occ0=occ0, occ1=occ1, motion=motion,
+                 geometry=geometry or None, axis=axis)
+
+
+@mcp.tool()
+def joint_origin(geometry: str, name: str = '') -> dict:
+    """Create a named joint origin at a geometry token (face/edge/vertex/sketch
+    point) — a stable, explicit reference other joints can snap to."""
+    return _call('joint_origin', geometry=geometry, name=name or None)
+
+
+@mcp.tool()
+def contact_set(tokens: list[str] = [], action: str = 'add',
+                name: str = '') -> dict:
+    """Make driven joints respect physical contact instead of parts passing
+    through each other. action="add": create a contact set from 2+ occurrence/
+    body tokens; action="all"/"none": toggle global all-contact. Pairs with
+    drive_joint + interference to sweep a mechanism through its range."""
+    return _call('contact_set', tokens=tokens, action=action, name=name or None)
+
+
 # --------------------------------------------------------------------------- #
 # Materials, measurement, import, timeline
 # --------------------------------------------------------------------------- #
 @mcp.tool()
 def set_material(body: str, material: str, library: str = '') -> dict:
     """Assign a physical material (e.g. "Steel", "Aluminum 6061") to a body
-    token — changes its computed mass. Optional library name to disambiguate."""
+    token — changes its computed mass. Optional library name to disambiguate.
+    Use list_materials to find exact names."""
     return _call('set_material', body=body, material=material, library=library or None)
 
 
 @mcp.tool()
 def set_appearance(body: str, appearance: str, library: str = '') -> dict:
-    """Assign an appearance (colour/finish) to a body token. Optional library."""
+    """Assign an appearance (colour/finish) to a body token. Optional library.
+    Use list_appearances to find exact names."""
     return _call('set_appearance', body=body, appearance=appearance,
                  library=library or None)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def list_materials(filter: str = '', limit: int = 200) -> dict:
+    """Browse material names for set_material: document materials, favourites and
+    the shipped libraries. filter = name substring (e.g. "alum"); limit caps."""
+    return _call('list_materials', filter=filter or None, limit=limit)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def list_appearances(filter: str = '', limit: int = 200) -> dict:
+    """Browse appearance names for set_appearance (document + shipped libraries).
+    filter = name substring; limit caps the result."""
+    return _call('list_appearances', filter=filter or None, limit=limit)
+
+
+@mcp.tool()
+def insert_fastener(size: str = 'M6', length: float = 20.0,
+                    thread: bool = True) -> dict:
+    """Insert a parametric ISO 4762 socket-head cap screw as its own component
+    (head + shank + hex socket + optional cosmetic thread). size:
+    M3|M4|M5|M6|M8|M10|M12; length mm (shank under the head). Real hardware for
+    assemblies/BOM without modelling it by hand; joint it with as_built_joint."""
+    return _call('insert_fastener', size=size, length=length, thread=thread)
 
 
 @mcp.tool(**_annot(readOnlyHint=True))
@@ -565,7 +692,12 @@ def import_file(format: str, path: str, plane: str = 'XY') -> dict:
 @mcp.tool()
 def timeline(action: str = 'list', position: int = 0) -> dict:
     """Inspect or roll back the parametric timeline. action: "list" (items with
-    index/name/suppressed) or "rollback" (move the marker to `position`)."""
+    index/name/suppressed) or "rollback" (move the marker to `position`).
+
+    After action="rollback", tokens created by features beyond `position` are
+    invalid (their geometry is rolled out) — re-run get_state/query_entities
+    before reusing tokens, and move the marker back to the end before resuming
+    edits."""
     return _call('timeline', action=action, position=position)
 
 
@@ -646,7 +778,7 @@ def capture_to_file(path: str, width: int = 1024, height: int = 768,
                                       'fit': fit, 'return_base64': False})
 
 
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
 def fit_view() -> dict:
     """Zoom the viewport to fit the whole model."""
     return _call('fit_view')
@@ -691,7 +823,10 @@ def batch(operations: list[dict], stop_on_error: bool = True) -> dict:
         ]
 
     op names match the other tools (create_sketch, sketch_rectangle, extrude,
-    fillet, ...). Returns a per-operation result list."""
+    fillet, ...). Both "run_fusion_code" and "run_code" work as the op for the
+    escape hatch. "$alias.path" supports .key and [i] including negative indices
+    ([-1]); an unparseable path raises rather than silently mis-resolving.
+    Returns a per-operation result list."""
     return _call('batch', operations=operations, stop_on_error=stop_on_error)
 
 
@@ -796,9 +931,12 @@ def fold(face: str, bend_line: str, angle: float = 90.0, radius: float = 0.0,
     """Fold a sheet-metal body along a bend line (Fusion July 2026+). `face` is
     the stationary face token, `bend_line` a sketch-line token drawn across it
     (create_sketch on the face + sketch_line). angle in degrees, optional bend
-    radius in mm (0 = sheet-metal rule default)."""
+    radius in mm (0 = sheet-metal rule default). corner_relief=False forces
+    relief off; True forces it on."""
+    # Forward corner_relief untouched: `or None` would collapse an explicit
+    # False to None and make "relief off" unreachable.
     return _call('fold', face=face, bend_line=bend_line, angle=angle,
-                 radius=radius or None, corner_relief=corner_relief or None)
+                 radius=radius or None, corner_relief=corner_relief)
 
 
 @mcp.tool()
@@ -977,6 +1115,23 @@ def scan_deviation(scan_path: str, model_path: str, samples: int = 4000,
         return {'error': str(exc)}
 
 
+@mcp.tool(**_annot(readOnlyHint=True))
+def print_check(path: str, bed_x: float = 256.0, bed_y: float = 256.0,
+                bed_z: float = 256.0, overhang_deg: float = 45.0,
+                min_wall: float = 1.0, nozzle: float = 0.4) -> dict:
+    """Score an STL/OBJ/3MF file for FDM 3D printing WITHOUT Fusion: bed fit
+    across orientations (bed_x/y/z mm), unsupported-overhang area for a Z build
+    (faces steeper than overhang_deg below horizontal), thin walls vs
+    min_wall/nozzle, watertightness, and actionable recommendations. Backs the
+    prepare_for_3d_print prompt. Needs the 're' extras (numpy/trimesh)."""
+    try:
+        return scan.print_check(path, bed=(bed_x, bed_y, bed_z),
+                                overhang_deg=overhang_deg, min_wall=min_wall,
+                                nozzle=nozzle)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
 # --------------------------------------------------------------------------- #
 # Mass report, parameter CSV round-trip, CAM
 # --------------------------------------------------------------------------- #
@@ -1096,7 +1251,7 @@ def electronics_library(filter: str = '', limit: int = 0) -> dict:
     return _call('electronics_library', filter=filter or None, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
 def electronics_export(path: str) -> dict:
     """Export the electronics design to an EAGLE 9.6.2 file. The extension
     picks the product: .brd (board), .sch (schematic), .lbr (library); it
@@ -1158,6 +1313,31 @@ def open_document(name: str, project: str = '') -> dict:
     return _call('open_document', name=name, project=project or None)
 
 
+@mcp.tool(**_annot(readOnlyHint=True))
+def data_folders(project: str = '', max_depth: int = 3) -> dict:
+    """Browse the cloud data tree: projects -> nested folders with file names.
+    Deeper than list_documents (which only sees root folders) — use it to find a
+    document buried in subfolders before open_document. project = name filter;
+    max_depth caps recursion."""
+    return _call('data_folders', project=project or None, max_depth=max_depth)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def version_history() -> dict:
+    """Version history of the ACTIVE saved document: version number, date and id
+    per version, newest first. Narrate "what changed since v12" or pair with
+    mesh_compare across exports."""
+    return _call('version_history')
+
+
+@mcp.tool()
+def share_link(create: bool = False) -> dict:
+    """Get a shareable link for the ACTIVE saved document. create=True publishes
+    the document to anyone with the link (get explicit user consent first);
+    create=False (default) only reports whether a link already exists."""
+    return _call('share_link', create=create)
+
+
 # --------------------------------------------------------------------------- #
 # Interaction: selection, highlighting, visibility, multi-view, section, undo
 # --------------------------------------------------------------------------- #
@@ -1170,7 +1350,7 @@ def get_selection() -> dict:
     return _call('get_selection')
 
 
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
 def selection_filter(action: str = 'list', filters: list[str] = [],
                      enabled: bool = True) -> dict:
     """Inspect or set the active workspace's selection filters (Fusion July
@@ -1182,7 +1362,7 @@ def selection_filter(action: str = 'list', filters: list[str] = [],
                  enabled=enabled)
 
 
-@mcp.tool()
+@mcp.tool(**_annot(readOnlyHint=True))
 def highlight(tokens: list[str] = []) -> dict:
     """Select the given tokens in the Fusion UI so the USER can see which
     entities you mean — confirm before destructive edits ("I'll fillet these 4
@@ -1210,6 +1390,23 @@ def isolate(token: str) -> dict:
 def unisolate() -> dict:
     """Restore the visibility state saved by isolate."""
     return _call('unisolate')
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def annotate(texts: list[dict] = [], lines: list[dict] = []) -> dict:
+    """Overlay labels and leader lines on the viewport (custom graphics) so the
+    next screenshot explains itself — callouts, dimensions-as-text, arrows.
+    texts: [{"text","x","y","z","size"}] (mm; size = cap height, default 5).
+    lines: [{"from":[x,y,z], "to":[x,y,z]}] (mm). Overlays aren't geometry and
+    don't touch the model; each call adds to the current overlay. Clear with
+    annotations_clear."""
+    return _call('annotate', texts=texts, lines=lines)
+
+
+@mcp.tool()
+def annotations_clear() -> dict:
+    """Remove the viewport annotation overlay created by annotate."""
+    return _call('annotations_clear')
 
 
 # NOTE: deliberately no return annotation — `-> list[Image]` makes FastMCP try
@@ -1284,22 +1481,26 @@ def open_viewer() -> dict:
 # --------------------------------------------------------------------------- #
 # Resources — read-only views a client can fetch without invoking a tool
 # --------------------------------------------------------------------------- #
+# Resources bypass the update-notice consumption (_consume_notice=False): a
+# client that prefetches these at session start must not swallow the one-shot
+# notice before any model-facing tool result can carry it.
 @mcp.resource('fusion://design/state')
 def resource_state() -> str:
     """Current design summary (bodies, sketches, parameters) as JSON."""
-    return json.dumps(_call('get_state'), ensure_ascii=False)
+    return json.dumps(_call('get_state', _consume_notice=False), ensure_ascii=False)
 
 
 @mcp.resource('fusion://design/parameters')
 def resource_parameters() -> str:
     """All model/user parameters as JSON."""
-    return json.dumps(_call('list_parameters'), ensure_ascii=False)
+    return json.dumps(_call('list_parameters', _consume_notice=False), ensure_ascii=False)
 
 
 @mcp.resource('fusion://design/tree')
 def resource_tree() -> str:
     """Component/occurrence hierarchy as JSON."""
-    return json.dumps(_call('query_entities', kind='occurrences'), ensure_ascii=False)
+    return json.dumps(_call('query_entities', kind='occurrences', _consume_notice=False),
+                      ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- #

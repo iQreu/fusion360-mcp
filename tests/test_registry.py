@@ -54,8 +54,32 @@ def test_get_opt_returns_none_for_unknown():
     assert reg.get_opt('ghost1') is None
 
 
-def test_reset_clears_everything():
+def test_reset_invalidates_old_tokens_without_reusing_strings():
     reg = Registry()
-    reg.add('edg', _Obj('ET-9'))
+    old = reg.add('edg', _Obj('ET-9'))
     reg.reset()
-    assert reg.add('edg', _Obj()) == 'edg1'  # counters restarted
+    # Old token is dead after reset...
+    with pytest.raises(KeyError):
+        reg.get(old)
+    # ...and its string is NOT reissued, so a stale client token can never
+    # silently resolve to a different entity.
+    fresh = reg.add('edg', _Obj())
+    assert fresh != old
+    assert fresh == 'edg2'
+
+
+def test_remove_forgets_token():
+    reg = Registry()
+    tok = reg.add('bdy', _Obj('ET-7'))
+    reg.remove(tok)
+    with pytest.raises(KeyError):
+        reg.get(tok)
+    # entityToken mapping is gone too: re-adding the same entity mints a new
+    # token rather than resurrecting the removed one.
+    again = reg.add('bdy', _Obj('ET-7'))
+    assert again != tok
+
+
+def test_remove_unknown_token_is_noop():
+    reg = Registry()
+    reg.remove('ghost1')  # must not raise

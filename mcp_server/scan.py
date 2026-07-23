@@ -304,6 +304,97 @@ def _wall_thickness(mesh, scale):
 
 
 # --------------------------------------------------------------------------- #
+# print_check — 3D-print readiness analysis (no Fusion, no numpy.random)
+# --------------------------------------------------------------------------- #
+_PRINT_SAMPLE = 4000
+
+
+def print_check(path, bed=(256.0, 256.0, 256.0), overhang_deg=45.0,
+                min_wall=1.0, nozzle=0.4):
+    """Score an STL for FDM 3D printing (all mm): bed fit across orientations,
+    unsupported-overhang area for a Z build, thin walls vs nozzle/min_wall, and
+    a flat footprint estimate. Pure trimesh/numpy — no Fusion round-trip."""
+    mesh = _load(path)
+    ext = np.asarray(mesh.extents, dtype=float)  # x,y,z size
+    size = [float(x) for x in ext]
+    bed = [float(b) for b in bed]
+
+    # Bed fit: the part fits if some axis-permutation of its bounding box fits
+    # within the bed footprint (x,y) and height (z).
+    import itertools
+    fits_orientations = []
+    for perm in set(itertools.permutations(range(3))):
+        d = [ext[perm[0]], ext[perm[1]], ext[perm[2]]]
+        if d[0] <= bed[0] and d[1] <= bed[1] and d[2] <= bed[2]:
+            fits_orientations.append(['xyz'[perm[0]], 'xyz'[perm[1]], 'xyz'[perm[2]]])
+    fits = bool(fits_orientations)
+
+    # Overhang: face area whose downward tilt from vertical exceeds the printable
+    # angle (measured for a +Z build). A face needs support when the angle
+    # between its normal and -Z is small (it faces down) beyond the threshold.
+    normals = np.asarray(mesh.face_normals, dtype=float)
+    areas = np.asarray(mesh.area_faces, dtype=float)
+    total_area = float(areas.sum()) or 1.0
+    down = normals[:, 2]  # cos(angle to +Z); downward faces have negative z
+    # Steepness from the build plate: a face is "overhang" if it points downward
+    # more than `overhang_deg` below horizontal, excluding the near-flat bottom.
+    overhang_mask = down < -math.sin(math.radians(overhang_deg))
+    # Exclude only the base resting on the plate: fully downward faces AND near
+    # the lowest Z. An elevated flat overhang (bridge/ceiling) also has a
+    # downward normal but sits high, so it must STILL count as unsupported.
+    z_centroid = np.asarray(mesh.triangles_center, dtype=float)[:, 2]
+    z_min = float(z_centroid.min())
+    base_band = max(0.5, 0.02 * float(ext[2]))  # a thin layer above the bed
+    on_plate = (down < -0.999) & (z_centroid <= z_min + base_band)
+    overhang_mask = overhang_mask & ~on_plate
+    overhang_area = float(areas[overhang_mask].sum())
+
+    walls = _wall_thickness(mesh, float(max(ext)))
+    thin = None
+    if walls and 'p5' in walls:
+        thin = {
+            'median_mm': walls['median'],
+            'p5_mm': walls['p5'],
+            'below_min_wall': walls['p5'] < min_wall,
+            'below_two_nozzle': walls['p5'] < 2 * nozzle,
+        }
+
+    recommendations = []
+    if not fits:
+        recommendations.append('Part exceeds the bed in every orientation — '
+                               'scale down or split it.')
+    if overhang_area / total_area > 0.15:
+        recommendations.append('Significant unsupported overhang area (%.0f%%) — '
+                               'reorient or enable supports.'
+                               % (100 * overhang_area / total_area))
+    if thin and thin['below_min_wall']:
+        recommendations.append('Thin walls below %.2f mm detected — thicken or '
+                               'they may not print.' % min_wall)
+    if not mesh.is_watertight:
+        recommendations.append('Mesh is not watertight — repair before slicing.')
+    if not recommendations:
+        recommendations.append('No blocking issues found for FDM printing.')
+
+    return {
+        'file': path,
+        'size_mm': _rounded(size, 2),
+        'bed_mm': bed,
+        'fits_bed': fits,
+        'fit_orientations': fits_orientations,
+        'watertight': bool(mesh.is_watertight),
+        'volume_mm3': _rounded(float(mesh.volume), 2) if mesh.is_watertight else None,
+        'overhang': {
+            'threshold_deg': overhang_deg,
+            'unsupported_area_fraction': _rounded(overhang_area / total_area, 3),
+        },
+        'walls': thin or walls,
+        'min_wall_mm': min_wall,
+        'nozzle_mm': nozzle,
+        'recommendations': recommendations,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # sections
 # --------------------------------------------------------------------------- #
 _AXES = {
@@ -336,26 +427,47 @@ def _assemble_loops(segments, tol=1e-4):
 
     used = [False] * len(segs)
     loops = []
+
+    def walk(points):
+        """Extend `points` forward from its tail as far as the chain goes.
+        Returns True if it closed back onto points[0]. Stops without appending
+        if it would re-enter a vertex already in the chain (a branch junction on
+        a non-watertight contour), so a shared vertex is never duplicated."""
+        seen = {key(tuple(pt)) for pt in points}
+        while True:
+            tail = points[-1]
+            candidates = [c for c in adjacency.get(key(tuple(tail)), [])
+                          if not used[c[0]]]
+            if not candidates:
+                return False
+            idx, end = candidates[0]
+            nxt = segs[idx][1 - end]
+            nkey = key(nxt)
+            if nkey == key(tuple(points[0])):
+                used[idx] = True
+                return True
+            if nkey in seen:
+                # Re-entering the existing chain (degree>=3 junction): stop here
+                # rather than appending a duplicate vertex.
+                return False
+            used[idx] = True
+            seen.add(nkey)
+            points.append(list(nxt))
+
     for start in range(len(segs)):
         if used[start]:
             continue
         used[start] = True
         a, b = segs[start]
         points = [list(a), list(b)]
-        closed = False
-        while True:
-            tail = points[-1]
-            candidates = [c for c in adjacency.get(key(tuple(tail)), [])
-                          if not used[c[0]]]
-            if not candidates:
-                break
-            idx, end = candidates[0]
-            used[idx] = True
-            nxt = segs[idx][1 - end]
-            if key(nxt) == key(tuple(points[0])):
-                closed = True
-                break
-            points.append(list(nxt))
+        closed = walk(points)
+        if not closed:
+            # The seed may sit MID-chain in an open (non-watertight) contour, so
+            # also walk backward from the head and prepend — otherwise one
+            # physical contour is fragmented into arbitrary pieces.
+            head = list(reversed(points))
+            walk(head)               # extends from the original start point
+            points = list(reversed(head))
         loops.append((points, closed))
     return loops
 
@@ -408,7 +520,9 @@ def sections(path, axis='z', count=8, heights=None, max_points=80):
                               'radius_mm': _rounded(r),
                               'fit_error_mm': _rounded(err)})
             else:
-                stride = max(1, len(flat) // max_points)
+                # Ceiling division keeps the decimated count <= max_points
+                # (floor division could return nearly 2x the promised bound).
+                stride = max(1, -(-len(flat) // max_points))
                 entry.update({'kind': 'polyline',
                               'points_mm': _rounded(flat[::stride])})
             contours.append(entry)
@@ -430,12 +544,21 @@ def sections(path, axis='z', count=8, heights=None, max_points=80):
 # --------------------------------------------------------------------------- #
 # deviation
 # --------------------------------------------------------------------------- #
+# Upper bound on deviation() sampling: the chunked NN allocates a
+# (chunk, 4*samples) float64 matrix, so an unbounded `samples` (e.g. 100000)
+# would try to allocate hundreds of MB and thrash/OOM the target machines.
+_MAX_DEVIATION_SAMPLES = 20000
+
+
 def deviation(scan_path, model_path, samples=4000, tolerance=0.2):
     """Compare a scan with a rebuilt model (both mesh files, both in mm):
     point-sampled two-way surface distances with percentile stats and the
     fraction within tolerance. Approximate (sampling-based) by design."""
     scan_mesh = _load(scan_path)
     model_mesh = _load(model_path)
+    requested = int(samples)
+    samples = max(100, min(requested, _MAX_DEVIATION_SAMPLES))
+    samples_clamped = samples != requested
 
     def one_way(src, dst):
         # Nearest sampled point picks the candidate face; the exact
@@ -460,6 +583,8 @@ def deviation(scan_path, model_path, samples=4000, tolerance=0.2):
         'scan': scan_path,
         'model': model_path,
         'tolerance_mm': tolerance,
+        'samples': samples,
+        'samples_clamped': samples_clamped,
         'scan_to_model': one_way(scan_mesh, model_mesh),
         'model_to_scan': one_way(model_mesh, scan_mesh),
         'note': ('Sampling-based approximation. scan_to_model shows scan '

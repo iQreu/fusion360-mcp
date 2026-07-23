@@ -25,10 +25,17 @@ if (-not $uv) { throw 'uv installation failed; install it manually from https://
 Write-Host "uv: $uv" -ForegroundColor Green
 
 # --- 2. server deps -------------------------------------------------------- #
+# In Windows PowerShell 5.1 $ErrorActionPreference='Stop' does NOT stop on a
+# native command's non-zero exit, so check $LASTEXITCODE explicitly — otherwise
+# a failed dependency sync silently proceeds to write a config for a dead server.
 Write-Host 'Resolving MCP server dependencies...' -ForegroundColor Yellow
 Push-Location $ServerDir
 & $uv sync
+$syncExit = $LASTEXITCODE
 Pop-Location
+if ($syncExit -ne 0) {
+    throw "uv sync failed (exit $syncExit). Fix the dependency error above and re-run; nothing was configured."
+}
 
 # --- 3. Fusion add-in ------------------------------------------------------ #
 $AddinDst = Join-Path $env:APPDATA 'Autodesk\Autodesk Fusion 360\API\AddIns\FusionMCP'
@@ -45,6 +52,11 @@ New-Item -ItemType Directory -Force -Path $CfgDir | Out-Null
 if (Test-Path $CfgPath) {
     $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
 } else {
+    $cfg = [pscustomobject]@{}
+}
+# An empty or whitespace-only existing config makes ConvertFrom-Json return
+# $null, and Add-Member on $null crashes mid-install — fall back to a fresh object.
+if ($null -eq $cfg) {
     $cfg = [pscustomobject]@{}
 }
 if (-not ($cfg.PSObject.Properties.Name -contains 'mcpServers')) {

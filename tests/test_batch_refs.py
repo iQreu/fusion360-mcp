@@ -18,6 +18,24 @@ def test_resolve_unknown_alias_raises():
         commands._resolve_ref('$missing.x', {})
 
 
+def test_resolve_negative_index():
+    results = {'r': {'profiles': [{'token': 'prf1'}, {'token': 'prf2'}]}}
+    assert commands._resolve_ref('$r.profiles[-1].token', results) == 'prf2'
+
+
+def test_resolve_unparseable_segment_raises():
+    # '(0)' is not a valid path segment — must raise, not silently pass the list.
+    results = {'r': {'profiles': [{'token': 'prf1'}]}}
+    with pytest.raises(ValueError):
+        commands._resolve_ref('$r.profiles(0)', results)
+
+
+def test_resolve_trailing_garbage_raises():
+    results = {'s': {'sketch': 'skt1'}}
+    with pytest.raises(ValueError):
+        commands._resolve_ref('$s.sketch extra', results)
+
+
 def test_resolve_params_recurses_into_lists_and_dicts():
     results = {'b': {'bodies': [{'token': 'bdy7'}]}}
     params = {'target': '$b.bodies[0].token', 'tools': ['$b.bodies[0].token'],
