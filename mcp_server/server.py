@@ -323,13 +323,15 @@ def hole(sketch: str, x: float, y: float, diameter: float, depth: float = 0.0,
 @mcp.tool()
 def construction_plane(method: str = 'offset', base: str = 'XY', offset: float = 0.0,
                        axis: str = 'X', angle: float = 0.0, points: list[str] = [],
-                       face: str = '') -> dict:
+                       face: str = '', extended: bool = True) -> dict:
     """Create a construction plane. method: "offset" (base plane/face + offset mm),
     "angle" (base + axis + angle deg), "three_points" (3 point tokens),
     "tangent" (cylindrical face + angle). Returns a plane token usable anywhere a
-    plane is accepted."""
+    plane is accepted. extended=False shows it as a compact square instead of
+    stretching across the viewport (Fusion July 2026+, ignored on older)."""
     return _call('construction_plane', method=method, base=base, offset=offset,
-                 axis=axis, angle=angle, points=points, face=face or None)
+                 axis=axis, angle=angle, points=points, face=face or None,
+                 extended=None if extended else False)
 
 
 @mcp.tool()
@@ -343,11 +345,15 @@ def construction_axis(method: str = 'edge', edge: str = '', points: list[str] = 
 
 @mcp.tool()
 def construction_point(method: str = 'at_point', point: str = '', edges: list[str] = [],
-                       edge: str = '', plane: str = '') -> dict:
+                       edge: str = '', plane: str = '', path: str = '',
+                       ratio: float = 0.5) -> dict:
     """Create a construction point. method: "at_point" (vertex/sketch-point token),
-    "two_edges" (2 edge tokens), "edge_plane" (edge token + plane)."""
+    "two_edges" (2 edge tokens), "edge_plane" (edge token + plane),
+    "distance_on_path" (edge/sketch-curve token in `path` + `ratio` 0..1 along
+    it — 0=start, 1=end; Fusion July 2026+)."""
     return _call('construction_point', method=method, point=point or None,
-                 edges=edges, edge=edge or None, plane=plane or None)
+                 edges=edges, edge=edge or None, plane=plane or None,
+                 path=path or None, ratio=ratio)
 
 
 @mcp.tool()
@@ -392,6 +398,28 @@ def sketch_fillet(sketch: str, line1: str, line2: str, radius: float) -> dict:
     return _call('sketch_fillet', sketch=sketch, line1=line1, line2=line2, radius=radius)
 
 
+@mcp.tool()
+def sketch_blend_curve(sketch: str, curve1: str, curve2: str,
+                       end1: str = '', end2: str = '',
+                       curvature: bool = False) -> dict:
+    """Bridge two OPEN sketch curves with a smooth fitted spline (Fusion July
+    2026+). Ends are picked automatically (closest endpoints) unless end1/end2
+    ("start"|"end") force a side. curvature=True gives a curvature-continuous
+    G2 blend (default is tangent/G1)."""
+    return _call('sketch_blend_curve', sketch=sketch, curve1=curve1,
+                 curve2=curve2, end1=end1 or None, end2=end2 or None,
+                 curvature=curvature)
+
+
+@mcp.tool()
+def auto_constrain(sketch: str) -> dict:
+    """Run Fusion's AutoConstrain on a sketch (2026+): adds the geometric
+    constraints a human would (horizontal/vertical/coincident/...) in one
+    call — stabilises imported DXF or quickly-drawn geometry before
+    dimensioning."""
+    return _call('auto_constrain', sketch=sketch)
+
+
 # --------------------------------------------------------------------------- #
 # Advanced features
 # --------------------------------------------------------------------------- #
@@ -434,6 +462,14 @@ def thread(face: str, internal: bool = False, modeled: bool = True) -> dict:
     """Add a thread to a cylindrical face token, sized from Fusion's recommended
     thread data. modeled=True cuts real geometry; False is cosmetic."""
     return _call('thread', face=face, internal=internal, modeled=modeled)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def thread_types() -> dict:
+    """List available thread standards: defaults, all/public built-in types,
+    and (Fusion July 2026+) custom thread libraries hosted on the team hub
+    with their thread types."""
+    return _call('thread_types')
 
 
 @mcp.tool()
@@ -665,18 +701,40 @@ def run_fusion_code(code: str) -> dict:
     the power tool for anything the curated tools don't cover, in ONE round trip.
 
     In scope: adsk, app, ui, design, root, math, MM (mm->cm factor), registry,
-    reg(kind, obj) -> token, and mm/degree helpers returning LIVE objects:
+    reg(kind, obj) -> token, tok(token) -> LIVE object (use tokens from
+    get_state/query_entities directly in code), store(name, obj) / fetch(name)
+    (keep any object across snippets for the session), and mm/degree helpers
+    returning LIVE objects:
         pt(x_mm, y_mm, z_mm=0), mm(v), vmm(v)->ValueInput, deg(d)->radians,
         new_sketch(plane), rect(sk, x1,y1,x2,y2), circle(sk, cx,cy,r),
         extrude_profile(profile, dist_mm, operation='new', symmetric=False)
     Assign to `result` (JSON-serialisable) to return a value; stdout is captured.
+    Unsure of a property name? Check first with api_introspect.
 
     Example (a 40x20x10 mm block in a few lines):
         sk = new_sketch("XY"); rect(sk, 0, 0, 40, 20)
         f = extrude_profile(sk.profiles.item(0), 10)
         result = f.bodies.item(0).name
+
+    Example (continue on an existing body across calls):
+        body = tok("bdy1"); store("base", body)
+        # ...later snippet: body = fetch("base")
     """
     return _call('run_code', code=code)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def api_introspect(target: str = 'adsk.fusion', query: str = '',
+                   limit: int = 80) -> dict:
+    """Explore the Fusion API surface before writing run_fusion_code: list an
+    object's members (properties/methods/enum values) with one-line docs.
+    target: an entity token ("bdy1"), a stored object ("$name" from
+    store(...)), or a dotted path ("adsk.fusion.ExtrudeFeatures",
+    "adsk.drawing", "adsk.cam"). `query` filters member names by substring —
+    e.g. target="bdy1", query="area". Reads the class, never evaluates live
+    properties."""
+    return _call('api_introspect', target=target, query=query or None,
+                 limit=limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -723,12 +781,33 @@ def flat_pattern(face: str = '', body: str = '') -> dict:
 
 
 @mcp.tool()
-def export_flat_pattern(path: str, face: str = '', body: str = '') -> dict:
-    """Export the flat pattern as a DXF outline ready for laser/waterjet
-    cutting. Creates the flat pattern first when a face/body token is given and
-    none exists yet."""
+def export_flat_pattern(path: str, face: str = '', body: str = '',
+                        format: str = 'dxf') -> dict:
+    """Export the flat pattern for fabrication: format "dxf" (2D outline for
+    laser/waterjet) or "step" (3D flat solid, Fusion July 2026+). Creates the
+    flat pattern first when a face/body token is given and none exists yet."""
     return _call('export_flat_pattern', path=path, face=face or None,
-                 body=body or None)
+                 body=body or None, format=format)
+
+
+@mcp.tool()
+def fold(face: str, bend_line: str, angle: float = 90.0, radius: float = 0.0,
+         corner_relief: bool = False) -> dict:
+    """Fold a sheet-metal body along a bend line (Fusion July 2026+). `face` is
+    the stationary face token, `bend_line` a sketch-line token drawn across it
+    (create_sketch on the face + sketch_line). angle in degrees, optional bend
+    radius in mm (0 = sheet-metal rule default)."""
+    return _call('fold', face=face, bend_line=bend_line, angle=angle,
+                 radius=radius or None, corner_relief=corner_relief or None)
+
+
+@mcp.tool()
+def join_by_bend(edge_a: str, edge_b: str, radius: float = 0.0) -> dict:
+    """Join two sheet-metal bodies with a bend between two linear edges of
+    DIFFERENT bodies (Fusion July 2026+). Pick the edges with query_entities
+    kind="edges". Optional bend radius in mm (0 = rule default)."""
+    return _call('join_by_bend', edge_a=edge_a, edge_b=edge_b,
+                 radius=radius or None)
 
 
 @mcp.tool()
@@ -815,14 +894,32 @@ def mesh_section(mesh: str, plane: str = 'XY', offset: float = 0.0) -> dict:
     return _call('mesh_section', mesh=mesh, plane=plane, offset=offset)
 
 
+@mcp.tool(**_annot(readOnlyHint=True))
+def mesh_compare(mesh_a: str, mesh_b: str, tolerance: float = 0.2) -> dict:
+    """Native signed-distance deviation between two mesh bodies IN the design
+    (Fusion July 2026+) — no file round-trip. Per-node distance stats in mm
+    (mean/rms/p50/p90/p99/max, signed min/max) plus the fraction within
+    `tolerance` mm. The fast verification loop for reverse engineering; for
+    file-vs-file comparison (or older Fusion) use scan_deviation."""
+    return _call('mesh_compare', mesh_a=mesh_a, mesh_b=mesh_b,
+                 tolerance=tolerance)
+
+
 @mcp.tool()
-def create_drawing(template: str = '', headless: bool = True) -> dict:
-    """Create a drawing for the active design. Fusion 2026+ can do this
-    headlessly (optionally from a `template`); older versions get the
+def create_drawing(template: str = '', headless: bool = True,
+                   sheet_size: str = '', orientation: str = '',
+                   standard: str = '', drawing_units: str = '') -> dict:
+    """Create a drawing for the active design. Fusion July 2026+ does this
+    fully headlessly (DrawingManager API): optional `template` file,
+    sheet_size ("A0".."A4" ISO or "A".."E" ASME), orientation
+    ("landscape"|"portrait"), standard ("iso"|"asme"), drawing_units
+    ("mm"|"in"). Older versions fall back to a bare drawing document or the
     "Drawing from Design" dialog, which the user completes in the UI. Then
-    export it with drawing_export. For fully scripted 2D output without a
+    export with drawing_export. For fully scripted 2D output without a
     drawing sheet use export_sketch_dxf / export_flat_pattern."""
-    return _call('create_drawing', template=template or None, headless=headless)
+    return _call('create_drawing', template=template or None, headless=headless,
+                 sheet_size=sheet_size or None, orientation=orientation or None,
+                 standard=standard or None, drawing_units=drawing_units or None)
 
 
 @mcp.tool()
@@ -904,6 +1001,18 @@ def import_parameters(csv_path: str) -> dict:
     comment). Existing parameters are updated, unknown names become new user
     parameters; returns per-row results."""
     return _call('import_parameters', csv_path=csv_path)
+
+
+@mcp.tool()
+def configurations(action: str = 'list', name: str = '', row: int = 0,
+                   column: int = 0) -> dict:
+    """Work with a configured design's configuration table. action: "list"
+    (configurations + columns + which is active), "activate" (name = the
+    configuration to switch the design to), "cell" (row/column indexes — read
+    one table cell). Returns {configured: false} when the design has no
+    configurations."""
+    return _call('configurations', action=action, name=name or None,
+                 row=row, column=column)
 
 
 @mcp.tool(**_annot(readOnlyHint=True))
@@ -1059,6 +1168,18 @@ def get_selection() -> dict:
     face/edge/body they mean, then call this instead of guessing geometry.
     Faces report centroid/type, edges report length."""
     return _call('get_selection')
+
+
+@mcp.tool()
+def selection_filter(action: str = 'list', filters: list[str] = [],
+                     enabled: bool = True) -> dict:
+    """Inspect or set the active workspace's selection filters (Fusion July
+    2026+) — narrow what the user's clicks can pick before asking them to
+    select something (e.g. faces only, then get_selection). action: "list"
+    (available filters + state), "set" (filters=[names], enabled), "all"
+    (enabled for every filter). Restore with action="all", enabled=True."""
+    return _call('selection_filter', action=action, filters=filters,
+                 enabled=enabled)
 
 
 @mcp.tool()

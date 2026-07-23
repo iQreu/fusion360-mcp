@@ -23,10 +23,15 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.7.0'
+VERSION = '1.8.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
+
+# Cross-call object store for run_code: store('jig', obj) in one snippet,
+# fetch('jig') in a later one. Session-lived, like the token registry, but
+# holds arbitrary Python objects (inputs, dicts, ...), not just entities.
+_code_store = {}
 
 # get_state / query_entities cache. Invalidated by a mutation generation counter
 # (bumped in dispatch after any non-read-only op) combined with a cheap structural
@@ -42,6 +47,7 @@ _READ_ONLY_OPS = frozenset({
     'mass_properties', 'cam_setups', 'export_parameters',
     'electronics_info', 'electronics_components', 'electronics_nets',
     'electronics_layers', 'electronics_library', 'electronics_export',
+    'mesh_compare', 'thread_types', 'api_introspect', 'selection_filter',
 })
 
 
@@ -626,6 +632,11 @@ def op_construction_plane(app, p):
     else:
         raise ValueError('method must be offset|angle|three_points|tangent, got %r' % method)
     plane = planes.add(cin)
+    if p.get('extended') is not None:
+        # July 2026+: isExtended=True stretches the plane display to the
+        # viewport; False keeps the compact resized square.
+        with contextlib.suppress(Exception):
+            plane.isExtended = bool(p['extended'])
     return {'plane': _registry.add('pln', plane), 'method': method}
 
 
@@ -651,7 +662,9 @@ def op_construction_axis(app, p):
 
 def op_construction_point(app, p):
     """Create a construction point. method: at_point (vertex/sketch-point token),
-    two_edges (2 edge tokens), edge_plane (edge token + plane)."""
+    two_edges (2 edge tokens), edge_plane (edge token + plane),
+    distance_on_path (edge/sketch-curve token + ratio 0..1 along it,
+    Fusion July 2026+)."""
     root = _root(app)
     pts = root.constructionPoints
     cin = pts.createInput()
@@ -663,8 +676,15 @@ def op_construction_point(app, p):
         cin.setByTwoEdges(edges[0], edges[1])
     elif method == 'edge_plane':
         cin.setByEdgeAndPlane(_registry.get(p['edge']), _resolve_plane(app, p['plane']))
+    elif method == 'distance_on_path':
+        setter = getattr(cin, 'setByDistanceOnPath', None)
+        if setter is None:
+            raise RuntimeError('distance_on_path needs Fusion July 2026+')
+        # The distance is a normalised ratio: 0 = path start, 1 = path end.
+        setter(_registry.get(p['path']), _vi(float(p.get('ratio', 0.5))))
     else:
-        raise ValueError('method must be at_point|two_edges|edge_plane, got %r' % method)
+        raise ValueError('method must be at_point|two_edges|edge_plane|'
+                         'distance_on_path, got %r' % method)
     point = pts.add(cin)
     return {'point': _registry.add('cpt', point), 'method': method}
 
@@ -770,6 +790,63 @@ def op_sketch_fillet(app, p):
 # --------------------------------------------------------------------------- #
 # Advanced features (loft / sweep / rib / draft / thread / split)
 # --------------------------------------------------------------------------- #
+def op_sketch_blend_curve(app, p):
+    """Bridge two OPEN sketch curves with a smooth fitted spline (Fusion July
+    2026+). Ends are picked automatically (closest endpoints) unless
+    end1/end2 ("start"|"end") force a side. curvature=True gives a G2 blend
+    (default G1/tangent)."""
+    sk = _registry.get(p['sketch'])
+    adder = getattr(sk.sketchCurves.sketchFittedSplines, 'addBlendCurve', None)
+    if adder is None:
+        raise RuntimeError('addBlendCurve needs Fusion July 2026+')
+    c1, c2 = _registry.get(p['curve1']), _registry.get(p['curve2'])
+
+    def endpoints(curve):
+        out = {}
+        for which, attr in (('start', 'startSketchPoint'), ('end', 'endSketchPoint')):
+            with contextlib.suppress(Exception):
+                out[which] = getattr(curve, attr).geometry
+        if not out:
+            raise RuntimeError('curve has no endpoints — closed curves cannot blend')
+        return out
+
+    e1, e2 = endpoints(c1), endpoints(c2)
+    pick1 = (p.get('end1') or '').lower()
+    pick2 = (p.get('end2') or '').lower()
+    if pick1 in e1 and pick2 in e2:
+        p1, p2 = e1[pick1], e2[pick2]
+    else:
+        def dist2(a, b):
+            return (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2
+        p1, p2 = min(((pa, pb) for pa in e1.values() for pb in e2.values()),
+                     key=lambda pair: dist2(*pair))
+    spline = adder(c1, p1, c2, p2, bool(p.get('curvature', False)))
+    out = _profiles_summary(sk)
+    out['curve'] = _registry.add('spl', spline)
+    return out
+
+
+def op_auto_constrain(app, p):
+    """Run Fusion's AutoConstrain on a sketch (2026+): adds the geometric
+    constraints a human would (horizontal/vertical/coincident/...), stabilising
+    imported DXF or hand-drawn geometry in one call."""
+    sk = _registry.get(p['sketch'])
+    maker = getattr(sk, 'createAutoConstrainInput', None)
+    runner = getattr(sk, 'autoConstrain', None)
+    if not (maker and runner):
+        raise RuntimeError('The AutoConstrain API is not in this Fusion build '
+                           '(needs 2026+).')
+    result = runner(maker())
+    out = {'sketch': p['sketch'], 'applied': result is not None}
+    for attr, key in (('constraintCount', 'constraints_added'),
+                      ('dimensionCount', 'dimensions_added')):
+        with contextlib.suppress(Exception):
+            out[key] = getattr(result, attr)
+    with contextlib.suppress(Exception):
+        out['moved_geometry'] = result.movedGeometry.count
+    return out
+
+
 def op_loft(app, p):
     """Loft through 2+ profile tokens. Optional `rails` (curve/edge tokens) guide
     the shape. operation: new|join|cut|intersect."""
@@ -840,6 +917,35 @@ def op_thread(app, p):
     tin = feats.createInput(face, info)
     tin.isModeled = bool(p.get('modeled', True))
     return _feature_result(feats.add(tin), 'thread')
+
+
+def op_thread_types(app, p):
+    """List the thread standards available to the thread tool — built-in
+    types plus (Fusion July 2026+) custom thread libraries hosted on the
+    team hub."""
+    query = _root(app).features.threadFeatures.threadDataQuery
+    out = {}
+    for attr, key in (('defaultMetricThreadType', 'default_metric'),
+                      ('defaultInchThreadType', 'default_inch')):
+        with contextlib.suppress(Exception):
+            out[key] = getattr(query, attr)
+    for attr, key in (('allThreadTypes', 'all'), ('publicThreadTypes', 'public')):
+        with contextlib.suppress(Exception):
+            out[key] = list(getattr(query, attr))
+    hubs = []
+    with contextlib.suppress(Exception):
+        for hub_id in query.availableHubLibraryIds:
+            entry = {'id': hub_id}
+            with contextlib.suppress(Exception):
+                entry['name'] = query.getHubLibraryDisplayName(hub_id)
+            with contextlib.suppress(Exception):
+                entry['thread_types'] = list(query.getHubLibraryThreadTypes(hub_id))
+            hubs.append(entry)
+    if hubs:
+        out['hub_libraries'] = hubs
+    if not out:
+        raise RuntimeError('Thread data query returned nothing — is a design open?')
+    return out
 
 
 def op_split_body(app, p):
@@ -1577,9 +1683,75 @@ def op_export_flat_pattern(app, p):
                            'body token of a sheet-metal body to create one.')
     flat = product.flatPattern
     em = product.exportManager
-    opts = em.createDXFFlatPatternExportOptions(p['path'], flat)
+    fmt = (p.get('format') or 'dxf').lower()
+    if fmt == 'dxf':
+        opts = em.createDXFFlatPatternExportOptions(p['path'], flat)
+    elif fmt == 'step':
+        creator = getattr(em, 'createSTEPExportOptionsForFlatPattern', None)
+        if creator is None:
+            raise RuntimeError('STEP flat-pattern export needs Fusion July 2026+; '
+                               'use format="dxf" on this build.')
+        opts = creator(p['path'], flat)
+    else:
+        raise ValueError('format must be dxf|step, got %r' % fmt)
     em.execute(opts)
-    return {'exported': p['path'], 'format': 'dxf'}
+    return {'exported': p['path'], 'format': fmt}
+
+
+def _sheet_metal_feats(app, name):
+    feats = getattr(_root(app).features, name, None)
+    if feats is None:
+        raise RuntimeError('%s is not available in this Fusion build (the '
+                           'sheet-metal fold/join API needs July 2026+).' % name)
+    return feats
+
+
+def op_fold(app, p):
+    """Fold a sheet-metal body along a bend line (Fusion July 2026+ preview).
+    `face` = stationary face token (stays fixed), `bend_line` = a sketch-line
+    token drawn across that face. Optional angle (deg, default 90), bend
+    radius (mm) and corner_relief."""
+    feats = _sheet_metal_feats(app, 'foldFeatures')
+    fin = feats.createInput(_registry.get(p['face']))
+    lines = fin.bendLines
+    adder = getattr(lines, 'add', None) or getattr(lines, 'addBendLine', None)
+    if adder is None:
+        raise RuntimeError('FoldFeatureInput.bendLines exposes no add method '
+                           'in this build — the preview API changed.')
+    bend = adder(_registry.get(p['bend_line']))
+    if bend is not None and p.get('angle') is not None:
+        angle = _vi(math.radians(float(p['angle'])))
+        for attr in ('angle', 'bendAngle', 'foldAngle'):
+            if hasattr(bend, attr):
+                with contextlib.suppress(Exception):
+                    setattr(bend, attr, angle)
+                    break
+    if bend is not None and p.get('radius') is not None:
+        radius = _vi(float(p['radius']) * MM)
+        for attr in ('bendRadius', 'radius'):
+            if hasattr(bend, attr):
+                with contextlib.suppress(Exception):
+                    setattr(bend, attr, radius)
+                    break
+    if p.get('corner_relief') is not None:
+        with contextlib.suppress(Exception):
+            fin.isUseCornerRelief = bool(p['corner_relief'])
+    return _feature_result(feats.add(fin), 'fold')
+
+
+def op_join_by_bend(app, p):
+    """Join two sheet-metal bodies with a bend between two linear edges of
+    DIFFERENT bodies (Fusion July 2026+ preview). Optional bend radius (mm)."""
+    feats = _sheet_metal_feats(app, 'joinByBendFeatures')
+    jin = feats.createInput(_registry.get(p['edge_a']), _registry.get(p['edge_b']))
+    if p.get('radius') is not None:
+        radius = _vi(float(p['radius']) * MM)
+        for attr in ('bendRadius', 'radius'):
+            if hasattr(jin, attr):
+                with contextlib.suppress(Exception):
+                    setattr(jin, attr, radius)
+                    break
+    return _feature_result(feats.add(jin), 'join_by_bend')
 
 
 def op_export_sketch_dxf(app, p):
@@ -1651,16 +1823,23 @@ def op_mesh_info(app, p):
     return {'count': len(out), 'meshes': out}
 
 
-def _fusion_enum(value_name):
-    """Look up an adsk.fusion enum VALUE by its name without knowing the enum
-    class (exact holder names vary across Fusion releases)."""
-    for attr in dir(adsk.fusion):
-        holder = getattr(adsk.fusion, attr, None)
+def _enum_value(module, value_name):
+    """Look up an enum VALUE by name anywhere in an adsk submodule (the exact
+    holder class names vary across Fusion releases). None when absent."""
+    for attr in dir(module):
+        holder = getattr(module, attr, None)
         value = getattr(holder, value_name, None)
         if value is not None and not callable(value):
             return value
-    raise RuntimeError('Enum value %r not found — this Fusion version may not '
-                       'support the requested option.' % value_name)
+    return None
+
+
+def _fusion_enum(value_name):
+    value = _enum_value(adsk.fusion, value_name)
+    if value is None:
+        raise RuntimeError('Enum value %r not found — this Fusion version may not '
+                           'support the requested option.' % value_name)
+    return value
 
 
 def _mesh_targets(root, p, key='meshes'):
@@ -1893,14 +2072,129 @@ def op_mesh_section(app, p):
 # --------------------------------------------------------------------------- #
 # Drawings (2D documentation)
 # --------------------------------------------------------------------------- #
-def _try_headless_drawing(app, template):
-    """Best-effort headless drawing creation via the 2026 Drawings API. The
-    exact creation surface is young and thinly documented, so this probes a
-    few shapes and cleans up after itself; None means 'fall back to the UI'."""
+def op_mesh_compare(app, p):
+    """Signed-distance deviation between two mesh bodies via the native
+    PolygonMesh.compareWith (Fusion July 2026+) — no file round-trip: compare
+    a scan against a converted/re-imported rebuild in place. Distances are
+    per-node of mesh_a against the surface of mesh_b; stats in mm. On older
+    builds (or for file-vs-file) use the server-side scan_deviation."""
+    a = _registry.get(p['mesh_a'])
+    b = _registry.get(p['mesh_b'])
+
+    def poly(mesh_body):
+        for attr in ('mesh', 'displayMesh'):
+            pm = getattr(mesh_body, attr, None)
+            if pm is not None and hasattr(pm, 'compareWith'):
+                return pm
+        return None
+
+    pa, pb = poly(a), poly(b)
+    if pa is None or pb is None:
+        raise RuntimeError('PolygonMesh.compareWith is not available in this '
+                           'Fusion build (needs July 2026+). Export both meshes '
+                           'as STL and use scan_deviation instead.')
+    dists = pa.compareWith(pb)
+    if not dists:
+        raise RuntimeError('compareWith returned no data — do the meshes overlap?')
+    signed_mm = [d / MM for d in dists]
+    absd = sorted(abs(d) for d in signed_mm)
+    n = len(absd)
+    tol = float(p.get('tolerance', 0.2))
+
+    def pct(q):
+        return absd[min(n - 1, int(q * (n - 1)))]
+
+    return {
+        'nodes': n,
+        'mean_mm': round(sum(absd) / n, 4),
+        'rms_mm': round(math.sqrt(sum(d * d for d in absd) / n), 4),
+        'p50_mm': round(pct(0.50), 4),
+        'p90_mm': round(pct(0.90), 4),
+        'p99_mm': round(pct(0.99), 4),
+        'max_mm': round(absd[-1], 4),
+        'signed_min_mm': round(min(signed_mm), 4),
+        'signed_max_mm': round(max(signed_mm), 4),
+        'within_tolerance': round(sum(1 for d in absd if d <= tol) / n, 4),
+        'tolerance_mm': tol,
+    }
+
+
+def _drawing_enum(drawing_mod, names):
+    """First enum value found among candidate names in adsk.drawing, or None."""
+    for name in names:
+        if not name:
+            continue
+        value = _enum_value(drawing_mod, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _create_drawing_via_manager(app, drawing_mod, p):
+    """The official creation surface (Fusion July 2026+, preview):
+    DrawingManager.createDrawingInput() -> template / sheet size / orientation /
+    standard / units knobs -> createDrawing(). None means 'not on this build'."""
+    mgr_cls = getattr(drawing_mod, 'DrawingManager', None)
+    if mgr_cls is None or not hasattr(mgr_cls, 'get'):
+        return None
+    mgr = mgr_cls.get()
+    if mgr is None or not hasattr(mgr, 'createDrawingInput'):
+        return None
+    din = mgr.createDrawingInput()
+    if p.get('template'):
+        base = _drawing_enum(drawing_mod, ('FromTemplateBaseDocumentType',))
+        if base is not None:
+            with contextlib.suppress(Exception):
+                din.baseDocumentType = base
+        din.templateFile = p['template']
+    sheet = (p.get('sheet_size') or '').upper().replace(' ', '')
+    if sheet:
+        value = _drawing_enum(drawing_mod, (
+            '%sISOSheetSize' % sheet, '%sASMESheetSize' % sheet,
+            '%sSheetSize' % sheet))
+        if value is not None:
+            din.sheetSize = value
+    orientation = (p.get('orientation') or '').capitalize()
+    if orientation:
+        value = _drawing_enum(drawing_mod, ('%sSheetOrientationType' % orientation,))
+        if value is not None:
+            din.orientationType = value
+    standard = (p.get('standard') or '').upper()
+    if standard:
+        value = _drawing_enum(drawing_mod, ('%sDrawingStandardType' % standard,))
+        if value is not None:
+            din.standard = value
+    units = (p.get('drawing_units') or '').lower()
+    if units:
+        value = _drawing_enum(drawing_mod, (
+            {'mm': 'MillimeterDrawingUnitType', 'in': 'InchDrawingUnitType'}.get(units),))
+        if value is not None:
+            din.units = value
+    created = mgr.createDrawing(din)
+    out = {'headless': True, 'api': 'DrawingManager'}
+    with contextlib.suppress(Exception):
+        out['created'] = getattr(created, 'name', None) or app.activeDocument.name
+    with contextlib.suppress(Exception):
+        drawing = drawing_mod.Drawing.cast(created)
+        if drawing:
+            out['sheets'] = drawing.sheets.count
+    return out
+
+
+def _try_headless_drawing(app, p):
+    """Best-effort headless drawing creation. Prefers the official
+    DrawingManager API (Fusion July 2026+); earlier 2026 builds fall back to
+    adding a bare drawing document and probing for a template setter. None
+    means 'fall back to the UI dialog'."""
     try:
         import adsk.drawing
     except ImportError:
         return None
+    with contextlib.suppress(Exception):
+        result = _create_drawing_via_manager(app, adsk.drawing, p)
+        if result is not None:
+            return result
+    template = p.get('template')
     doc = None
     try:
         doc_type = getattr(adsk.core.DocumentTypes, 'DrawingDocumentType', None)
@@ -1934,13 +2228,14 @@ def _try_headless_drawing(app, template):
 
 
 def op_create_drawing(app, p):
-    """Create a drawing for the active design. Tries the headless Drawings API
-    first (Fusion 2026+; optional `template` path/name); when that is not
-    available it opens the "Drawing from Design" dialog for the user to finish.
-    For fully scripted 2D output use export_sketch_dxf / export_flat_pattern;
-    export a finished drawing with drawing_export."""
+    """Create a drawing for the active design. Fusion July 2026+ does this
+    fully headlessly via DrawingManager (optional template, sheet_size
+    "A0"-"A4"/"A"-"E", orientation "landscape"|"portrait", standard "iso"|"asme",
+    drawing_units "mm"|"in"); older builds fall back to a bare drawing document
+    or the "Drawing from Design" dialog. Export with drawing_export; for 2D
+    output without a sheet use export_sketch_dxf / export_flat_pattern."""
     if p.get('headless', True):
-        result = _try_headless_drawing(app, p.get('template'))
+        result = _try_headless_drawing(app, p)
         if result is not None:
             return result
     ui = app.userInterface
@@ -2011,6 +2306,37 @@ _SELECTION_KINDS = {
     'ConstructionPoint': ('cpt', 'construction_point'),
     'JointOrigin': ('jor', 'joint_origin'),
 }
+
+
+def op_selection_filter(app, p):
+    """Inspect or set the active workspace's selection filters (Fusion July
+    2026+) — narrow what the user's clicks can pick before asking them to
+    select (e.g. faces only). action: "list" | "set" (filters=[names],
+    enabled=True/False) | "all" (enabled=True/False)."""
+    settings = getattr(app.userInterface.activeWorkspace,
+                       'selectionFilterSettings', None)
+    if settings is None:
+        raise RuntimeError('selectionFilterSettings needs Fusion July 2026+')
+    action = (p.get('action') or 'list').lower()
+    if action == 'set':
+        for name in p.get('filters') or []:
+            settings.setFilterEnabled(name, bool(p.get('enabled', True)))
+    elif action == 'all':
+        settings.areAllFiltersEnabled = bool(p.get('enabled', True))
+    elif action != 'list':
+        raise ValueError('action must be list|set|all, got %r' % action)
+    out = {'action': action}
+    with contextlib.suppress(Exception):
+        out['select_through'] = settings.isSelectThroughEnabled
+    filters = []
+    with contextlib.suppress(Exception):
+        for name in settings.availableFilters:
+            entry = {'name': name}
+            with contextlib.suppress(Exception):
+                entry['enabled'] = settings.isFilterEnabled(name)
+            filters.append(entry)
+    out['filters'] = filters
+    return out
 
 
 def op_get_selection(app, p):
@@ -2514,11 +2840,18 @@ def _run_code_helpers(app):
     }
 
 
+def _code_store_put(name, obj):
+    _code_store[str(name)] = obj
+    return str(name)
+
+
 def op_run_code(app, p):
     """Execute an arbitrary Fusion API snippet on the main thread.
 
     Available names: adsk, app, ui, design, root, math, MM, registry,
-    reg(kind, obj) -> token, plus mm/degree helpers: pt, mm, vmm, deg,
+    reg(kind, obj) -> token, tok(token) -> live object,
+    store(name, obj) / fetch(name) -> keep objects across snippets,
+    plus mm/degree helpers: pt, mm, vmm, deg,
     new_sketch(plane), rect(sk,x1,y1,x2,y2), circle(sk,cx,cy,r),
     extrude_profile(profile, dist_mm, operation, symmetric).
     Assign to `result` to return a value.
@@ -2534,6 +2867,9 @@ def op_run_code(app, p):
         'MM': MM,
         'registry': _registry,
         'reg': lambda kind, obj: _registry.add(kind, obj),
+        'tok': _registry.get,
+        'store': _code_store_put,
+        'fetch': _code_store.get,
     }
     g.update(_run_code_helpers(app))
     local = {}
@@ -2547,6 +2883,151 @@ def op_run_code(app, p):
 def op_reset_registry(app, p):
     _registry.reset()
     return {'reset': True}
+
+
+def _introspect_target(p):
+    """Resolve the introspection target: a registry token ('bdy1'), a stored
+    run_code object ('$name'), or a dotted adsk path ('adsk.fusion.Component')."""
+    target = p.get('target') or 'adsk.fusion'
+    if target.startswith('$'):
+        obj = _code_store.get(target[1:])
+        if obj is None:
+            raise KeyError('Nothing stored under %r — use store(name, obj) in '
+                           'run_fusion_code first' % target)
+        return target, obj
+    obj = _registry.get_opt(target)
+    if obj is not None:
+        return target, obj
+    parts = target.split('.')
+    if parts[0] != 'adsk':
+        raise ValueError('target must be an entity token, a $stored name, or a '
+                         'dotted adsk.* path, got %r' % target)
+    import importlib
+    obj = adsk
+    for i, part in enumerate(parts[1:], start=2):
+        nxt = getattr(obj, part, None)
+        if nxt is None and i == 2:
+            # Lazily import optional namespaces (adsk.drawing, adsk.electron...)
+            with contextlib.suppress(Exception):
+                importlib.import_module('.'.join(parts[:i]))
+                nxt = getattr(obj, part, None)
+        if nxt is None:
+            raise AttributeError('%s has no attribute %r'
+                                 % ('.'.join(parts[:i - 1]), part))
+        obj = nxt
+    return target, obj
+
+
+def op_api_introspect(app, p):
+    """Explore the Fusion API surface without leaving the chat: list an
+    object's members with one-line docs. target: a registry token ('bdy1'),
+    a run_code-stored object ('$jig') or a dotted path
+    ('adsk.fusion.ExtrudeFeatures'). `query` filters member names (substring).
+    The companion of run_fusion_code — check exact property/method names
+    before writing a snippet. Members are read off the CLASS, so no live
+    properties are evaluated."""
+    import inspect as pyinspect
+    target, obj = _introspect_target(p)
+    query = (p.get('query') or '').lower()
+    limit = max(1, int(p.get('limit', 80)))
+    direct = pyinspect.ismodule(obj) or pyinspect.isclass(obj)
+    holder = obj if direct else type(obj)
+    names = [n for n in dir(holder) if not n.startswith('_')]
+    if query:
+        names = [n for n in names if query in n.lower()]
+    names.sort()
+    members = []
+    for name in names[:limit]:
+        try:
+            attr = getattr(holder, name)
+        except Exception:  # noqa: BLE001 - descriptor refused; still report it
+            members.append({'name': name, 'kind': 'property'})
+            continue
+        if isinstance(attr, property):
+            kind, doc = 'property', attr.__doc__
+        elif callable(attr):
+            kind, doc = 'method', getattr(attr, '__doc__', None)
+        else:
+            kind, doc = 'attribute', None
+        entry = {'name': name, 'kind': kind}
+        if kind == 'attribute' and isinstance(attr, (bool, int, float, str)):
+            entry['value'] = attr
+        if doc:
+            entry['doc'] = doc.strip().splitlines()[0][:160]
+        members.append(entry)
+    out = {'target': target, 'count': len(names), 'members': members}
+    if len(names) > len(members):
+        out['truncated_to'] = len(members)
+    with contextlib.suppress(Exception):
+        out['type'] = (getattr(obj, '__name__', None) if direct
+                       else obj.objectType)
+    doc = pyinspect.getdoc(holder)
+    if doc:
+        out['doc'] = doc.splitlines()[0][:200]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Configurations
+# --------------------------------------------------------------------------- #
+def op_configurations(app, p):
+    """Work with a configured design's configuration table. action: "list"
+    (rows = configurations + column titles + active row), "activate"
+    (name = row name), "cell" (row=, column= indexes — read one cell).
+    Returns {configured: false} when the design has no configurations."""
+    design = _design(app)
+    try:
+        table = design.configurationTopTable
+    except Exception:  # noqa: BLE001 - older builds / unconfigured designs
+        table = None
+    if not table:
+        return {'configured': False,
+                'note': 'The active design has no configuration table.'}
+    action = (p.get('action') or 'list').lower()
+    rows = table.rows
+
+    def row_entries():
+        out = []
+        for i in range(rows.count):
+            row = rows.item(i)
+            entry = {'index': i, 'name': row.name}
+            with contextlib.suppress(Exception):
+                entry['id'] = row.id
+            out.append(entry)
+        return out
+
+    if action == 'activate':
+        target = p.get('name')
+        for i in range(rows.count):
+            row = rows.item(i)
+            if row.name == target:
+                row.activate()
+                return {'activated': target}
+        raise ValueError('No configuration named %r (have: %s)' % (
+            target, ', '.join(e['name'] for e in row_entries()) or 'none'))
+    if action == 'cell':
+        cell = table.getCell(int(p['row']), int(p['column']))
+        out = {'row': int(p['row']), 'column': int(p['column'])}
+        for attr in ('value', 'expression', 'title', 'name'):
+            with contextlib.suppress(Exception):
+                out[attr] = _jsonable(getattr(cell, attr))
+        return out
+    if action != 'list':
+        raise ValueError('action must be list|activate|cell, got %r' % action)
+    out = {'configured': True, 'rows': row_entries()}
+    with contextlib.suppress(Exception):
+        out['active'] = table.activeRow.name
+    columns = []
+    with contextlib.suppress(Exception):
+        for i in range(table.columns.count):
+            col = table.columns.item(i)
+            entry = {'index': i}
+            for attr in ('title', 'name', 'id'):
+                with contextlib.suppress(Exception):
+                    entry[attr] = getattr(col, attr)
+            columns.append(entry)
+    out['columns'] = columns
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -2901,8 +3382,8 @@ def op_electronics_library(app, p):
     src = brd if active == 'board' else sch if active == 'schematic' else (brd or sch)
     libs = []
     with contextlib.suppress(Exception):
-        for l in _eitems(src.libraries):
-            name = str(getattr(l, 'name', '') or '')
+        for lib in _eitems(src.libraries):
+            name = str(getattr(lib, 'name', '') or '')
             if flt and flt not in name.lower():
                 continue
             entry = {'name': name}
@@ -2910,7 +3391,7 @@ def op_electronics_library(app, p):
                               ('devices', 'devices'), ('symbols', 'symbols'),
                               ('packages', 'packages'),
                               ('packages3d', 'packages_3d')):
-                n = _ecount(l, prop)
+                n = _ecount(lib, prop)
                 if n is not None:
                     entry[key] = n
             libs.append(entry)
@@ -3125,6 +3606,15 @@ DISPATCH = {
     'batch': op_batch,
     'run_code': op_run_code,
     'reset_registry': op_reset_registry,
+    'mesh_compare': op_mesh_compare,
+    'fold': op_fold,
+    'join_by_bend': op_join_by_bend,
+    'sketch_blend_curve': op_sketch_blend_curve,
+    'auto_constrain': op_auto_constrain,
+    'thread_types': op_thread_types,
+    'selection_filter': op_selection_filter,
+    'configurations': op_configurations,
+    'api_introspect': op_api_introspect,
 }
 
 

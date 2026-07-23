@@ -21,6 +21,10 @@ EXPECTED = {
     'save', 'set_design_mode', 'batch', 'run_code', 'reset_registry',
     'electronics_info', 'electronics_components', 'electronics_nets',
     'electronics_layers', 'electronics_library', 'electronics_export',
+    # v1.8.0: July 2026 API wave
+    'mesh_compare', 'fold', 'join_by_bend', 'sketch_blend_curve',
+    'auto_constrain', 'thread_types', 'selection_filter', 'configurations',
+    'api_introspect',
 }
 
 

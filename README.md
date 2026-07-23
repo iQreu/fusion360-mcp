@@ -55,7 +55,9 @@ Jednostki na łączu: **długości w mm, kąty w stopniach**. Geometria adresowa
 `bodies|sketches|profiles|faces|edges|occurrences|meshes`), `server_info`
 (wersja, uptime, telemetria czasów per-operacja)
 **Interakcja z użytkownikiem**: `get_selection` — tokeny tego, co użytkownik
-zaznaczył myszą w Fusion („kliknij ścianę i powiedz: tutaj"), `highlight(tokens)`
+zaznaczył myszą w Fusion („kliknij ścianę i powiedz: tutaj"),
+`selection_filter(action, filters, enabled)` — zawężenie, co da się kliknąć
+(np. tylko ściany; lipiec 2026+), `highlight(tokens)`
 — Claude podświetla encje w UI, żeby pokazać, o co mu chodzi, **zanim** wykona
 operację; `undo(steps)` — cofnięcie ostatnich operacji (tokeny sprzed undo mogą
 być nieaktualne — po nim odpytaj `get_state`)
@@ -69,9 +71,14 @@ Fusion 2023+)
 **Więzy i wymiary**: `sketch_constraint` (horizontal/vertical/parallel/
 perpendicular/equal/collinear/tangent/concentric/coincident/midpoint),
 `sketch_dimension` (distance/radius/diameter/angle), `sketch_offset`,
-`sketch_fillet`, `project_to_sketch`
+`sketch_fillet`, `project_to_sketch`, `auto_constrain(sketch)` — automatyczne
+więzy jak od człowieka (Fusion 2026+), `sketch_blend_curve(curve1, curve2)` —
+gładkie połączenie dwóch otwartych krzywych splajnem G1/G2 (lipiec 2026+)
 **Geometria konstrukcyjna**: `construction_plane` (offset/angle/three_points/
-tangent), `construction_axis` (edge/two_points/cylinder), `construction_point`
+tangent; `extended=False` — kompaktowa płaszczyzna, lipiec 2026+),
+`construction_axis` (edge/two_points/cylinder), `construction_point`
+(at_point/two_edges/edge_plane/**distance_on_path** — punkt w zadanym ułamku
+długości krawędzi/krzywej, lipiec 2026+)
 **Cechy**: `extrude` (dystans/symetrycznie/do ściany `to_face`, pochylenie
 `taper_angle`), `revolve`, `fillet`, `chamfer`, `shell`, `combine`,
 `rectangular_pattern`, `circular_pattern`, `mirror`, `move_body`, `delete`, `hole`
@@ -93,8 +100,12 @@ masą jednostkową i całkowitą; opcjonalny zapis CSV
 `emboss(profile, depth, engrave)` — grawer (cut) lub wypukły napis (join);
 token tekstu działa też w zwykłym `extrude`
 **Blachy**: `flat_pattern(face|body)` — rozwinięcie blachy,
-`export_flat_pattern(path, ...)` — DXF rozwinięcia pod laser/waterjet,
-`export_sketch_dxf(sketch, path)` — dowolny szkic jako DXF
+`export_flat_pattern(path, format="dxf"|"step")` — rozwinięcie pod
+laser/waterjet (DXF) lub jako płaska bryła STEP (lipiec 2026+),
+`export_sketch_dxf(sketch, path)` — dowolny szkic jako DXF,
+`fold(face, bend_line, angle, radius)` — zagięcie wzdłuż linii szkicu,
+`join_by_bend(edge_a, edge_b)` — połączenie dwóch blach zagięciem
+(obie operacje: Fusion lipiec 2026+, API preview)
 **Siatki / reverse engineering (w Fusion)**: `import_mesh(path, units)`
 (stl/obj/3mf), `mesh_info`, `mesh_reduce` (redukcja trójkątów: target_faces/
 proportion/max_deviation, adaptive|uniform), `mesh_remesh`,
@@ -102,8 +113,10 @@ proportion/max_deviation, adaptive|uniform), `mesh_remesh`,
 symetrycznej części, `mesh_to_brep(meshes, method)` — konwersja skanu na bryłę
 (**faceted | prismatic** — rozpoznaje płaszczyzny i walce | organic),
 `mesh_section(mesh, plane, offset)` — szkic przekroju siatki,
-`canvas_add(image, plane, width_mm)` — skalibrowane zdjęcie jako podkład;
-`query_entities(kind="meshes")` listuje siatki
+`mesh_compare(mesh_a, mesh_b, tolerance)` — natywne odchyłki siatka↔siatka
+(znakowana odległość per węzeł, statystyki w mm; lipiec 2026+ — szybka pętla
+weryfikacji bez eksportu plików), `canvas_add(image, plane, width_mm)` —
+skalibrowane zdjęcie jako podkład; `query_entities(kind="meshes")` listuje siatki
 **Analiza skanów (w serwerze, bez obciążania Fusion)** — wymaga opcjonalnych
 zależności `pip install -e "mcp_server[re]"` (numpy/trimesh/pyransac3d):
 `scan_analyze(path)` — wymiary, symetrie, płaszczyzny/walce/sfery (RANSAC,
@@ -112,9 +125,11 @@ klasyfikacja otwór/czop), grubość ścianek — gotowy plan odbudowy;
 parametrycznej odbudowy jednym `batch`; `scan_deviation(scan, model_stl)` —
 raport odchyłek odbudowa↔skan (pętla: buduj → mierz → poprawiaj).
 Prompt `reverse_engineer_scan` prowadzi cały przepływ skan→CAD.
-**Rysunki 2D**: `create_drawing(template)` — na Fusion 2026+ tworzy rysunek
-headless (opcjonalnie z szablonu), na starszych otwiera kreator „Drawing from
-Design"; `drawing_export(path, pdf|dxf)` — eksport aktywnego rysunku;
+**Rysunki 2D**: `create_drawing(template, sheet_size, orientation, standard,
+drawing_units)` — na Fusion lipiec 2026+ w pełni headless przez oficjalne
+DrawingManager API (arkusz A0–A4/A–E, ISO/ASME, mm/cale, szablon), na
+starszych buildach fallback do pustego dokumentu rysunku lub kreatora „Drawing
+from Design"; `drawing_export(path, pdf|dxf)` — eksport aktywnego rysunku;
 w pełni skryptowalne 2D bez arkusza: `export_sketch_dxf` / `export_flat_pattern`
 **Panel interaktywny (MCP Apps)**: `open_viewer` — w klientach z obsługą MCP
 Apps (m.in. Claude Desktop) otwiera w czacie panel z podglądem modelu
@@ -123,6 +138,10 @@ o kolejne screenshoty
 **Parametry**: `list_parameters`, `set_parameter`, `add_parameter`,
 `export_parameters(csv)` / `import_parameters(csv)` — tabela parametrów do/z
 arkusza kalkulacyjnego
+**Konfiguracje**: `configurations(action="list"|"activate"|"cell")` — lista
+konfiguracji projektu, przełączenie aktywnej, odczyt komórek tabeli
+**Gwinty**: `thread_types` — dostępne standardy gwintów, w tym biblioteki
+niestandardowe z huba zespołu (lipiec 2026+)
 **CAM (MANUFACTURE)**: `cam_setups` (lista setupów i operacji), `cam_generate`
 (przeliczenie ścieżek), `cam_post(setup, path, post_config)` — G-code przez
 post-procesor (.cps). Setup tworzy się raz w UI — API nie umie go założyć;
@@ -138,7 +157,11 @@ wersje + release notes), `apply_update(confirm=True, method="auto")` (instaluje
 — presety kamery: `current|front|back|left|right|top|bottom|iso|iso-top-right|iso-top-left|iso-bottom-right|iso-bottom-left`
 **Wydajność**: `batch(operations)` — wiele operacji w jednym round-tripie,
 `set_design_mode("direct"|"parametric")`
-**Furtka**: `run_fusion_code(code)` — dowolny kod Fusion Python API w jednym wywołaniu
+**Furtka**: `run_fusion_code(code)` — dowolny kod Fusion Python API w jednym
+wywołaniu; w zasięgu m.in. `tok(token)` → żywy obiekt z tokenu,
+`store(name, obj)` / `fetch(name)` — obiekty przeżywają między snippetami;
+`api_introspect(target, query)` — podgląd właściwości/metod dowolnego obiektu
+API (token, `$nazwa` ze store, ścieżka `adsk.*`) przed napisaniem snippetu
 
 **Resources** (odczyt bez wywołania narzędzia): `fusion://design/state`,
 `fusion://design/parameters`, `fusion://design/tree`.
