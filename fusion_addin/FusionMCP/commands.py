@@ -23,7 +23,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.9.1'
+VERSION = '1.10.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -59,6 +59,7 @@ _READ_ONLY_OPS = frozenset({
     'mesh_compare', 'thread_types', 'api_introspect', 'selection_filter',
     'list_materials', 'list_appearances', 'data_folders', 'version_history',
     'share_link', 'annotate', 'annotations_clear',
+    'design_diagnostics', 'sketch_status',
 })
 
 
@@ -178,6 +179,35 @@ def _feature_result(feat, kind):
             })
     except Exception:
         pass
+    return out
+
+
+def _validate_or_add(feats, fin, kind):
+    """validate_only tail shared by sweep/loft/shell: Fusion has no dry-run API,
+    so actually try the add, summarise what it made, then delete the feature
+    again. No tokens are registered for the transient geometry. If the delete
+    fails the feature is REAL — report it as a normal creation instead of
+    leaking an unregistered timeline entry."""
+    try:
+        feat = feats.add(fin)
+    except Exception as exc:  # noqa: BLE001 - the invalid input IS the answer
+        return {'valid': False, 'kind': kind, 'error': str(exc)}
+    summary = {}
+    with contextlib.suppress(Exception):
+        summary['bodies'] = feat.bodies.count
+        summary['faces'] = sum(feat.bodies.item(i).faces.count
+                               for i in range(feat.bodies.count))
+    removed = False
+    with contextlib.suppress(Exception):
+        removed = bool(feat.deleteMe())
+    if not removed:
+        res = _feature_result(feat, kind)
+        res.update({'valid': True, 'committed': True,
+                    'note': 'validate_only could not remove the test feature, '
+                            'so it was kept — these tokens are real.'})
+        return res
+    out = {'valid': True, 'committed': False, 'kind': kind}
+    out.update(summary)
     return out
 
 
@@ -535,6 +565,8 @@ def op_shell(app, p):
         entities.add(body)
     sin = feats.createInput(entities, False)
     sin.insideThickness = _vi(p['thickness'] * MM)
+    if p.get('validate_only'):
+        return _validate_or_add(feats, sin, 'shell')
     return _feature_result(feats.add(sin), 'shell')
 
 
@@ -929,6 +961,8 @@ def op_loft(app, p):
         lin.loftSections.add(_registry.get(tok))
     for tok in p.get('rails', []):
         lin.centerLineOrRails.addRail(_registry.get(tok))
+    if p.get('validate_only'):
+        return _validate_or_add(feats, lin, 'loft')
     return _feature_result(feats.add(lin), 'loft')
 
 
@@ -942,6 +976,8 @@ def op_sweep(app, p):
                             _operation(p.get('operation', 'new')))
     if p.get('twist_angle'):
         sin.twistAngle = _vi(math.radians(p['twist_angle']))
+    if p.get('validate_only'):
+        return _validate_or_add(feats, sin, 'sweep')
     return _feature_result(feats.add(sin), 'sweep')
 
 
@@ -1473,6 +1509,18 @@ def _find_material(app, name, library=None):
 
 
 def _find_appearance(app, name, library=None):
+    # Document appearances first (covers create_appearance results and any
+    # appearance the user customised in-document), then favourites, then the
+    # shipped libraries. An explicit `library` skips straight to the libraries.
+    if not library:
+        with contextlib.suppress(Exception):
+            a = _design(app).appearances.itemByName(name)
+            if a is not None:
+                return a
+        with contextlib.suppress(Exception):
+            a = app.favoriteAppearances.itemByName(name)
+            if a is not None:
+                return a
     libs = app.materialLibraries
     for i in range(libs.count):
         lib = libs.item(i)
@@ -1500,6 +1548,104 @@ def op_set_appearance(app, p):
     body = _registry.get(p['body'])
     body.appearance = _find_appearance(app, p['appearance'], p.get('library'))
     return {'body': p['body'], 'appearance': body.appearance.name}
+
+
+def op_create_appearance(app, p):
+    """Create a custom appearance IN THE DOCUMENT: copy a base appearance
+    (default: a matte plastic from the shipped libraries) under a new name,
+    then recolour it (r/g/b 0-255, optional alpha) and set surface roughness
+    (0..1). base/library pick the appearance to copy. The result is
+    immediately usable: set_appearance(body, name)."""
+    design = _design(app)
+    name = p.get('name')
+    if not name:
+        raise ValueError('name is required')
+    # Validate everything BEFORE addByCopy — there is no rollback for a
+    # half-configured appearance.
+    rgb = [p.get(k) for k in ('r', 'g', 'b')]
+    color = None
+    if any(v is not None for v in rgb):
+        vals = []
+        for v in rgb + [p.get('alpha', 255)]:
+            v = int(v or 0)
+            if not 0 <= v <= 255:
+                raise ValueError('r/g/b/alpha must be 0-255, got %r' % v)
+            vals.append(v)
+        color = adsk.core.Color.create(*vals)
+    roughness = p.get('roughness')
+    if roughness is not None:
+        roughness = float(roughness)
+        if not 0.0 <= roughness <= 1.0:
+            raise ValueError('roughness must be 0..1, got %r' % p['roughness'])
+    existing = None
+    with contextlib.suppress(Exception):
+        existing = design.appearances.itemByName(str(name))
+    if existing is not None:
+        raise ValueError('An appearance named %r already exists in this '
+                         'document — pick another name, or assign it with '
+                         'set_appearance.' % name)
+    base = None
+    if p.get('base'):
+        base = _find_appearance(app, p['base'], p.get('library'))
+    else:
+        # A plastic takes an albedo recolour most predictably.
+        for guess in ('Plastic - Matte (Black)', 'Paint - Enamel Glossy (Black)'):
+            with contextlib.suppress(Exception):
+                base = _find_appearance(app, guess)
+            if base is not None:
+                break
+        if base is None:
+            libs = app.materialLibraries
+            for i in range(libs.count):
+                with contextlib.suppress(Exception):
+                    if libs.item(i).appearances.count:
+                        base = libs.item(i).appearances.item(0)
+                        break
+    if base is None:
+        raise RuntimeError('No base appearance found to copy — pass '
+                           'base=<name from list_appearances>.')
+    new = design.appearances.addByCopy(base, str(name))
+    out = {'appearance': new.name, 'base': base.name, 'source': 'document'}
+    if color is not None:
+        colored = False
+        candidates = []
+        with contextlib.suppress(Exception):
+            prop = new.appearanceProperties.itemById('opaque_albedo')
+            if prop is not None:
+                candidates.append(prop)
+        with contextlib.suppress(Exception):
+            props = new.appearanceProperties
+            candidates.extend(props.item(i) for i in range(props.count))
+        for prop in candidates:
+            cp = None
+            with contextlib.suppress(Exception):
+                cp = adsk.core.ColorProperty.cast(prop)
+            if cp is None:
+                continue
+            with contextlib.suppress(Exception):
+                cp.value = color
+                colored = True
+            if not colored:
+                # Some colour slots are list-valued (texture-connected).
+                with contextlib.suppress(Exception):
+                    cp.values = [color]
+                    colored = True
+            if colored:
+                break
+        out['colored'] = colored
+        if not colored:
+            out['note'] = ('The copied appearance exposes no writable colour '
+                           'property — pick a different base '
+                           '(list_appearances).')
+    if roughness is not None:
+        rough_set = False
+        with contextlib.suppress(Exception):
+            prop = new.appearanceProperties.itemById('surface_roughness')
+            if prop is not None:
+                prop.value = roughness
+                rough_set = True
+        out['roughness_set'] = rough_set
+    return out
 
 
 def op_measure(app, p):
@@ -1645,6 +1791,228 @@ def op_suppress_feature(app, p):
     entity = feat.timelineObject if hasattr(feat, 'timelineObject') else feat
     entity.isSuppressed = bool(p.get('suppress', True))
     return {'feature': p['feature'], 'suppressed': entity.isSuppressed}
+
+
+# The one Timeline Builder job of this session. The cloud service takes its
+# time, so start/status/open are separate actions instead of one long block.
+_tb_job = None
+
+_JOB_STATUS = {0: 'not_started', 1: 'in_progress', 2: 'completed', 3: 'failed'}
+
+
+def _tb_status(job):
+    with contextlib.suppress(Exception):
+        return _JOB_STATUS.get(int(job.status), 'unknown')
+    return 'unknown'
+
+
+def op_timeline_builder(app, p):
+    """Rebuild an editable parametric timeline from a bare BRep body — an
+    imported STEP becomes a design with real features (Timeline Builder cloud
+    service, Fusion July 2026+ preview). action="start" (body token; waits up
+    to `timeout` s, default 60), "status" (poll the running job), "open"
+    (activate the produced document — re-orient with get_state after)."""
+    global _tb_job
+    action = (p.get('action') or 'start').lower()
+    tbj = getattr(adsk.fusion, 'TimelineBuilderJob', None)
+    if tbj is None or not hasattr(tbj, 'createTimeline'):
+        raise RuntimeError('TimelineBuilderJob is not available in this Fusion '
+                           'build (needs Fusion July 2026+).')
+    if action == 'start':
+        body = _registry.get(p['body'])
+        job = tbj.createTimeline(body)
+        if job is None:
+            raise RuntimeError('Fusion refused to start the Timeline Builder '
+                               'job — cloud service unreachable, or this body '
+                               'is not a valid input.')
+        _tb_job = job
+        requested = float(p.get('timeout', 60))
+        deadline = time.time() + min(requested,
+                                     max(30.0, _main_thread_ceiling() - 15.0))
+        while _tb_status(job) in ('not_started', 'in_progress') \
+                and time.time() < deadline:
+            adsk.doEvents()
+            time.sleep(0.5)
+        status = _tb_status(job)
+    elif action == 'status':
+        if _tb_job is None:
+            raise RuntimeError('No Timeline Builder job was started this '
+                               'session — call timeline_builder(action='
+                               '"start", body=...) first.')
+        job = _tb_job
+        status = _tb_status(job)
+    elif action == 'open':
+        if _tb_job is None:
+            raise RuntimeError('No Timeline Builder job was started this '
+                               'session.')
+        doc = None
+        with contextlib.suppress(Exception):
+            doc = _tb_job.resultDocument
+        if doc is None:
+            raise RuntimeError('The job has not produced a document (status: '
+                               '%s).' % _tb_status(_tb_job))
+        doc.activate()
+        return {'activated': doc.name,
+                'note': 'The rebuilt parametric design is now the active '
+                        'document — call get_state to re-orient (old tokens '
+                        'are invalid).'}
+    else:
+        raise ValueError('action must be start|status|open, got %r' % action)
+    out = {'status': status}
+    if status == 'completed':
+        with contextlib.suppress(Exception):
+            out['result_document'] = job.resultDocument.name
+        out['note'] = 'Open the rebuilt design with timeline_builder(action="open").'
+    elif status in ('not_started', 'in_progress'):
+        out['note'] = ('Cloud job still running — check again with '
+                       'timeline_builder(action="status").')
+    elif status == 'failed':
+        out['note'] = ('The Timeline Builder service could not rebuild this '
+                       'body (it was cancelled or the geometry is not '
+                       'supported).')
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics: design health, sketch pre-flight
+# --------------------------------------------------------------------------- #
+def op_design_diagnostics(app, p):
+    """One-call health report for the active design: timeline features in
+    error/warning state (with Fusion's own message), sketches that are not
+    fully constrained, non-solid (open) bodies, empty components and unsaved
+    changes. limit caps the issue list (default 100). Run it after a big
+    batch or before export/print to catch silent modelling problems."""
+    design = _design(app)
+    limit = int(p.get('limit') or 100)
+    issues = []
+    timeline_errors = timeline_warnings = 0
+
+    # healthState names are resolved dynamically, so a build that renumbers or
+    # adds states cannot make the mapping lie.
+    states = {}
+    hs = getattr(adsk.fusion, 'FeatureHealthStates', None)
+    if hs is not None:
+        for nm in dir(hs):
+            if nm.endswith('FeatureHealthState'):
+                with contextlib.suppress(Exception):
+                    states[int(getattr(hs, nm))] = \
+                        nm[:-len('FeatureHealthState')].lower()
+    with contextlib.suppress(Exception):
+        tl = design.timeline
+        for i in range(tl.count):
+            it = tl.item(i)
+            state = None
+            with contextlib.suppress(Exception):
+                state = states.get(int(it.healthState))
+            if state not in ('error', 'warning'):
+                continue
+            if state == 'error':
+                timeline_errors += 1
+            else:
+                timeline_warnings += 1
+            entry = {'kind': 'timeline_' + state, 'index': i}
+            with contextlib.suppress(Exception):
+                entry['name'] = it.name
+            with contextlib.suppress(Exception):
+                msg = it.errorOrWarningMessage
+                if msg:
+                    entry['message'] = msg
+            issues.append(entry)
+
+    unconstrained = open_bodies = empty_components = 0
+    with contextlib.suppress(Exception):
+        root = design.rootComponent
+        for comp in design.allComponents:
+            with contextlib.suppress(Exception):
+                for sk in comp.sketches:
+                    if sk.isFullyConstrained:
+                        continue
+                    unconstrained += 1
+                    issues.append({'kind': 'sketch_not_fully_constrained',
+                                   'sketch': _registry.add('skt', sk),
+                                   'name': sk.name, 'component': comp.name})
+            with contextlib.suppress(Exception):
+                for body in comp.bRepBodies:
+                    if body.isSolid:
+                        continue
+                    open_bodies += 1
+                    issues.append({'kind': 'open_body',
+                                   'body': _registry.add('bdy', body),
+                                   'name': body.name, 'component': comp.name,
+                                   'note': 'Surface (non-solid) body — it '
+                                           'will not export or print as a '
+                                           'solid.'})
+            with contextlib.suppress(Exception):
+                if comp is not root and comp.bRepBodies.count == 0 \
+                        and comp.sketches.count == 0 \
+                        and comp.occurrences.count == 0 \
+                        and comp.meshBodies.count == 0:
+                    empty_components += 1
+                    issues.append({'kind': 'empty_component',
+                                   'name': comp.name})
+
+    out = {'healthy': not issues, 'issue_count': len(issues),
+           'issues': issues[:limit],
+           'timeline_errors': timeline_errors,
+           'timeline_warnings': timeline_warnings,
+           'unconstrained_sketches': unconstrained,
+           'open_bodies': open_bodies,
+           'empty_components': empty_components}
+    if len(issues) > limit:
+        out['note'] = 'Issue list truncated to %d of %d.' % (limit, len(issues))
+    with contextlib.suppress(Exception):
+        out['unsaved_changes'] = bool(app.activeDocument.isModified)
+    return out
+
+
+def op_sketch_status(app, p):
+    """Pre-flight a sketch before sweep/loft/shell — most failed attempts
+    trace back to an open or missing profile. For one sketch token (or every
+    root sketch when omitted) report: profile count, fully-constrained state,
+    curve/construction counts, and OPEN ENDPOINTS (positions in sketch mm
+    where exactly one curve ends) — an open chain never forms a profile, so
+    these are exactly where a closing segment or coincident constraint is
+    missing."""
+    if p.get('sketch'):
+        sketches = [_registry.get(p['sketch'])]
+    else:
+        sketches = list(_root(app).sketches)
+    out = []
+    for sk in sketches:
+        entry = {'token': _registry.add('skt', sk)}
+        with contextlib.suppress(Exception):
+            entry['name'] = sk.name
+        with contextlib.suppress(Exception):
+            entry['fully_constrained'] = bool(sk.isFullyConstrained)
+        with contextlib.suppress(Exception):
+            entry['profiles'] = sk.profiles.count
+        curves = construction = 0
+        ends = {}
+        with contextlib.suppress(Exception):
+            for c in sk.sketchCurves:
+                is_constr = False
+                with contextlib.suppress(Exception):
+                    is_constr = bool(c.isConstruction)
+                if is_constr:
+                    construction += 1
+                    continue
+                curves += 1
+                # Endpoint census: coincident-by-position counts as joined,
+                # matching how profiles close. Closed curves (circles,
+                # ellipses) have no endpoints — the suppress skips them.
+                for prop in ('startSketchPoint', 'endSketchPoint'):
+                    with contextlib.suppress(Exception):
+                        g = getattr(c, prop).geometry
+                        key = (round(g.x, 4), round(g.y, 4))
+                        ends[key] = ends.get(key, 0) + 1
+        entry['curves'] = curves
+        entry['construction_curves'] = construction
+        open_pts = sorted(k for k, n in ends.items() if n == 1)
+        entry['open_endpoint_count'] = len(open_pts)
+        entry['open_endpoints_mm'] = [[round(x / MM, 4), round(y / MM, 4)]
+                                      for x, y in open_pts[:20]]
+        out.append(entry)
+    return {'count': len(out), 'sketches': out}
 
 
 # --------------------------------------------------------------------------- #
@@ -1906,6 +2274,55 @@ def op_join_by_bend(app, p):
                     setattr(jin, attr, radius)
                     break
     return _feature_result(feats.add(jin), 'join_by_bend')
+
+
+def op_corner_closure(app, p):
+    """Close the corner where two sheet-metal flanges meet (Fusion July 2026+
+    preview). edge_a = dominant flange edge token, edge_b = submissive edge
+    (the edges that face each other across the corner; pick with
+    query_entities kind="edges"). Optional gap (mm), overlap (0..1 switches
+    from symmetric-gap to overlap alignment; flip puts the submissive flange
+    on top), transition: smooth|straight|trim, width_aligned bool."""
+    feats = _sheet_metal_feats(app, 'cornerClosureFeatures')
+    cin = feats.createInput(_registry.get(p['edge_a']), _registry.get(p['edge_b']))
+    if cin is None:
+        raise RuntimeError('Fusion refused to create a corner-closure input '
+                           'for these edges — are both on sheet-metal flanges?')
+    ctype = None
+    with contextlib.suppress(Exception):
+        ctype = int(cin.closureType)
+    if ctype == 0:  # UndefinedCornerClosureType
+        raise ValueError('These two edges do not define a shared corner. Pass '
+                         'the two flange edges that meet at the corner to '
+                         'close.')
+    if p.get('gap') is not None:
+        cin.gap = _vi(float(p['gap']) * MM)
+    if p.get('overlap') is not None:
+        overlap = float(p['overlap'])
+        if not 0.0 <= overlap <= 1.0:
+            raise ValueError('overlap must be between 0 and 1, got %r'
+                             % p['overlap'])
+        cin.setToOverlapAlignmentType(_vi(overlap), bool(p.get('flip', False)))
+    if p.get('transition'):
+        names = {'smooth': 'SmoothCornerBendTransitionType',
+                 'straight': 'StraightLineCornerBendTransitionType',
+                 'trim': 'TrimToBendCornerBendTransitionType'}
+        key = str(p['transition']).lower()
+        if key not in names:
+            raise ValueError('transition must be smooth|straight|trim, got %r'
+                             % p['transition'])
+        enum = getattr(adsk.fusion, 'BendTransitionTypes', None)
+        value = getattr(enum, names[key], None) if enum else None
+        if value is None:
+            raise RuntimeError('BendTransitionTypes is not available in this '
+                               'Fusion build — the preview API changed.')
+        cin.bendTransition = value
+    if p.get('width_aligned') is not None:
+        with contextlib.suppress(Exception):
+            cin.isWidthExtentAligned = bool(p['width_aligned'])
+    out = _feature_result(feats.add(cin), 'corner_closure')
+    out['closure_type'] = {1: 'two_bend', 2: 'three_bend'}.get(ctype, 'unknown')
+    return out
 
 
 def op_export_sketch_dxf(app, p):
@@ -2946,10 +3363,42 @@ def _cam_product(app):
     prod = doc.products.itemByProductType('CAMProductType')
     cam = adsk.cam.CAM.cast(prod) if prod else None
     if not cam:
-        raise RuntimeError('No MANUFACTURE data in this document. Create a '
-                           'Setup in the MANUFACTURE workspace first — the '
-                           'Fusion API cannot create setups.')
+        raise RuntimeError('No MANUFACTURE data in this document — create a '
+                           'setup with cam_setup first (or open the '
+                           'MANUFACTURE workspace once).')
     return cam
+
+
+def _cam_product_materialized(app):
+    """Like _cam_product, but when the document has never entered MANUFACTURE
+    (so no CAM product exists yet) it activates the MANUFACTURE workspace once
+    to materialise it. Returns (cam, previous_workspace_or_None); the caller
+    restores the workspace in a finally."""
+    import adsk.cam
+    doc = app.activeDocument
+    if not doc:
+        raise RuntimeError('No document is open.')
+    prod = doc.products.itemByProductType('CAMProductType')
+    cam = adsk.cam.CAM.cast(prod) if prod else None
+    if cam:
+        return cam, None
+    ui = app.userInterface
+    ws = ui.workspaces.itemById('CAMEnvironment')
+    if ws is None:
+        raise RuntimeError('The MANUFACTURE workspace is not available in '
+                           'this Fusion install.')
+    prev = ui.activeWorkspace
+    ws.activate()
+    adsk.doEvents()
+    prod = doc.products.itemByProductType('CAMProductType')
+    cam = adsk.cam.CAM.cast(prod) if prod else None
+    if not cam:
+        with contextlib.suppress(Exception):
+            if prev is not None:
+                prev.activate()
+        raise RuntimeError('Could not materialise the MANUFACTURE product '
+                           'for this document.')
+    return cam, prev
 
 
 def _cam_setup_by_name(cam, name):
@@ -3043,6 +3492,110 @@ def op_cam_post(app, p):
                            'generated and valid? Run cam_generate first.')
     return {'posted': p['setup'], 'folder': folder or '.', 'program': program,
             'post': os.path.basename(post)}
+
+
+_CAM_OP_TYPES = {'milling': 'MillingOperation', 'turning': 'TurningOperation',
+                 'jet': 'JetOperation', 'additive': 'AdditiveOperation'}
+_CAM_STOCK_MODES = {
+    'relative_box': 'RelativeBoxStock', 'fixed_box': 'FixedBoxStock',
+    'relative_cylinder': 'RelativeCylinderStock',
+    'fixed_cylinder': 'FixedCylinderStock',
+    'relative_tube': 'RelativeTubeStock', 'fixed_tube': 'FixedTubeStock',
+    'solid': 'SolidStock', 'previous_setup': 'PreviousSetupStock',
+}
+
+
+def op_cam_setup(app, p):
+    """Create a MANUFACTURE setup (Fusion 2023+; GA since v2704 for the full
+    flow). bodies: body/occurrence tokens to machine (default: every root
+    body); operation_type: milling|turning|jet|additive; stock_mode:
+    relative_box (default)|fixed_box|relative_cylinder|fixed_cylinder|
+    relative_tube|fixed_tube|solid|previous_setup; optional name. Operations/
+    toolpaths are then added in the UI or via run_fusion_code; generate with
+    cam_generate, post with cam_post. Milling needs no machine; additive
+    setups do (not created here)."""
+    import adsk.cam
+    cam, prev_ws = _cam_product_materialized(app)
+    try:
+        kind = (p.get('operation_type') or 'milling').lower()
+        if kind not in _CAM_OP_TYPES:
+            raise ValueError('operation_type must be one of %s, got %r'
+                             % (sorted(_CAM_OP_TYPES), p.get('operation_type')))
+        sin = cam.setups.createInput(
+            getattr(adsk.cam.OperationTypes, _CAM_OP_TYPES[kind]))
+        models = [_registry.get(t) for t in (p.get('bodies') or [])]
+        if not models:
+            with contextlib.suppress(Exception):
+                bodies = cam.designRootOccurrence.bRepBodies
+                models = [bodies.item(i) for i in range(bodies.count)]
+        if not models:
+            raise RuntimeError('No bodies to machine — pass bodies=[tokens].')
+        try:
+            sin.models = models
+        except Exception:
+            # Design-side proxies can be rejected: remap to the CAM product's
+            # own view of the design bodies by name.
+            cam_bodies = {}
+            with contextlib.suppress(Exception):
+                bodies = cam.designRootOccurrence.bRepBodies
+                cam_bodies = {bodies.item(i).name: bodies.item(i)
+                              for i in range(bodies.count)}
+            sin.models = [cam_bodies.get(getattr(m, 'name', None), m)
+                          for m in models]
+        stock = (p.get('stock_mode') or 'relative_box').lower()
+        if stock not in _CAM_STOCK_MODES:
+            raise ValueError('stock_mode must be one of %s, got %r'
+                             % (sorted(_CAM_STOCK_MODES), p.get('stock_mode')))
+        with contextlib.suppress(Exception):
+            sin.stockMode = getattr(adsk.cam.SetupStockModes,
+                                    _CAM_STOCK_MODES[stock])
+        if p.get('name'):
+            with contextlib.suppress(Exception):
+                sin.name = str(p['name'])
+        setup = cam.setups.add(sin)
+        if setup is None:
+            raise RuntimeError('Fusion refused to create the setup.')
+        if p.get('name'):
+            with contextlib.suppress(Exception):
+                setup.name = str(p['name'])
+        return {'setup': setup.name, 'operation_type': kind,
+                'stock_mode': stock, 'models': len(models)}
+    finally:
+        if prev_ws is not None:
+            with contextlib.suppress(Exception):
+                prev_ws.activate()
+
+
+def op_cam_suppress(app, p):
+    """Suppress (or with suppress=False, restore) a CAM setup or one of its
+    operations by name — skip an operation without deleting it. Names come
+    from cam_setups."""
+    cam = _cam_product(app)
+    name = p['name']
+    suppress = bool(p.get('suppress', True))
+    target = None
+    for i in range(cam.setups.count):
+        s = cam.setups.item(i)
+        if s.name == name:
+            target = s
+            break
+        found = None
+        with contextlib.suppress(Exception):
+            for j in range(s.allOperations.count):
+                o = s.allOperations.item(j)
+                if o.name == name:
+                    found = o
+                    break
+        if found is not None:
+            target = found
+            break
+    if target is None:
+        raise RuntimeError('No CAM setup or operation named %r (see '
+                           'cam_setups)' % name)
+    if getattr(target, 'isSuppressible', True) is False:
+        raise RuntimeError('%r cannot be suppressed in this build.' % name)
+    target.isSuppressed = suppress
+    return {'name': name, 'suppressed': bool(target.isSuppressed)}
 
 
 # --------------------------------------------------------------------------- #
@@ -3789,11 +4342,55 @@ _ISO4762 = {
 }
 
 
+def _native_fastener(app, size, length_mm):
+    """Fusion v2704+ exposes content-library fasteners
+    (FastenerOccurrenceDefinition). Our research notes name the class but not
+    its factory signature, so probe a few plausible spellings defensively and
+    return None to fall back to the parametric ISO 4762 model. Live-Fusion
+    verification: api_introspect
+    target="adsk.fusion.FastenerOccurrenceDefinition"."""
+    cls = getattr(adsk.fusion, 'FastenerOccurrenceDefinition', None)
+    if cls is None:
+        return None
+    definition = None
+    for args in (('ISO 4762', size, length_mm * MM),
+                 (size, length_mm * MM), (size,)):
+        with contextlib.suppress(Exception):
+            definition = cls.create(*args)
+        if definition is not None:
+            break
+    if definition is None:
+        return None
+    occs = _root(app).occurrences
+    occ = None
+    for meth in ('addByOccurrenceDefinition',
+                 'addByFastenerOccurrenceDefinition', 'addByDefinition'):
+        fn = getattr(occs, meth, None)
+        if fn is None:
+            continue
+        with contextlib.suppress(Exception):
+            occ = fn(definition)
+        if occ is not None:
+            break
+    if occ is None:
+        return None
+    out = {'occurrence': _registry.add('occ', occ), 'native': True,
+           'size': size, 'length_mm': length_mm}
+    with contextlib.suppress(Exception):
+        comp = occ.component
+        out['component'] = _registry.add('cmp', comp)
+        out['name'] = comp.name
+        out['bodies'] = [_registry.add('bdy', b) for b in comp.bRepBodies]
+    return out
+
+
 def op_insert_fastener(app, p):
-    """Model a parametric ISO 4762 socket-head cap screw as its own component.
-    size: M3|M4|M5|M6|M8|M10|M12; length mm (shank under the head). Builds the
-    head, shank, hex socket, and (best effort) a cosmetic thread. thread=False
-    skips the thread. Returns the component/body tokens."""
+    """Insert an ISO 4762 socket-head cap screw as its own component — via the
+    native content-library fastener API when this Fusion build has it
+    (v2704+), else modelled parametrically (head, shank, hex socket, best-
+    effort cosmetic thread). size: M3|M4|M5|M6|M8|M10|M12; length mm (shank
+    under the head); thread=False skips the thread (parametric path only);
+    native=False forces the parametric path. Returns component/body tokens."""
     size = str(p.get('size', 'M6')).upper()
     if size not in _ISO4762:
         raise ValueError('size must be one of %s, got %r'
@@ -3801,6 +4398,10 @@ def op_insert_fastener(app, p):
     length = float(p.get('length', 20.0))
     if length <= 0:
         raise ValueError('length must be > 0 mm')
+    if p.get('native', True):
+        native = _native_fastener(app, size, length)
+        if native is not None:
+            return native
     d, dk, k, s, _pitch = _ISO4762[size]
     root = _root(app)
     occ = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
@@ -3848,7 +4449,12 @@ def op_insert_fastener(app, p):
 
     out = {'component': _registry.add('cmp', comp),
            'occurrence': _registry.add('occ', occ), 'name': comp.name,
-           'size': size, 'length_mm': length}
+           'size': size, 'length_mm': length, 'native': False}
+    if getattr(adsk.fusion, 'FastenerOccurrenceDefinition', None) is not None:
+        out['note'] = ('Native fastener API detected but its factory shape '
+                       'did not match — modelled parametrically instead. '
+                       'Probe with api_introspect target='
+                       '"adsk.fusion.FastenerOccurrenceDefinition".')
     # Cosmetic thread on the shank side face (best effort).
     if p.get('thread', True):
         with contextlib.suppress(Exception):
@@ -4287,6 +4893,14 @@ DISPATCH = {
     'annotate': op_annotate,
     'annotations_clear': op_annotations_clear,
     'contact_set': op_contact_set,
+    # v1.10.0: July 2026 GA wave + diagnostics
+    'timeline_builder': op_timeline_builder,
+    'corner_closure': op_corner_closure,
+    'cam_setup': op_cam_setup,
+    'cam_suppress': op_cam_suppress,
+    'design_diagnostics': op_design_diagnostics,
+    'sketch_status': op_sketch_status,
+    'create_appearance': op_create_appearance,
 }
 
 

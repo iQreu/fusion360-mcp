@@ -68,6 +68,30 @@ def _call(op, _consume_notice=True, **params):
     return result
 
 
+def _with_screenshot(result, include_screenshot):
+    """Visual-verification loop: when a mutating tool is asked, attach an
+    iso/fit viewport screenshot to its result (one extra add-in round trip,
+    no extra tool call). Any screenshot failure returns the plain result
+    unchanged — verification must never break the mutation it verifies.
+    Note: the capture moves the camera to the iso preset."""
+    if not include_screenshot or not isinstance(result, dict) \
+            or result.get('error'):
+        return result
+    try:
+        path = os.path.join(os.environ.get('TEMP', os.getcwd()),
+                            'fusion_mcp_verify.png')
+        shot = fusion.call('screenshot', {
+            'path': path, 'width': 800, 'height': 600, 'direction': 'iso',
+            'fit': True, 'return_base64': True})
+        b64 = shot.get('image_base64') if isinstance(shot, dict) else None
+        if b64:
+            import base64
+            return [result, Image(data=base64.b64decode(b64), format='png')]
+    except Exception:  # noqa: BLE001 - the screenshot is best-effort
+        pass
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # State / inspection
 # --------------------------------------------------------------------------- #
@@ -195,6 +219,16 @@ def query_entities(kind: str, target: str = '', include_mass_props: bool = False
                  include_mass_props=include_mass_props)
 
 
+@mcp.tool(**_annot(readOnlyHint=True))
+def design_diagnostics(limit: int = 100) -> dict:
+    """One-call health report of the active design: timeline features in
+    error/warning state (with Fusion's own message), sketches that are not
+    fully constrained, open (non-solid) bodies, empty components and unsaved
+    changes. Run it after a big batch build or before export/CAM/print to
+    catch silent modelling problems. limit caps the issue list."""
+    return _call('design_diagnostics', limit=limit)
+
+
 # --------------------------------------------------------------------------- #
 # Sketching
 # --------------------------------------------------------------------------- #
@@ -266,86 +300,109 @@ def sketch_spline(sketch: str, points: list[list[float]]) -> dict:
 @mcp.tool()
 def extrude(profile: str, distance: float = 0.0, operation: str = 'new',
             symmetric: bool = False, taper_angle: float = 0.0,
-            to_face: str = '') -> dict:
+            to_face: str = '', include_screenshot: bool = False):
     """Extrude a profile token by `distance` mm. operation: new|join|cut|intersect.
     If symmetric, distance is the total (centred) length. taper_angle (deg)
     drafts the sides (e.g. molds). to_face: extrude up to a face/body token
-    instead of a distance. Returns body tokens."""
-    return _call('extrude', profile=profile, distance=distance,
-                 operation=operation, symmetric=symmetric,
-                 taper_angle=taper_angle, to_face=to_face or None)
+    instead of a distance. Returns body tokens. include_screenshot=True also
+    attaches an iso screenshot of the result — see what you built without a
+    second call."""
+    return _with_screenshot(
+        _call('extrude', profile=profile, distance=distance,
+              operation=operation, symmetric=symmetric,
+              taper_angle=taper_angle, to_face=to_face or None),
+        include_screenshot)
 
 
 @mcp.tool()
 def revolve(profile: str, axis: str, angle: float = 360.0,
-            operation: str = 'new') -> dict:
+            operation: str = 'new', include_screenshot: bool = False):
     """Revolve a profile around an axis ("X"/"Y"/"Z" or a line/edge token) by
     `angle` degrees. operation: new|join|cut|intersect."""
-    return _call('revolve', profile=profile, axis=axis, angle=angle,
-                 operation=operation)
+    return _with_screenshot(
+        _call('revolve', profile=profile, axis=axis, angle=angle,
+              operation=operation), include_screenshot)
 
 
 @mcp.tool()
-def fillet(edges: list[str], radius: float) -> dict:
+def fillet(edges: list[str], radius: float, include_screenshot: bool = False):
     """Round one or more edge tokens with a constant radius (mm)."""
-    return _call('fillet', edges=edges, radius=radius)
+    return _with_screenshot(_call('fillet', edges=edges, radius=radius),
+                            include_screenshot)
 
 
 @mcp.tool()
-def chamfer(edges: list[str], distance: float) -> dict:
+def chamfer(edges: list[str], distance: float,
+            include_screenshot: bool = False):
     """Bevel one or more edge tokens with an equal distance (mm)."""
-    return _call('chamfer', edges=edges, distance=distance)
+    return _with_screenshot(_call('chamfer', edges=edges, distance=distance),
+                            include_screenshot)
 
 
 @mcp.tool()
-def shell(thickness: float, faces: list[str] = []) -> dict:
+def shell(thickness: float, faces: list[str] = [],
+          validate_only: bool = False, include_screenshot: bool = False):
     """Hollow the body with a wall `thickness` mm, removing the given face tokens
-    (open faces). Pass an empty list to shell without removing a face."""
-    return _call('shell', thickness=thickness, faces=faces)
+    (open faces). Pass an empty list to shell without removing a face.
+    validate_only=True reports whether the shell would succeed (and what it
+    would produce) WITHOUT keeping it — cheap pre-flight for thin walls."""
+    return _with_screenshot(
+        _call('shell', thickness=thickness, faces=faces,
+              validate_only=validate_only or None), include_screenshot)
 
 
 @mcp.tool()
 def combine(target: str, tools: list[str], operation: str = 'join',
-            keep_tools: bool = False) -> dict:
+            keep_tools: bool = False, include_screenshot: bool = False):
     """Boolean combine a target body token with tool body tokens.
     operation: join|cut|intersect."""
-    return _call('combine', target=target, tools=tools, operation=operation,
-                 keep_tools=keep_tools)
+    return _with_screenshot(
+        _call('combine', target=target, tools=tools, operation=operation,
+              keep_tools=keep_tools), include_screenshot)
 
 
 @mcp.tool()
 def rectangular_pattern(entities: list[str], count1: int, spacing1: float,
                         direction1: str = 'X', count2: int = 0,
-                        spacing2: float = 0.0, direction2: str = 'Y') -> dict:
+                        spacing2: float = 0.0, direction2: str = 'Y',
+                        include_screenshot: bool = False):
     """Rectangular pattern of body/feature tokens. counts are instance counts,
     spacings are mm. Set count2>0 for a second direction; spacing2 defaults to
     spacing1 when left at 0."""
-    return _call('rectangular_pattern', entities=entities, count1=count1,
-                 spacing1=spacing1, direction1=direction1, count2=count2,
-                 spacing2=(spacing2 or spacing1), direction2=direction2)
+    return _with_screenshot(
+        _call('rectangular_pattern', entities=entities, count1=count1,
+              spacing1=spacing1, direction1=direction1, count2=count2,
+              spacing2=(spacing2 or spacing1), direction2=direction2),
+        include_screenshot)
 
 
 @mcp.tool()
 def circular_pattern(entities: list[str], axis: str, count: int,
-                     angle: float = 360.0, symmetric: bool = False) -> dict:
+                     angle: float = 360.0, symmetric: bool = False,
+                     include_screenshot: bool = False):
     """Circular pattern of tokens about an axis ("X"/"Y"/"Z" or token),
     `count` instances over `angle` degrees."""
-    return _call('circular_pattern', entities=entities, axis=axis, count=count,
-                 angle=angle, symmetric=symmetric)
+    return _with_screenshot(
+        _call('circular_pattern', entities=entities, axis=axis, count=count,
+              angle=angle, symmetric=symmetric), include_screenshot)
 
 
 @mcp.tool()
-def mirror(entities: list[str], plane: str) -> dict:
+def mirror(entities: list[str], plane: str, include_screenshot: bool = False):
     """Mirror tokens across a plane ("XY"/"XZ"/"YZ" or a planar-face token)."""
-    return _call('mirror', entities=entities, plane=plane)
+    return _with_screenshot(_call('mirror', entities=entities, plane=plane),
+                            include_screenshot)
 
 
 @mcp.tool()
-def offset_face(faces: list[str], distance: float) -> dict:
+def offset_face(faces: list[str], distance: float,
+                include_screenshot: bool = False):
     """Press-pull: offset the given face tokens by `distance` mm (negative
     pushes inward). The quickest way to tweak a wall thickness or clearance
     without touching sketches."""
-    return _call('offset_face', faces=faces, distance=distance)
+    return _with_screenshot(
+        _call('offset_face', faces=faces, distance=distance),
+        include_screenshot)
 
 
 @mcp.tool()
@@ -358,12 +415,13 @@ def scale(entities: list[str], factor: float, point: str = '') -> dict:
 
 @mcp.tool()
 def thicken(faces: list[str], thickness: float, symmetric: bool = False,
-            operation: str = 'new') -> dict:
+            operation: str = 'new', include_screenshot: bool = False):
     """Thicken surface faces (tokens) into a solid, `thickness` mm (symmetric
     centres it on the surface). operation: new|join|cut|intersect. Turns
     surface lofts/sweeps into printable solids."""
-    return _call('thicken', faces=faces, thickness=thickness,
-                 symmetric=symmetric, operation=operation)
+    return _with_screenshot(
+        _call('thicken', faces=faces, thickness=thickness,
+              symmetric=symmetric, operation=operation), include_screenshot)
 
 
 @mcp.tool()
@@ -385,14 +443,17 @@ def delete(token: str) -> dict:
 def hole(sketch: str, x: float, y: float, diameter: float, depth: float = 0.0,
          through_all: bool = False, kind: str = 'simple',
          cbore_diameter: float = 0.0, cbore_depth: float = 0.0,
-         csink_diameter: float = 0.0, csink_angle: float = 90.0) -> dict:
+         csink_diameter: float = 0.0, csink_angle: float = 90.0,
+         include_screenshot: bool = False):
     """Create a hole at point (x,y) mm on a sketch. kind: simple|counterbore|
     countersink. Set through_all=True or give depth (mm). Counterbore needs
     cbore_diameter/cbore_depth; countersink needs csink_diameter/csink_angle."""
-    return _call('hole', sketch=sketch, x=x, y=y, diameter=diameter, depth=depth,
-                 through_all=through_all, kind=kind, cbore_diameter=cbore_diameter,
-                 cbore_depth=cbore_depth, csink_diameter=csink_diameter,
-                 csink_angle=csink_angle)
+    return _with_screenshot(
+        _call('hole', sketch=sketch, x=x, y=y, diameter=diameter, depth=depth,
+              through_all=through_all, kind=kind,
+              cbore_diameter=cbore_diameter, cbore_depth=cbore_depth,
+              csink_diameter=csink_diameter, csink_angle=csink_angle),
+        include_screenshot)
 
 
 @mcp.tool()
@@ -495,23 +556,45 @@ def auto_constrain(sketch: str) -> dict:
     return _call('auto_constrain', sketch=sketch)
 
 
+@mcp.tool(**_annot(readOnlyHint=True))
+def sketch_status(sketch: str = '') -> dict:
+    """Pre-flight a sketch before sweep/loft/shell — most failed attempts
+    trace back to an open or missing profile. Reports profile count,
+    fully-constrained state, curve/construction counts and OPEN ENDPOINTS
+    (mm positions where exactly one curve ends — exactly where a closing
+    segment or coincident constraint is missing; open chains never form
+    profiles). Pass a sketch token, or omit to check every root sketch."""
+    return _call('sketch_status', sketch=sketch or None)
+
+
 # --------------------------------------------------------------------------- #
 # Advanced features
 # --------------------------------------------------------------------------- #
 @mcp.tool()
-def loft(profiles: list[str], rails: list[str] = [], operation: str = 'new') -> dict:
+def loft(profiles: list[str], rails: list[str] = [], operation: str = 'new',
+         validate_only: bool = False, include_screenshot: bool = False):
     """Loft through 2+ profile tokens (ordered). Optional rails (curve/edge
-    tokens) guide the shape. operation: new|join|cut|intersect."""
-    return _call('loft', profiles=profiles, rails=rails, operation=operation)
+    tokens) guide the shape. operation: new|join|cut|intersect.
+    validate_only=True reports whether the loft would succeed (and what it
+    would produce) WITHOUT keeping it — pre-flight profile compatibility
+    before committing (pair with sketch_status)."""
+    return _with_screenshot(
+        _call('loft', profiles=profiles, rails=rails, operation=operation,
+              validate_only=validate_only or None), include_screenshot)
 
 
 @mcp.tool()
 def sweep(profile: str, path: str, twist_angle: float = 0.0,
-          operation: str = 'new') -> dict:
+          operation: str = 'new', validate_only: bool = False,
+          include_screenshot: bool = False):
     """Sweep a profile token along a path (curve/edge token). twist_angle in deg.
-    operation: new|join|cut|intersect."""
-    return _call('sweep', profile=profile, path=path, twist_angle=twist_angle,
-                 operation=operation)
+    operation: new|join|cut|intersect. validate_only=True reports whether the
+    sweep would succeed WITHOUT keeping it — pre-flight a doubtful
+    profile/path pair (pair with sketch_status)."""
+    return _with_screenshot(
+        _call('sweep', profile=profile, path=path, twist_angle=twist_angle,
+              operation=operation, validate_only=validate_only or None),
+        include_screenshot)
 
 
 @mcp.tool()
@@ -649,13 +732,31 @@ def list_appearances(filter: str = '', limit: int = 200) -> dict:
 
 
 @mcp.tool()
+def create_appearance(name: str, r: int | None = None, g: int | None = None,
+                      b: int | None = None, alpha: int = 255,
+                      roughness: float | None = None, base: str = '',
+                      library: str = '') -> dict:
+    """Create a custom appearance in the document (copy + recolour): r/g/b
+    0-255 (optional alpha), roughness 0..1 (0 = polished, 1 = matte), base =
+    appearance name to copy (default: a matte plastic; library narrows the
+    lookup). Any exact colour without leaving the chat — assign it with
+    set_appearance(body, name) afterwards."""
+    return _call('create_appearance', name=name, r=r, g=g, b=b, alpha=alpha,
+                 roughness=roughness, base=base or None,
+                 library=library or None)
+
+
+@mcp.tool()
 def insert_fastener(size: str = 'M6', length: float = 20.0,
-                    thread: bool = True) -> dict:
-    """Insert a parametric ISO 4762 socket-head cap screw as its own component
-    (head + shank + hex socket + optional cosmetic thread). size:
-    M3|M4|M5|M6|M8|M10|M12; length mm (shank under the head). Real hardware for
-    assemblies/BOM without modelling it by hand; joint it with as_built_joint."""
-    return _call('insert_fastener', size=size, length=length, thread=thread)
+                    thread: bool = True, native: bool = True) -> dict:
+    """Insert an ISO 4762 socket-head cap screw as its own component — the
+    native content-library fastener when this Fusion build ships it (v2704+),
+    else modelled parametrically (head + shank + hex socket + optional
+    cosmetic thread). size: M3|M4|M5|M6|M8|M10|M12; length mm (shank under
+    the head); native=False forces the parametric path. Real hardware for
+    assemblies/BOM; joint it with as_built_joint."""
+    return _call('insert_fastener', size=size, length=length, thread=thread,
+                 native=native)
 
 
 @mcp.tool(**_annot(readOnlyHint=True))
@@ -709,6 +810,20 @@ def suppress_feature(feature: str, suppress: bool = True) -> dict:
     """Suppress (or unsuppress with suppress=False) a feature token in the
     timeline. Parametric designs only."""
     return _call('suppress_feature', feature=feature, suppress=suppress)
+
+
+@mcp.tool()
+def timeline_builder(action: str = 'start', body: str = '',
+                     timeout: float = 60.0) -> dict:
+    """Rebuild an editable parametric timeline from a bare BRep body — an
+    imported STEP becomes a design with real features (Timeline Builder
+    cloud service, Fusion July 2026+). action="start" (body = body token;
+    waits up to `timeout` s for the cloud job), "status" (poll a running
+    job), "open" (activate the produced document — then call get_state, old
+    tokens are invalid). Needs network access; large bodies can take
+    minutes, so start + status is the usual flow."""
+    return _call('timeline_builder', action=action, body=body or None,
+                 timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -809,7 +924,8 @@ def save(message: str = '') -> dict:
 # Escape hatch
 # --------------------------------------------------------------------------- #
 @mcp.tool()
-def batch(operations: list[dict], stop_on_error: bool = True) -> dict:
+def batch(operations: list[dict], stop_on_error: bool = True,
+          include_screenshot: bool = False):
     """Run many operations in ONE round trip and ONE main-thread dispatch — the
     fastest way to build a multi-step part (use this instead of many separate
     tool calls).
@@ -831,8 +947,12 @@ def batch(operations: list[dict], stop_on_error: bool = True) -> dict:
     fillet, ...). Both "run_fusion_code" and "run_code" work as the op for the
     escape hatch. "$alias.path" supports .key and [i] including negative indices
     ([-1]); an unparseable path raises rather than silently mis-resolving.
-    Returns a per-operation result list."""
-    return _call('batch', operations=operations, stop_on_error=stop_on_error)
+    Returns a per-operation result list. include_screenshot=True also attaches
+    an iso screenshot after the whole batch — verify a multi-step build with
+    zero extra calls."""
+    return _with_screenshot(
+        _call('batch', operations=operations, stop_on_error=stop_on_error),
+        include_screenshot)
 
 
 @mcp.tool()
@@ -905,12 +1025,15 @@ def sketch_text(sketch: str, text: str, x: float = 0.0, y: float = 0.0,
 
 
 @mcp.tool()
-def emboss(profile: str, depth: float, engrave: bool = True) -> dict:
+def emboss(profile: str, depth: float, engrave: bool = True,
+           include_screenshot: bool = False):
     """Engrave (engrave=True, cuts into the solid below the sketch plane) or
     emboss (engrave=False, raises material above it) a sketch-text or profile
     token, `depth` mm deep. Typical flow: sketch on a face -> sketch_text ->
     emboss."""
-    return _call('emboss', profile=profile, depth=depth, engrave=engrave)
+    return _with_screenshot(
+        _call('emboss', profile=profile, depth=depth, engrave=engrave),
+        include_screenshot)
 
 
 @mcp.tool()
@@ -933,7 +1056,7 @@ def export_flat_pattern(path: str, face: str = '', body: str = '',
 
 @mcp.tool()
 def fold(face: str, bend_line: str, angle: float = 90.0, radius: float = 0.0,
-         corner_relief: bool = False) -> dict:
+         corner_relief: bool = False, include_screenshot: bool = False):
     """Fold a sheet-metal body along a bend line (Fusion July 2026+). `face` is
     the stationary face token, `bend_line` a sketch-line token drawn across it
     (create_sketch on the face + sketch_line). angle in degrees, optional bend
@@ -941,8 +1064,10 @@ def fold(face: str, bend_line: str, angle: float = 90.0, radius: float = 0.0,
     relief off; True forces it on."""
     # Forward corner_relief untouched: `or None` would collapse an explicit
     # False to None and make "relief off" unreachable.
-    return _call('fold', face=face, bend_line=bend_line, angle=angle,
-                 radius=radius or None, corner_relief=corner_relief)
+    return _with_screenshot(
+        _call('fold', face=face, bend_line=bend_line, angle=angle,
+              radius=radius or None, corner_relief=corner_relief),
+        include_screenshot)
 
 
 @mcp.tool()
@@ -952,6 +1077,22 @@ def join_by_bend(edge_a: str, edge_b: str, radius: float = 0.0) -> dict:
     kind="edges". Optional bend radius in mm (0 = rule default)."""
     return _call('join_by_bend', edge_a=edge_a, edge_b=edge_b,
                  radius=radius or None)
+
+
+@mcp.tool()
+def corner_closure(edge_a: str, edge_b: str, gap: float | None = None,
+                   overlap: float | None = None, flip: bool = False,
+                   transition: str = '',
+                   width_aligned: bool | None = None) -> dict:
+    """Close the corner where two sheet-metal flanges meet (Fusion July
+    2026+). edge_a/edge_b: the two flange edges that face each other across
+    the corner (pick with query_entities kind="edges"). gap in mm; overlap
+    0..1 switches from symmetric-gap to overlap alignment (flip puts the
+    other flange on top); transition: smooth|straight|trim. Reports whether
+    Fusion treated it as a two- or three-bend corner."""
+    return _call('corner_closure', edge_a=edge_a, edge_b=edge_b, gap=gap,
+                 overlap=overlap, flip=flip, transition=transition or None,
+                 width_aligned=width_aligned)
 
 
 @mcp.tool()
@@ -1179,10 +1320,32 @@ def configurations(action: str = 'list', name: str = '', row: int = 0,
 
 @mcp.tool(**_annot(readOnlyHint=True))
 def cam_setups() -> dict:
-    """List MANUFACTURE (CAM) setups with their operations and toolpath state.
-    Note: the Fusion API cannot CREATE setups — the user makes them once in the
-    MANUFACTURE workspace; generation and posting are then scriptable."""
+    """List MANUFACTURE (CAM) setups with their operations and toolpath
+    state. Create new setups with cam_setup; generation and posting are
+    scriptable via cam_generate/cam_post."""
     return _call('cam_setups')
+
+
+@mcp.tool()
+def cam_setup(bodies: list[str] = [], operation_type: str = 'milling',
+              stock_mode: str = 'relative_box', name: str = '') -> dict:
+    """Create a MANUFACTURE (CAM) setup — scripted end-to-end since Fusion
+    v2704. bodies: body/occurrence tokens to machine (default: every root
+    body); operation_type: milling|turning|jet|additive; stock_mode:
+    relative_box|fixed_box|relative_cylinder|fixed_cylinder|relative_tube|
+    fixed_tube|solid|previous_setup. Activates the MANUFACTURE workspace
+    once when the document has never entered it. Add operations in the UI or
+    via run_fusion_code, then cam_generate + cam_post."""
+    return _call('cam_setup', bodies=bodies, operation_type=operation_type,
+                 stock_mode=stock_mode, name=name or None)
+
+
+@mcp.tool()
+def cam_suppress(name: str, suppress: bool = True) -> dict:
+    """Suppress (or restore with suppress=False) a CAM setup or a single
+    operation by name (names from cam_setups) — skip work without deleting
+    it. Suppressed operations are excluded from cam_generate/cam_post."""
+    return _call('cam_suppress', name=name, suppress=suppress)
 
 
 @mcp.tool()
@@ -1256,6 +1419,74 @@ def electronics_library(filter: str = '', limit: int = 0) -> dict:
     schematic/PCB active: the libraries embedded in that document with
     content counts. filter: name substring; limit: cap (device sets)."""
     return _call('electronics_library', filter=filter or None, limit=limit)
+
+
+def _ecad_bom_rows(components, group=True):
+    """Aggregate schematic parts into BOM rows — pure Python over the
+    electronics_components read, no extra Fusion API surface. Grouping key:
+    value + package (group=False keeps one row per part)."""
+    def _attr(attrs, names):
+        for k, v in attrs.items():
+            if str(k).upper() in names and v:
+                return str(v)
+        return ''
+
+    rows = {}
+    for c in components:
+        attrs = c.get('attributes') or {}
+        key = ((c.get('value') or '', c.get('package') or '') if group
+               else (c.get('name') or '',))
+        row = rows.get(key)
+        if row is None:
+            row = rows[key] = {
+                'value': c.get('value') or '',
+                'package': c.get('package') or '',
+                'device_set': c.get('device_set') or '',
+                'mpn': '', 'manufacturer': '',
+                'quantity': 0, 'designators': []}
+        # Backfill from whichever part in the group carries the attribute.
+        if not row['mpn']:
+            row['mpn'] = _attr(attrs, ('MPN', 'PART_NUMBER', 'PARTNO',
+                                       'MANUFACTURER_PART_NUMBER'))
+        if not row['manufacturer']:
+            row['manufacturer'] = _attr(attrs, ('MANUFACTURER', 'MFR', 'MFG'))
+        row['quantity'] += 1
+        row['designators'].append(c.get('name') or '')
+    out = sorted(rows.values(),
+                 key=lambda r: (-r['quantity'], r['value'], r['package']))
+    for r in out:
+        r['designators'] = sorted(r['designators'])
+    return out
+
+
+# NOT readOnlyHint: csv_path writes/overwrites a file at the model-chosen path.
+@mcp.tool()
+def electronics_bom(group: bool = True, csv_path: str = '') -> dict:
+    """Bill of materials of the open electronics design, aggregated from the
+    schematic parts: one row per distinct value+package with quantity, sorted
+    designators (R1, R2, ...) and MPN/manufacturer attributes when the parts
+    carry them. group=False keeps one row per part. csv_path (absolute) also
+    writes the table as CSV for ordering/assembly."""
+    parts = _call('electronics_components', side='schematic', limit=0)
+    if not isinstance(parts, dict) or parts.get('error'):
+        return parts
+    rows = _ecad_bom_rows(parts.get('components') or [], group=group)
+    out = {'rows': len(rows), 'bom': rows}
+    if csv_path:
+        import csv
+        try:
+            with open(csv_path, 'w', newline='', encoding='utf-8') as fh:
+                w = csv.writer(fh)
+                w.writerow(['quantity', 'value', 'package', 'device_set',
+                            'mpn', 'manufacturer', 'designators'])
+                for r in rows:
+                    w.writerow([r['quantity'], r['value'], r['package'],
+                                r['device_set'], r['mpn'], r['manufacturer'],
+                                ' '.join(r['designators'])])
+            out['csv'] = csv_path
+        except OSError as exc:
+            out['csv_error'] = str(exc)
+    return out
 
 
 # NOT readOnlyHint: this writes/overwrites a file at the model-chosen path.
@@ -1561,6 +1792,37 @@ def reverse_engineer_scan(scan_path: str = '', tolerance_mm: float = 0.2) -> str
         '— iterate on the worst regions until within tolerance.\n'
         '6) Show the result: multi_screenshot + the deviation summary.'
         % ((' at %r' % scan_path) if scan_path else '', tolerance_mm)
+    )
+
+
+@mcp.prompt()
+def constrain_and_dimension() -> str:
+    """Guide the model to fully constrain and dimension a sketch."""
+    return (
+        'Fully constrain the active sketch. 1) sketch_status — find open '
+        'endpoints and the profile count; close open chains first '
+        '(sketch_line, or sketch_constraint kind="coincident"). 2) '
+        'auto_constrain to add the geometric constraints a human would. 3) '
+        'Add driving dimensions with sketch_dimension, naming the key ones '
+        'via parameter= so they become editable parameters. 4) Re-run '
+        'sketch_status until fully_constrained is true; design_diagnostics '
+        'confirms nothing else is under-constrained.'
+    )
+
+
+@mcp.prompt()
+def cam_to_gcode(post: str = 'fanuc.cps') -> str:
+    """Guide the model from a solid to posted G-code."""
+    return (
+        'Machine the active design and produce G-code. 1) get_state + '
+        'bounding_box to size the part and pick orientations. 2) '
+        'cam_setup(bodies=[...], operation_type="milling", '
+        'stock_mode="relative_box") — one setup per orientation. 3) Add '
+        'operations (adaptive clearing, contour, drill) in the MANUFACTURE '
+        'UI or via run_fusion_code on the cam product. 4) cam_generate() and '
+        'check cam_setups for toolpath errors; park problem operations with '
+        'cam_suppress while iterating. 5) cam_post(setup, path, '
+        'post_config="%s") and report the NC file path.' % post
     )
 
 

@@ -26,7 +26,10 @@ def test_server_imports_and_registers_tools():
     # regression that would drop tools or crash registration entirely.
     for expected in ('get_state', 'extrude', 'export', 'run_fusion_code',
                      'mesh_compare', 'fold', 'configurations', 'print_check',
-                     'list_materials', 'contact_set', 'version_history'):
+                     'list_materials', 'contact_set', 'version_history',
+                     'design_diagnostics', 'sketch_status', 'timeline_builder',
+                     'corner_closure', 'cam_setup', 'cam_suppress',
+                     'create_appearance', 'electronics_bom'):
         assert expected in names, 'missing tool: %s' % expected
     # Sanity floor: the server exposes well over a hundred tools.
     assert len(names) >= 110, 'only %d tools registered' % len(names)

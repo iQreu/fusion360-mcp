@@ -75,7 +75,10 @@ perpendicular/equal/collinear/tangent/concentric/coincident/midpoint),
 `sketch_dimension` (distance/radius/diameter/angle), `sketch_offset`,
 `sketch_fillet`, `project_to_sketch`, `auto_constrain(sketch)` — automatyczne
 więzy jak od człowieka (Fusion 2026+), `sketch_blend_curve(curve1, curve2)` —
-gładkie połączenie dwóch otwartych krzywych splajnem G1/G2 (lipiec 2026+)
+gładkie połączenie dwóch otwartych krzywych splajnem G1/G2 (lipiec 2026+),
+`sketch_status(sketch?)` — pre-flight szkicu: liczba profili, pełne związanie
+i **otwarte końcówki** (współrzędne mm, gdzie łańcuch się nie domyka — główna
+przyczyna nieudanych sweep/loft)
 **Geometria konstrukcyjna**: `construction_plane` (offset/angle/three_points/
 tangent; `extended=False` — kompaktowa płaszczyzna, lipiec 2026+),
 `construction_axis` (edge/two_points/cylinder), `construction_point`
@@ -85,7 +88,11 @@ długości krawędzi/krzywej, lipiec 2026+)
 `taper_angle`), `revolve`, `fillet`, `chamfer`, `shell`, `combine`,
 `rectangular_pattern`, `circular_pattern`, `mirror`, `move_body`, `delete`, `hole`
 (simple/counterbore/countersink), `loft`, `sweep`, `rib`, `draft`, `thread`,
-`split_body`, `offset_face` (press-pull), `scale`, `thicken` (powierzchnia→bryła)
+`split_body`, `offset_face` (press-pull), `scale`, `thicken` (powierzchnia→bryła).
+`loft`/`sweep`/`shell` przyjmują `validate_only=true` — próba na sucho (czy
+operacja przejdzie i co wyprodukuje) bez zostawiania cechy w osi czasu.
+Mutujące cechy (i `batch`) przyjmują `include_screenshot=true` — do wyniku
+dołączany jest screenshot iso: wizualna weryfikacja bez drugiego wywołania
 **Złożenia**: `create_component`, `rename`, `copy_body` (do wskazanego
 komponentu/occurrence), `joint`
 (rigid/revolute/slider/cylindrical/pin_slot/planar/ball),
@@ -96,7 +103,8 @@ punkt odniesienia, `move_occurrence` (przesunięcie/obrót całego komponentu),
 `interference` i `multi_screenshot` daje sprawdzenie mechanizmu w ruchu),
 `set_joint_limits`, `contact_set(tokens|action)` — kontakt fizyczny w
 mechanizmie (części nie przenikają), `insert_fastener(size, length)` —
-parametryczna śruba ISO 4762 (M3–M12) jako gotowy komponent
+śruba ISO 4762 (M3–M12) jako gotowy komponent: natywna z biblioteki
+zawartości, gdy build Fusion ją ma (v2704+), inaczej modelowana parametrycznie
 **Dokumenty w chmurze**: `list_documents(project)`, `open_document(name)` —
 panel danych Fusion (projekty i dokumenty), `data_folders(project, max_depth)`
 — rekurencyjne drzewo folderów (dokumenty w podfolderach),
@@ -104,7 +112,9 @@ panel danych Fusion (projekty i dokumenty), `data_folders(project, max_depth)`
 `share_link(create)` — link do udostępnienia (publikacja tylko za zgodą)
 **Materiały i pomiary**: `set_material`, `set_appearance`,
 `list_materials(filter)` / `list_appearances(filter)` — przegląd nazw z
-bibliotek (żeby set_* miał trafną nazwę), `measure`
+bibliotek (żeby set_* miał trafną nazwę),
+`create_appearance(name, r, g, b, roughness)` — własny wygląd w dokumencie
+(kopia + przebarwienie; dowolny kolor RGB bez wychodzenia z czatu), `measure`
 (distance/angle), `bounding_box`, `center_of_mass`, `interference` (zwraca parę
 kolidujących brył + objętość), `mass_properties` (masa, objętość, pole, środek
 ciężkości, momenty bezwładności)
@@ -118,8 +128,10 @@ token tekstu działa też w zwykłym `extrude`
 laser/waterjet (DXF) lub jako płaska bryła STEP (lipiec 2026+),
 `export_sketch_dxf(sketch, path)` — dowolny szkic jako DXF,
 `fold(face, bend_line, angle, radius)` — zagięcie wzdłuż linii szkicu,
-`join_by_bend(edge_a, edge_b)` — połączenie dwóch blach zagięciem
-(obie operacje: Fusion lipiec 2026+, API preview)
+`join_by_bend(edge_a, edge_b)` — połączenie dwóch blach zagięciem,
+`corner_closure(edge_a, edge_b, gap|overlap, transition)` — domknięcie
+narożnika dwóch kołnierzy (two-/three-bend)
+(operacje: Fusion lipiec 2026+)
 **Siatki / reverse engineering (w Fusion)**: `import_mesh(path, units)`
 (stl/obj/3mf), `mesh_info`, `mesh_reduce` (redukcja trójkątów: target_faces/
 proportion/max_deviation, adaptive|uniform), `mesh_remesh`,
@@ -159,16 +171,26 @@ arkusza kalkulacyjnego
 konfiguracji projektu, przełączenie aktywnej, odczyt komórek tabeli
 **Gwinty**: `thread_types` — dostępne standardy gwintów, w tym biblioteki
 niestandardowe z huba zespołu (lipiec 2026+)
-**CAM (MANUFACTURE)**: `cam_setups` (lista setupów i operacji), `cam_generate`
-(przeliczenie ścieżek), `cam_post(setup, path, post_config)` — G-code przez
-post-procesor (.cps). Setup tworzy się raz w UI — API nie umie go założyć;
-regeneracja i post są już skryptowalne
+**CAM (MANUFACTURE)**: `cam_setup(bodies, operation_type, stock_mode, name)` —
+założenie setupu z kodu (GA od v2704; milling/turning/jet/additive, tryby
+stocku box/cylinder/tube/solid), `cam_setups` (lista setupów i operacji),
+`cam_generate` (przeliczenie ścieżek), `cam_suppress(name)` — wyłączenie
+setupu/operacji bez kasowania, `cam_post(setup, path, post_config)` — G-code
+przez post-procesor (.cps). Prompt `cam_to_gcode` prowadzi cały przepływ
 **Elektronika (read-only, preview API, Fusion maj 2026+)**: `electronics_info`,
 `electronics_components`, `electronics_nets`, `electronics_layers`,
 `electronics_library` — inspekcja schematu/PCB/bibliotek (bez edycji — API jest
-tylko do odczytu), `electronics_export(path)` — eksport EAGLE 9.6.2
-(.brd/.sch/.lbr wg rozszerzenia)
-**Timeline**: `timeline` (list/rollback), `suppress_feature`
+tylko do odczytu), `electronics_bom(group, csv_path)` — BOM z partów schematu
+(agregacja wartość+footprint, designatory, MPN/producent, zapis CSV),
+`electronics_export(path)` — eksport EAGLE 9.6.2 (.brd/.sch/.lbr wg
+rozszerzenia)
+**Timeline**: `timeline` (list/rollback), `suppress_feature`,
+`timeline_builder(action, body)` — odbudowa edytowalnej osi czasu z gołej
+bryły (importowany STEP → cechy parametryczne; usługa chmurowa, lipiec 2026+)
+**Diagnostyka**: `design_diagnostics()` — raport zdrowia projektu w jednym
+wywołaniu: błędy/ostrzeżenia osi czasu (z komunikatem Fusion), szkice bez
+pełnych więzów, otwarte (niebryłowe) ciała, puste komponenty, niezapisane
+zmiany
 **Aktualizacje**: automatyczne sprawdzenie + pobranie przy starcie (patrz
 [Aktualizacje z GitHuba](#aktualizacje-z-githuba)); `check_for_updates` (odczyt:
 wersje + release notes), `apply_update(confirm=True, method="auto")` (instaluje
@@ -189,7 +211,8 @@ API (token, `$nazwa` ze store, ścieżka `adsk.*`) przed napisaniem snippetu
 **Resources** (odczyt bez wywołania narzędzia): `fusion://design/state`,
 `fusion://design/parameters`, `fusion://design/tree`.
 **Prompts** (gotowe szablony): `parametric_bracket`, `prepare_for_3d_print`,
-`reverse_engineer_scan`, `assemble_components`.
+`reverse_engineer_scan`, `assemble_components`, `constrain_and_dimension`,
+`cam_to_gcode`.
 Narzędzia inspekcyjne są oznaczone adnotacją `readOnlyHint`, a `delete` —
 `destructiveHint` (klient MCP wie, które operacje są bezpieczne). Błędy niosą
 **kod strukturalny** (`code`: `stale_token`/`bad_params`/`no_design`/

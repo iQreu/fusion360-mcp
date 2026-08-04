@@ -32,6 +32,9 @@ EXPECTED = {
     'as_built_joint', 'joint_origin', 'list_materials', 'list_appearances',
     'insert_fastener', 'data_folders', 'version_history', 'share_link',
     'annotate', 'annotations_clear', 'contact_set',
+    # v1.10.0: July 2026 GA wave + diagnostics
+    'timeline_builder', 'corner_closure', 'cam_setup', 'cam_suppress',
+    'design_diagnostics', 'sketch_status', 'create_appearance',
 }
 
 
