@@ -48,6 +48,12 @@ class Registry:
             self._et_by_token[token] = et
         return token
 
+    def tokens(self):
+        """Snapshot of the currently resolvable token strings (for selective
+        invalidation, e.g. dropping only pre-existing tokens after an op that
+        switched documents mid-dispatch)."""
+        return set(self._by_token)
+
     def get(self, token):
         if token is None:
             raise KeyError('Expected an entity token, got null')

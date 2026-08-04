@@ -81,6 +81,38 @@ def test_assemble_loops_separates_disjoint_loops_and_drops_degenerate():
     assert all(closed for _, closed in loops)
 
 
+def test_assemble_loops_backward_walk_closure_is_kept():
+    # A closed pentagon H-Y-Z-T-X plus one chord T-Y (a degree-3 junction, as
+    # emitted when the section plane grazes a shared mesh vertex). The forward
+    # walk stops at the junction; the BACKWARD walk consumes the closing edge
+    # and returns True — a result that used to be discarded, reporting the
+    # closed contour as open and dropping its closing edge from the output.
+    H, Y, Z, T, X = (0, 0, 0), (1, 0, 0), (2, 0.5, 0), (1.5, 1.5, 0), (0, 1, 0)
+    segs = [(H, Y), (Y, Z), (Z, T), (T, Y), (T, X), (X, H)]
+    loops = scan._assemble_loops(segs)
+    closed_loops = [pts for pts, closed in loops if closed]
+    assert len(closed_loops) == 1, 'the pentagon must be reported closed'
+    assert len(closed_loops[0]) == 5
+
+
+def test_print_check_catches_elevated_flat_overhang_on_tall_parts(tmp_path):
+    tm = pytest.importorskip('trimesh')
+    t = tm.transformations.translation_matrix
+    # A 100x100x2 plate whose flat underside hangs 3 mm above the bed on one
+    # 5x5x3 foot, with a 195 mm pillar on top (part 200 mm tall). A base band
+    # scaled by part height (2% -> 4 mm) used to classify the whole underside
+    # as "on plate" and report no issues — the first layers would print in air.
+    plate = tm.creation.box(extents=(100.0, 100.0, 2.0), transform=t([0, 0, 4.0]))
+    foot = tm.creation.box(extents=(5.0, 5.0, 3.0), transform=t([0, 0, 1.5]))
+    pillar = tm.creation.box(extents=(5.0, 5.0, 195.0),
+                             transform=t([0, 0, 5.0 + 97.5]))
+    path = str(tmp_path / 'bridge.stl')
+    tm.util.concatenate([plate, foot, pillar]).export(path)
+    res = scan.print_check(path, bed=(300, 300, 300))
+    assert res['overhang']['unsupported_area_fraction'] > 0.15
+    assert any('support' in r.lower() for r in res['recommendations'])
+
+
 def test_fit_circle_recovers_center_and_radius():
     pytest.importorskip('numpy')
     pts = [[10 + 5 * math.cos(t), -3 + 5 * math.sin(t)]

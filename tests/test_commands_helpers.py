@@ -21,6 +21,30 @@ def test_classify_error_codes():
     assert commands.classify_error(RuntimeError('boom'))[0] == 'fusion_error'
 
 
+def test_classify_error_preview_matches_api_phrase_not_user_paths():
+    # Our own preview-API raises say "preview API"; an error merely echoing a
+    # user string (an export path, a body named Preview) must NOT be filed as
+    # unsupported — it would tell the model a retriable failure is impossible.
+    assert commands.classify_error(RuntimeError(
+        'Fold bend-line definition is not available in this build — the '
+        'preview API changed.'))[0] == 'unsupported'
+    assert commands.classify_error(RuntimeError(
+        "Export of 'C:/renders/preview.step' failed (execute returned "
+        'false).'))[0] == 'fusion_error'
+
+
+def test_multi_screenshot_rejects_bad_directions_up_front():
+    import pytest
+    # A non-string direction (reachable via batch, which bypasses server-side
+    # typing) must fail validation BEFORE any capture, not crash on the path
+    # concatenation halfway through the series.
+    with pytest.raises(ValueError, match='camera preset'):
+        commands.op_multi_screenshot(None, {'directions': ['iso', 5],
+                                            'base_path': 'C:/tmp/shot'})
+    with pytest.raises(ValueError, match='camera preset'):
+        commands.op_multi_screenshot(None, {'directions': ['isometric']})
+
+
 class _Line:
     """A sketch-line-like object with start/end geometry points."""
     def __init__(self, x0, y0, x1, y1):

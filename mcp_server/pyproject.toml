@@ -1,14 +1,17 @@
 [project]
 name = "fusion360-mcp"
-version = "1.9.0"
+version = "1.9.1"
 description = "Model Context Protocol server for Autodesk Fusion 360"
 requires-python = ">=3.10"
 dependencies = [
-    # 1.9+ carries tool annotations (readOnlyHint/destructiveHint); the server
-    # degrades gracefully to plain tools on older SDKs (see _annot in server.py).
-    # <2: mcp 2.0 (spec 2026-07-28) renames FastMCP to MCPServer and reworks the
-    # low-level server — migrate deliberately, not via a silent pip upgrade.
-    "mcp>=1.9.0,<2",
+    # >=1.29: the FINAL 1.x line (2026-07-28) — 1.x is maintenance-only now, so
+    # take its last fixes deliberately. The server degrades gracefully to plain
+    # tools on older SDKs (see _annot in server.py).
+    # <2: mcp 2.0 (spec 2026-07-28) renames FastMCP to MCPServer with NO alias
+    # (mcp.server.fastmcp imports die), moves sync tools onto anyio worker
+    # threads, and replaces ctx.elicit on new-spec connections with the
+    # Resolve() pattern — migrate deliberately, not via a silent pip upgrade.
+    "mcp>=1.29,<2",
 ]
 
 [project.optional-dependencies]

@@ -97,11 +97,17 @@ class _ExecHandler(adsk.core.CustomEventHandler):
             # thread. Refuse to dispatch inside another dispatch — it would
             # corrupt shared state and duplicate geometry.
             if _state.get('dispatching'):
-                job['response'] = {
-                    'ok': False,
-                    'error': 'Fusion main thread is busy with a long-running '
-                             'operation; retry when it finishes.'}
-                job['event'].set()
+                with _state['lock']:
+                    job['response'] = {
+                        'ok': False,
+                        'error': 'Fusion main thread is busy with a long-running '
+                                 'operation; retry when it finishes.'}
+                    if job.get('abandoned'):
+                        # The waiter already timed out — nobody will collect
+                        # this rejection, so drop the job instead of leaking it.
+                        _state['pending'].pop(job_id, None)
+                    else:
+                        job['event'].set()
                 return
             _state['dispatching'] = True
             op = job['op']
@@ -129,16 +135,25 @@ class _ExecHandler(adsk.core.CustomEventHandler):
                         '%s %s %.1fms', op, 'ok' if ok else 'error', elapsed_ms)
                 except Exception:
                     pass
-                if job.get('abandoned'):
-                    # The client already gave up (timeout). Don't touch a dead
-                    # event; just record the late completion so it isn't silent.
-                    _state['late_completions'] = _state.get('late_completions', 0) + 1
+                # The abandoned check must be atomic with the waiter's
+                # timed-out-vs-completed decision, or a completion landing in
+                # that window leaks the job (handler skips the pop, waiter
+                # skips the collect).
+                late = False
+                with _state['lock']:
+                    if job.get('abandoned'):
+                        # The client already gave up (timeout). Don't touch a
+                        # dead event; record the late completion so it isn't
+                        # silent.
+                        _state['late_completions'] = _state.get('late_completions', 0) + 1
+                        _state['pending'].pop(job_id, None)
+                        late = True
+                    else:
+                        job['event'].set()
+                if late:
                     with contextlib.suppress(Exception):
                         logutil.get_logger().warning(
                             '%s finished %.1fms AFTER the client timed out', op, elapsed_ms)
-                    _state['pending'].pop(job_id, None)
-                else:
-                    job['event'].set()
         except Exception:
             # Last-ditch: never let an exception escape the handler.
             _state['dispatching'] = False
@@ -155,18 +170,32 @@ def _execute_on_main(op, params):
     event = threading.Event()
     job = {'op': op, 'params': params, 'event': event, 'response': None}
     _state['pending'][job_id] = job
-    _state['app'].fireCustomEvent(EVENT_ID, job_id)
+    try:
+        fired = _state['app'].fireCustomEvent(EVENT_ID, job_id)
+    except Exception as exc:
+        _state['pending'].pop(job_id, None)
+        return {'ok': False,
+                'error': 'Could not reach the Fusion main thread (%s).' % exc}
+    if fired is False:
+        # Event id not registered (add-in stopping/stopped) — no handler will
+        # ever run this job, so waiting the full timeout would just hang.
+        _state['pending'].pop(job_id, None)
+        return {'ok': False,
+                'error': 'Fusion custom event is not registered — is the '
+                         'add-in stopping or restarting?'}
     finished = event.wait(timeout=MAIN_THREAD_TIMEOUT)
     if finished:
         _state['pending'].pop(job_id, None)
         return job['response']
-    # Timed out. The op may still be running on the main thread, so DON'T pop the
-    # job — mark it abandoned and let the handler clean up and log its late
-    # finish. (Handle the rare race where it completed just as we timed out.)
-    if job.get('response') is not None:
-        _state['pending'].pop(job_id, None)
-        return job['response']
-    job['abandoned'] = True
+    # Timed out. The op may still be running on the main thread, so DON'T pop
+    # the job blindly. Under the lock, either collect a response that landed
+    # just as we timed out, or mark the job abandoned so the handler (whenever
+    # it finishes) pops it — atomically, so neither side can skip both steps.
+    with _state['lock']:
+        if job.get('response') is not None:
+            _state['pending'].pop(job_id, None)
+            return job['response']
+        job['abandoned'] = True
     return {'ok': False,
             'error': 'Timed out after %ds waiting for the Fusion main thread. '
                      'The operation may still be running — re-run get_state to '
@@ -234,7 +263,16 @@ def start_server(app):
     # raises here and run() can surface it — instead of the thread failing
     # silently after the caller has already logged "listening".
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+        # Windows: SO_REUSEADDR lets a SECOND listener bind a port another
+        # SO_REUSEADDR socket is actively listening on, so the conflict check
+        # below would never fire and connections would land on an arbitrary
+        # Fusion instance. Exclusive mode makes the second bind fail loudly.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        # POSIX: SO_REUSEADDR only skips the TIME_WAIT wait; it does NOT allow
+        # binding over a live listener, so the conflict check still works.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((HOST, PORT))
     except OSError as exc:
@@ -247,12 +285,33 @@ def start_server(app):
     sock.settimeout(1.0)
     _state['server_sock'] = sock
 
-    custom_event = app.registerCustomEvent(EVENT_ID)
-    handler = _ExecHandler()
-    custom_event.add(handler)
+    try:
+        custom_event = app.registerCustomEvent(EVENT_ID)
+        handler = _ExecHandler()
+        custom_event.add(handler)
+    except Exception:
+        # Don't leave the port bound with no working dispatch path — a client
+        # could connect to a dead listener and hang until timeout. Also drop
+        # the event registration: registerCustomEvent returns None when the id
+        # is already registered (a failed earlier unregister), and leaving it
+        # would make every retry fail the same way until Fusion restarts.
+        with contextlib.suppress(Exception):
+            sock.close()
+        _state['server_sock'] = None
+        with contextlib.suppress(Exception):
+            app.unregisterCustomEvent(EVENT_ID)
+        raise
     _state['custom_event'] = custom_event
     _state['handler'] = handler  # keep a strong reference or it gets GC'd
 
+    with _state['lock']:
+        _state['pending'].clear()
+    # Deliberately do NOT reset _state['dispatching'] here: if the add-in is
+    # restarted from Scripts & Add-Ins while a long op is still pumping
+    # adsk.doEvents() (stop+start run nested inside that op's frame), the flag
+    # is owned by the live dispatch — clearing it would re-open the
+    # re-entrancy hole the guard exists to close. The dispatch's finally
+    # block clears it on every path.
     _state['running'] = True
     thread = threading.Thread(target=_serve, name='FusionMCPServer', daemon=True)
     thread.start()
@@ -280,6 +339,20 @@ def stop_server():
         with contextlib.suppress(Exception):
             sock.close()
     _state['server_sock'] = None
+
+    # Wake the connection thread BEFORE joining it: closing conn does not wake
+    # an Event, so a thread blocked in _execute_on_main's event.wait would
+    # otherwise burn the full join timeout on Fusion's main thread and outlive
+    # stop_server. Draining also drops the job dicts (op + full params) so
+    # they don't leak past the server's lifetime.
+    with _state['lock']:
+        leftovers = list(_state['pending'].values())
+        _state['pending'].clear()
+    for job in leftovers:
+        with contextlib.suppress(Exception):
+            if job.get('response') is None:
+                job['response'] = {'ok': False, 'error': 'Add-in stopping.'}
+            job['event'].set()
 
     thread = _state.get('thread')
     if thread is not None:

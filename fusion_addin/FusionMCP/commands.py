@@ -23,17 +23,19 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.9.0'
+VERSION = '1.9.1'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
 
-# Persistent cloud id of the active document, so dispatch() can drop entity
-# tokens when the user (or open_document) switches to a DIFFERENT saved document
-# — tokens are per-document, and a stale doc-A token must never resolve against
-# doc B. Keyed on dataFile.id (not the name) so saving a new design is not
-# mistaken for a switch.
-_active_doc_id = None
+# Identity of the active document, so dispatch() can drop entity tokens when
+# the user (or open_document) switches to a DIFFERENT document — tokens are
+# per-document, and a stale doc-A token must never resolve against doc B.
+# Keyed on (creationId, dataFile.id): creationId survives the first save (so
+# saving a new design is not mistaken for a switch) but differs for File > New
+# (so a saved -> unsaved switch IS detected). The cloud id disambiguates open
+# copies of one document, which share a creationId.
+_active_doc_key = (None, None)
 
 # Cross-call object store for run_code: store('jig', obj) in one snippet,
 # fetch('jig') in a later one. Session-lived, like the token registry, but
@@ -523,7 +525,9 @@ def op_shell(app, p):
     else:
         # No faces to remove -> hollow the whole body (closed shell). The input
         # collection still needs the target body, or Fusion has nothing to act on.
-        body = _registry.get_opt(p.get('body')) if p.get('body') else None
+        # _registry.get (not get_opt) so a STALE body token raises the helpful
+        # KeyError instead of a misleading "you passed no body".
+        body = _registry.get(p['body']) if p.get('body') else None
         if body is None:
             raise ValueError('shell needs either faces=[tokens] to remove, or a '
                              'body token to hollow with no opening')
@@ -588,7 +592,12 @@ def op_move_body(app, p):
 
 def op_delete(app, p):
     obj = _registry.get(p['token'])
-    obj.deleteMe()
+    # deleteMe() reports failure by returning False (e.g. an entity consumed by
+    # later features, isDeletable == False) — it does not always raise.
+    if obj.deleteMe() is False:
+        raise RuntimeError('Fusion refused to delete %s (deleteMe returned '
+                           'False — the entity may not be deletable in the '
+                           'current context).' % p['token'])
     # Forget the token so a later call gets the registry's helpful "stale token"
     # KeyError instead of a cryptic Fusion "object is invalid" from deep inside a
     # feature add.
@@ -1116,14 +1125,23 @@ _JOINT_MOTION = ('rigid', 'revolute', 'slider', 'cylindrical', 'pin_slot',
 
 
 def _joint_geometry(token):
-    """Build a JointGeometry from a planar-face token (centre keypoint) or fall
-    back to a curve/edge token."""
+    """Build a JointGeometry from a planar-face token (centre keypoint), a
+    curve/edge token, or a vertex/sketch-point/construction-point token."""
     obj = _registry.get(token)
     key = adsk.fusion.JointKeyPointTypes.CenterKeyPoint
     try:
         return adsk.fusion.JointGeometry.createByPlanarFace(obj, None, key)
     except Exception:
+        pass
+    try:
         return adsk.fusion.JointGeometry.createByCurve(obj, key)
+    except Exception:
+        pass
+    try:
+        return adsk.fusion.JointGeometry.createByPoint(obj)
+    except Exception:
+        raise ValueError('token %r is not usable joint geometry (need a planar '
+                         'face, an edge/curve, or a vertex/sketch point)' % token)
 
 
 def _apply_joint_motion(jin, motion, axis_name):
@@ -2650,14 +2668,23 @@ def op_multi_screenshot(app, p):
     """Capture several camera presets in ONE round-trip (e.g. iso/front/top/
     right) so the model is visible from all sides at once. Returns one base64
     PNG per direction."""
-    directions = p.get('directions') or ['iso', 'front', 'top', 'right']
+    raw = p.get('directions') or ['iso', 'front', 'top', 'right']
     width = int(p.get('width', 800))
     height = int(p.get('height', 600))
     base = p.get('base_path') or ''
-    # Validate ALL presets up front so a typo doesn't discard already-captured
-    # shots halfway through.
-    bad = [d for d in directions
-           if (d or '').lower() not in _CAMERA_DIRS and (d or '').lower() not in ('current', '')]
+    # Validate AND normalise all presets up front so a typo (or a non-string
+    # smuggled in via batch) doesn't discard already-captured shots halfway
+    # through — the capture loop below concatenates d into a file name.
+    directions, bad = [], []
+    for d in raw:
+        s = d if isinstance(d, str) else ('' if d is None else None)
+        s = s.lower() if s is not None else None
+        if s in ('', 'current'):
+            directions.append('current')
+        elif s in _CAMERA_DIRS:
+            directions.append(s)
+        else:
+            bad.append(d)
     if bad:
         raise ValueError('unknown camera preset(s) %s; valid: current|%s'
                          % (bad, '|'.join(_CAMERA_DIRS)))
@@ -2720,24 +2747,25 @@ def op_undo(app, p):
     get_state/query_entities before reusing them."""
     steps = max(1, int(p.get('steps', 1)))
 
-    def _marker():
-        # Track real progress: a no-op undo (empty stack) leaves the timeline
-        # marker unchanged, so we can tell how many steps actually reverted.
+    def _can_undo():
+        # The Undo control is disabled exactly when the undo stack is empty.
+        # Unlike the timeline marker, this also tracks undoable actions that
+        # create no timeline item (set_appearance/set_material/rename, every
+        # edit in a direct-modeling design) — a marker-based check either
+        # reported phantom steps or, worse, executed an undo and then refused
+        # to count it.
         with contextlib.suppress(Exception):
-            return _design(app).timeline.markerPosition
+            cd = app.userInterface.commandDefinitions.itemById('UndoCommand')
+            return bool(cd.controlDefinition.isEnabled)
         return None
 
     done = 0
     for _ in range(steps):
-        before = _marker()
+        if _can_undo() is False:
+            break  # nothing left to undo — checked BEFORE executing
         try:
             app.executeTextCommand('Commands.Start UndoCommand')
         except Exception:
-            break
-        after = _marker()
-        # If we can read the marker and it did not move, there was nothing left
-        # to undo — stop reporting phantom steps.
-        if before is not None and after is not None and after == before:
             break
         done += 1
     return {'undone': done, 'requested': steps, 'tokens_may_be_stale': True,
@@ -3708,7 +3736,8 @@ def op_list_materials(app, p):
     with contextlib.suppress(Exception):
         _collect_named(design.materials, flt, out, seen, 'document')
     with contextlib.suppress(Exception):
-        _collect_named(design.favoriteMaterials, flt, out, seen, 'favorite')
+        # Favourites live on Application, not Design.
+        _collect_named(app.favoriteMaterials, flt, out, seen, 'favorite')
     with contextlib.suppress(Exception):
         libs = app.materialLibraries
         for i in range(libs.count):
@@ -3731,6 +3760,8 @@ def op_list_appearances(app, p):
     out, seen = [], set()
     with contextlib.suppress(Exception):
         _collect_named(design.appearances, flt, out, seen, 'document')
+    with contextlib.suppress(Exception):
+        _collect_named(app.favoriteAppearances, flt, out, seen, 'favorite')
     with contextlib.suppress(Exception):
         libs = app.materialLibraries
         for i in range(libs.count):
@@ -3891,7 +3922,11 @@ def _active_datafile(app):
     doc = app.activeDocument
     if not doc:
         raise RuntimeError('No active document.')
-    df = getattr(doc, 'dataFile', None)
+    # Document.dataFile RAISES (not returns None) for a never-saved document,
+    # so suppress — the point of this guard is the actionable message below.
+    df = None
+    with contextlib.suppress(Exception):
+        df = doc.dataFile
     if df is None:
         raise RuntimeError('The active document is not saved to the cloud, so it '
                            'has no version history or share link. Save it first.')
@@ -3937,11 +3972,15 @@ def op_share_link(app, p):
             with contextlib.suppress(Exception):
                 setattr(link, attr, True)
                 out['is_shared'] = True
-    for attr, key in (('url', 'url'), ('isPasswordRequired', 'password_required')):
+    for attr, key in (('linkURL', 'url'), ('isPasswordRequired', 'password_required')):
         with contextlib.suppress(Exception):
             out[key] = getattr(link, attr)
-    if not out.get('url') and not p.get('create'):
-        out['note'] = 'Not shared yet. Call share_link(create=true) to publish a link.'
+    if not out.get('url'):
+        out.pop('url', None)  # linkURL is '' while unshared — drop the noise
+        if out.get('is_shared'):
+            out['note'] = 'Shared, but this Fusion build did not report the link URL.'
+        else:
+            out['note'] = 'Not shared yet. Call share_link(create=true) to publish a link.'
     return out
 
 
@@ -4027,8 +4066,9 @@ def op_contact_set(app, p):
     tokens = p.get('tokens') or []
     if len(tokens) < 2:
         raise ValueError('contact_set needs 2+ occurrence/body tokens')
-    coll = _collection(tokens)
-    cs = sets.add(coll)
+    # ContactSets.add takes a plain array of Occurrence/BRepBody objects, not
+    # an ObjectCollection — the SWIG vector typemap rejects the proxy.
+    cs = sets.add([_registry.get(t) for t in tokens])
     if p.get('name'):
         with contextlib.suppress(Exception):
             cs.name = p['name']
@@ -4263,47 +4303,96 @@ def classify_error(exc):
             'switch to the design' in msg:
         return 'no_design', True
     if ('not available in this fusion' in msg or 'needs fusion' in msg
-            or 'preview' in msg or 'this fusion version' in msg
+            or 'preview api' in msg or 'this fusion version' in msg
             or 'this fusion build' in msg):
+        # 'preview api' (not bare 'preview') so an error echoing a user string
+        # like the path 'C:/renders/preview.step' isn't misfiled as unsupported.
         return 'unsupported', False
     return 'fusion_error', False
 
 
-def _doc_id(app):
-    """The active document's persistent cloud id, or None when it has none yet
-    (unsaved, or no document). Deliberately NOT keyed on the document name: a
-    name appears/changes on first save, and keying on it would wrongly look like
-    a document switch and drop all tokens mid-build."""
+def _doc_key(app):
+    """Session identity of the active document: (creationId, cloud id).
+    creationId (when the build exposes it) is constant for the life of a
+    document — it survives the first save (None -> cloud id is the SAME doc,
+    must not reset) and differs for File > New (so a saved -> unsaved switch IS
+    a switch). The cloud id disambiguates open copies, which share a
+    creationId. Deliberately NOT keyed on the document name: a name
+    appears/changes on first save. (None, None) = no usable identity."""
     try:
         doc = app.activeDocument
     except Exception:
-        return None
+        return (None, None)
     if doc is None:
-        return None
+        return (None, None)
+    cid = None
+    with contextlib.suppress(Exception):
+        cid = doc.creationId or None
+    cloud_id = None
     with contextlib.suppress(Exception):
         df = doc.dataFile
         if df is not None:
-            return df.id
-    return None
+            cloud_id = df.id
+    return (cid, cloud_id)
+
+
+def _doc_switched(prev_key, new_key):
+    """Whether new_key identifies a DIFFERENT document than prev_key.
+    creationId is authoritative when both sides have it (the cloud id only
+    splits same-creationId copies once both are saved); on old builds without
+    creationId, only a transition between two distinct non-None cloud ids
+    provably is a switch (None -> id is a first save, same document)."""
+    prev_cid, prev_cloud = prev_key
+    cid, cloud_id = new_key
+    if cid is not None and prev_cid is not None:
+        return cid != prev_cid or (
+            cloud_id is not None and prev_cloud is not None
+            and cloud_id != prev_cloud)
+    return (cloud_id is not None and prev_cloud is not None
+            and cloud_id != prev_cloud)
 
 
 def _drop_tokens_on_doc_switch(app):
-    """If the active document changed to a DIFFERENT saved document since the
-    last dispatch, invalidate all entity tokens (and caches) so stale tokens
-    raise the helpful KeyError instead of resolving against the wrong document.
-
-    Only a transition between two distinct non-None cloud ids counts as a
-    switch. Saving a new design (None -> id) is the SAME document and must not
-    reset — that was a regression that dropped every pre-save token."""
-    global _active_doc_id, _annotation_group
-    doc_id = _doc_id(app)
-    if doc_id is None:
-        return  # unsaved or no document context: can't tell, so leave state alone
-    if _active_doc_id is not None and doc_id != _active_doc_id:
+    """If the active document changed since the last dispatch, invalidate all
+    per-document state so stale tokens raise the helpful KeyError instead of
+    silently resolving against (and mutating) the previous, still-open
+    document in the background."""
+    global _active_doc_key, _annotation_group, _isolate_stash
+    key = _doc_key(app)
+    if key == (None, None):
+        return  # no identity at all: can't tell, so leave state alone
+    if _doc_switched(_active_doc_key, key):
         _registry.reset()
         _state_cache.clear()
         _annotation_group = None  # the overlay belonged to the previous document
-    _active_doc_id = doc_id
+        # The isolate stash holds live proxies of the PREVIOUS document —
+        # restoring them here would mutate a background document, so drop it
+        # (that document keeps its current visibility state).
+        _isolate_stash = None
+        _code_store.clear()  # run_code store/fetch must not leak live doc-A objects
+    _active_doc_key = key
+
+
+def _drop_old_doc_state_after_op(app, pre_tokens, pre_code_keys):
+    """If the HANDLER itself changed the active document (documents.add inside
+    run_code, open_document, the headless-drawing fallback), drop the previous
+    document's state immediately — but KEEP tokens and code-store entries
+    minted DURING this dispatch, which belong to the newly active document.
+    Without this, the next dispatch would see the key change and wipe the very
+    tokens the op just returned."""
+    global _active_doc_key, _annotation_group, _isolate_stash
+    key = _doc_key(app)
+    if key == (None, None):
+        return
+    if _doc_switched(_active_doc_key, key):
+        for tok in pre_tokens:
+            _registry.remove(tok)
+        for k in [k for k in _code_store if k in pre_code_keys]:
+            del _code_store[k]
+        _state_cache.clear()
+        _annotation_group = None
+        _isolate_stash = None
+    _active_doc_key = key
 
 
 def dispatch(app, op, params):
@@ -4314,11 +4403,24 @@ def dispatch(app, op, params):
                            % (op, ', '.join(sorted(DISPATCH))))
     if app is not None:
         _drop_tokens_on_doc_switch(app)
-    result = handler(app, params or {})
+        pre_tokens = _registry.tokens()
+        pre_code_keys = set(_code_store)
+    try:
+        result = handler(app, params or {})
+    finally:
+        # In a finally so a handler that RAISES after switching documents
+        # (e.g. a failing run_code that did documents.add) still invalidates
+        # the old document's state. op_batch catches sub-op exceptions, so
+        # without this the batch's outer dispatch would advance the doc key
+        # while stale mid-batch tokens stayed alive — resolvable against the
+        # background document forever.
+        if app is not None:
+            _drop_old_doc_state_after_op(app, pre_tokens, pre_code_keys)
     # Any mutating op invalidates the cached read-only views. timeline rollback
     # mutates geometry but is otherwise read-only-shaped, so force it here.
     mutating = op not in _READ_ONLY_OPS or (
-        op == 'timeline' and (params or {}).get('action') == 'rollback')
+        op == 'timeline'
+        and str((params or {}).get('action') or '').lower() == 'rollback')
     if mutating:
         _mutation_gen += 1
         _state_cache.clear()

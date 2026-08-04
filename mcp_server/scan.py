@@ -344,7 +344,11 @@ def print_check(path, bed=(256.0, 256.0, 256.0), overhang_deg=45.0,
     # downward normal but sits high, so it must STILL count as unsupported.
     z_centroid = np.asarray(mesh.triangles_center, dtype=float)[:, 2]
     z_min = float(z_centroid.min())
-    base_band = max(0.5, 0.02 * float(ext[2]))  # a thin layer above the bed
+    # A FIXED thin band (~a few first layers), deliberately NOT scaled by part
+    # height: scaling it excluded ever-larger elevated undersides on tall parts
+    # — a bridge 3 mm above the bed was classed "on plate" once the part grew
+    # past 150 mm, silencing the exact overhang this check exists to catch.
+    base_band = 0.5
     on_plate = (down < -0.999) & (z_centroid <= z_min + base_band)
     overhang_mask = overhang_mask & ~on_plate
     overhang_area = float(areas[overhang_mask].sum())
@@ -464,9 +468,11 @@ def _assemble_loops(segments, tol=1e-4):
         if not closed:
             # The seed may sit MID-chain in an open (non-watertight) contour, so
             # also walk backward from the head and prepend — otherwise one
-            # physical contour is fragmented into arbitrary pieces.
+            # physical contour is fragmented into arbitrary pieces. The backward
+            # walk can be the one that closes the loop (e.g. when the forward
+            # walk stopped at a degree-3 junction), so keep its result.
             head = list(reversed(points))
-            walk(head)               # extends from the original start point
+            closed = walk(head)      # extends from the original start point
             points = list(reversed(head))
         loops.append((points, closed))
     return loops

@@ -378,7 +378,16 @@ def _apply_zip(root):
     except zipfile.BadZipFile:
         return {'applied': False, 'method': 'zip',
                 'reason': 'Downloaded file is not a valid zip archive.'}
-    written = _extract_over(blob, root)
+    except Exception as exc:  # noqa: BLE001 - testzip reads every member and can
+        # raise beyond BadZipFile (encrypted member -> RuntimeError, exotic
+        # compression -> NotImplementedError, corrupt deflate -> zlib.error);
+        # apply() must return a reason, never raise to the MCP layer.
+        return {'applied': False, 'method': 'zip',
+                'reason': 'Update archive failed validation: %s' % exc}
+    try:
+        written = _extract_over(blob, root)
+    except Exception as exc:  # noqa: BLE001 - apply() must not raise to the MCP layer
+        return {'applied': False, 'method': 'zip', 'reason': str(exc)}
     _sync_addin(root)
     _clear_staged()
     return {'applied': True, 'method': 'zip', 'files_updated': written,
@@ -388,14 +397,14 @@ def _apply_zip(root):
 
 def _extract_over(blob, root):
     """Extract a GitHub zip (single top-level dir) over `root`, skipping _SKIP.
-    Guards against zip-slip: any entry whose resolved path escapes `root` (via
-    '..' or absolute components) is refused, so a crafted archive cannot write
-    outside the install."""
-    written = 0
+    Guards against zip-slip: ALL entries are validated BEFORE anything is
+    written, so a crafted archive is rejected outright instead of aborting
+    mid-extraction with the install half-overwritten."""
     root_real = os.path.realpath(root)
     with zipfile.ZipFile(io.BytesIO(blob)) as zf:
         names = zf.namelist()
         top = names[0].split('/', 1)[0] + '/' if names else ''
+        todo = []
         for name in names:
             if name.endswith('/'):
                 continue
@@ -404,12 +413,16 @@ def _extract_over(blob, root):
             if not rel or any(part in _SKIP for part in parts):
                 continue
             if any(part in ('..', '') for part in parts) or os.path.isabs(rel):
-                raise RuntimeError('Refusing unsafe archive path %r (zip-slip).' % name)
+                raise RuntimeError('Refusing unsafe archive path %r (zip-slip); '
+                                   'nothing was written.' % name)
             dest = os.path.join(root, *parts)
             if os.path.realpath(dest) != root_real and \
                     not os.path.realpath(dest).startswith(root_real + os.sep):
                 raise RuntimeError('Refusing archive path %r outside the install '
-                                   'root (zip-slip).' % name)
+                                   'root (zip-slip); nothing was written.' % name)
+            todo.append((name, dest))
+        written = 0
+        for name, dest in todo:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with zf.open(name) as src, open(dest, 'wb') as out:
                 shutil.copyfileobj(src, out)
@@ -457,10 +470,17 @@ def apply(confirm=False, method='auto'):
     root = _repo_root()
     has_git = os.path.isdir(os.path.join(root, '.git'))
     method = (method or 'auto').lower()
-    if method == 'git' or (method == 'auto' and has_git):
-        if not has_git:
-            return {'applied': False, 'reason': 'Not a git checkout; use method="zip".'}
-        return _apply_git(root)
-    if method in ('zip', 'auto'):
-        return _apply_zip(root)
+    # Contract boundary: apply() NEVER raises to the MCP layer. The handlers
+    # return reason dicts for expected failures; this catches the rest (git
+    # missing from PATH -> FileNotFoundError, subprocess timeout, surprise
+    # zip/IO errors) so a failed update is always a readable result.
+    try:
+        if method == 'git' or (method == 'auto' and has_git):
+            if not has_git:
+                return {'applied': False, 'reason': 'Not a git checkout; use method="zip".'}
+            return _apply_git(root)
+        if method in ('zip', 'auto'):
+            return _apply_zip(root)
+    except Exception as exc:  # noqa: BLE001
+        return {'applied': False, 'method': method, 'reason': 'Update failed: %s' % exc}
     return {'applied': False, 'reason': 'method must be auto|git|zip, got %r' % method}

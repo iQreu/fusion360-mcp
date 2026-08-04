@@ -143,7 +143,10 @@ async def _elicit_update_consent(ctx):
         accepted = str(result[0]).lower().startswith('accept')
         payload = result[1] if len(result) > 1 else None
         return accepted and bool(getattr(payload, 'install', True))
-    return bool(getattr(result, 'install', result))
+    # Unknown result shape: FAIL CLOSED. This gates a destructive install —
+    # a drifted SDK shape (e.g. a mapping, whose keys getattr can't see) must
+    # never count as consent just because it is truthy.
+    return bool(getattr(result, 'install', False))
 
 
 if _Context is not None:
@@ -744,7 +747,8 @@ def export(format: str, path: str, allow_fallback: bool = True) -> dict:
     return _call('export', format=format, path=path, allow_fallback=allow_fallback)
 
 
-@mcp.tool(**_annot(readOnlyHint=True))
+# NOT readOnlyHint: path lets the model overwrite an arbitrary PNG on disk.
+@mcp.tool()
 def screenshot(path: str = '', width: int = 1024, height: int = 768,
                direction: str = 'current', fit: bool = False) -> Image:
     """Capture the active viewport and return it as an image so you can SEE the
@@ -767,7 +771,8 @@ def screenshot(path: str = '', width: int = 1024, height: int = 768,
     return Image(data=base64.b64decode(b64), format='png')
 
 
-@mcp.tool(**_annot(readOnlyHint=True))
+# NOT readOnlyHint: its whole purpose is writing a file at the model-chosen path.
+@mcp.tool()
 def capture_to_file(path: str, width: int = 1024, height: int = 768,
                     direction: str = 'current', fit: bool = False) -> dict:
     """Save the viewport to a PNG file WITHOUT returning the image bytes. Use
@@ -875,7 +880,8 @@ def api_introspect(target: str = 'adsk.fusion', query: str = '',
 # --------------------------------------------------------------------------- #
 # BOM, sketch text / engraving, sheet metal, meshes, drawings
 # --------------------------------------------------------------------------- #
-@mcp.tool(**_annot(readOnlyHint=True))
+# NOT readOnlyHint: csv_path writes/overwrites a file at the model-chosen path.
+@mcp.tool()
 def bom(include_mass: bool = True, csv_path: str = '') -> dict:
     """Bill of materials for the active design: one row per component with
     quantity, body count, materials and per-unit mass (kg) plus the assembly's
@@ -1143,7 +1149,8 @@ def mass_properties(body: str) -> dict:
     return _call('mass_properties', body=body)
 
 
-@mcp.tool(**_annot(readOnlyHint=True))
+# NOT readOnlyHint: writes/overwrites a CSV at the model-chosen path.
+@mcp.tool()
 def export_parameters(csv_path: str) -> dict:
     """Write all model/user parameters to a CSV file (name, kind, expression,
     unit, comment) for spreadsheet editing; re-apply with import_parameters."""
@@ -1251,7 +1258,8 @@ def electronics_library(filter: str = '', limit: int = 0) -> dict:
     return _call('electronics_library', filter=filter or None, limit=limit)
 
 
-@mcp.tool(**_annot(readOnlyHint=True))
+# NOT readOnlyHint: this writes/overwrites a file at the model-chosen path.
+@mcp.tool()
 def electronics_export(path: str) -> dict:
     """Export the electronics design to an EAGLE 9.6.2 file. The extension
     picks the product: .brd (board), .sch (schematic), .lbr (library); it

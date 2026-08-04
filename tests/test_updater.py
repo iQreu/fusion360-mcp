@@ -86,13 +86,36 @@ def test_extract_over_blocks_zip_slip(tmp_path):
     root = tmp_path / 'install'
     root.mkdir()
     (root / 'mcp_server').mkdir()
+    # The escaping entry comes LAST: validation must reject the archive BEFORE
+    # writing anything, not abort mid-extraction with a half-overwritten install.
     evil = _make_zip({'top/mcp_server/ok.py': 'x = 1',
+                      'top/mcp_server/two.py': 'y = 2',
                       'top/../../escape.py': 'pwned = 1'})
     import pytest
     with pytest.raises(RuntimeError, match='zip-slip'):
         updater._extract_over(evil, str(root))
     # The escaping payload must NOT have been written outside the root.
     assert not (tmp_path.parent / 'escape.py').exists()
+    # ...and no in-root entry was written either (all-or-nothing validation).
+    assert not (root / 'mcp_server' / 'ok.py').exists()
+    assert not (root / 'mcp_server' / 'two.py').exists()
+
+
+def test_apply_zip_returns_reason_instead_of_raising_on_zip_slip(tmp_path, monkeypatch):
+    """updater.apply must keep its 'never raises to the MCP layer' contract."""
+    monkeypatch.setattr(updater.tempfile, 'gettempdir', lambda: str(tmp_path))
+    root = tmp_path / 'install'
+    root.mkdir()
+    evil = _make_zip({'top/mcp_server/ok.py': 'x = 1',
+                      'top/../../escape.py': 'pwned = 1'})
+    monkeypatch.setattr(updater, 'latest', lambda: {
+        'version': 'v9.9.9', 'zip_url': 'https://example.test/z.zip'})
+    monkeypatch.setattr(updater, '_http_get', lambda url, accept='': evil)
+    monkeypatch.setattr(updater, '_repo_root', lambda: str(root))
+    result = updater.apply(confirm=True, method='zip')
+    assert result['applied'] is False
+    assert 'zip-slip' in result['reason']
+    assert not (root / 'mcp_server' / 'ok.py').exists()
 
 
 def test_download_to_staging_without_url_or_on_error(tmp_path, monkeypatch):
