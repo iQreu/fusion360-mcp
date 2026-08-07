@@ -92,6 +92,10 @@ class _ExecHandler(adsk.core.CustomEventHandler):
             job = _state['pending'].get(job_id)
             if not job:
                 return
+            # Tell the waiter the event really was delivered — it uses this to
+            # distinguish a spurious fireCustomEvent()==False (event fired
+            # anyway) from a genuinely unregistered event (job never touched).
+            job['started'] = True
             # Re-entrancy guard: a long op that spins adsk.doEvents() (e.g.
             # cam_generate) can pump THIS queued custom event on the same main
             # thread. Refuse to dispatch inside another dispatch — it would
@@ -177,12 +181,19 @@ def _execute_on_main(op, params):
         return {'ok': False,
                 'error': 'Could not reach the Fusion main thread (%s).' % exc}
     if fired is False:
-        # Event id not registered (add-in stopping/stopped) — no handler will
-        # ever run this job, so waiting the full timeout would just hang.
-        _state['pending'].pop(job_id, None)
-        return {'ok': False,
-                'error': 'Fusion custom event is not registered — is the '
-                         'add-in stopping or restarting?'}
+        # fireCustomEvent returning False *should* mean the event id is not
+        # registered (add-in stopping/stopped). But some Fusion builds return
+        # False even though the event IS queued and the handler runs (observed
+        # live 2026-08-07 on v2704.1 / Python 3.14 — every call, while the
+        # v1.9.0 bridge that ignored the return value worked on the same
+        # build). So don't trust the return value alone: give the handler a
+        # short grace window and only fail fast if the job is still untouched.
+        grace = event.wait(timeout=2.0)
+        if not grace and not job.get('started'):
+            _state['pending'].pop(job_id, None)
+            return {'ok': False,
+                    'error': 'Fusion custom event is not registered — is the '
+                             'add-in stopping or restarting?'}
     finished = event.wait(timeout=MAIN_THREAD_TIMEOUT)
     if finished:
         _state['pending'].pop(job_id, None)
