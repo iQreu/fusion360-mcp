@@ -2,7 +2,7 @@
 
 Everything here runs in the MCP server process — no round-trip to Fusion and
 no load on Fusion's single UI thread. The heavy dependencies are optional
-(the "re" extras: numpy, scipy, trimesh, pyransac3d); every public function
+(the "re" extras: numpy, trimesh, pyransac3d); every public function
 raises a RuntimeError with install instructions when they are missing, so the
 server works fine without them.
 
@@ -15,6 +15,7 @@ fewer native submodules we touch the fewer machines (e.g. with Windows Smart
 App Control blocking unsigned DLLs) the tools break on.
 """
 import math
+import os
 import random
 
 try:
@@ -600,4 +601,406 @@ def deviation(scan_path, model_path, samples=4000, tolerance=0.2):
     if scan_mesh.is_watertight and model_mesh.is_watertight:
         report['volume_scan_mm3'] = _rounded(float(scan_mesh.volume), 2)
         report['volume_model_mm3'] = _rounded(float(model_mesh.volume), 2)
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# align — rigid (optionally scaled) registration of a scan onto a model
+# --------------------------------------------------------------------------- #
+_MAX_ALIGN_SAMPLES = 8000
+
+
+def _kabsch(src, dst, allow_scale=False):
+    """Best-fit rotation (+ optional uniform scale) and translation mapping
+    src points onto dst points (paired Nx3 arrays). Returns (R, s, t)."""
+    sc, dc = src.mean(axis=0), dst.mean(axis=0)
+    s0, d0 = src - sc, dst - dc
+    u, sv, vt = np.linalg.svd(s0.T @ d0)
+    sign = np.sign(np.linalg.det(vt.T @ u.T)) or 1.0
+    corr = np.array([1.0, 1.0, sign])
+    rot = vt.T @ np.diag(corr) @ u.T
+    scale = 1.0
+    if allow_scale:
+        denom = float((s0 ** 2).sum())
+        if denom > 0:
+            scale = float((sv * corr).sum() / denom)
+    t = dc - scale * (rot @ sc)
+    return rot, scale, t
+
+
+def align(scan_path, model_path, out_path=None, samples=3000, scale=False,
+          iterations=40, tolerance=1e-4):
+    """Rigidly align a scan file onto a model file (both mm) with deterministic
+    ICP: centroid + PCA-axis initial guesses, then iterate nearest-point /
+    Kabsch. scale=True also solves a uniform scale (scanner calibration error).
+    Writes the aligned scan to out_path (STL/OBJ by extension) when given.
+    Returns the 4x4 transform (mm) and before/after RMS distances — run this
+    before scan_deviation / scan_fit_check when the scan and the model are not
+    in the same coordinate frame."""
+    scan_mesh = _load(scan_path)
+    model_mesh = _load(model_path)
+    requested = int(samples)
+    samples = max(200, min(requested, _MAX_ALIGN_SAMPLES))
+    src_pts, _ = _sample_surface(scan_mesh, samples)
+    dst_pts, _ = _sample_surface(model_mesh, samples * 2, seed=1)
+
+    def rms_of(pts, probe=600):
+        stride = max(1, -(-len(pts) // probe))
+        d, _ = _nearest(pts[::stride], dst_pts)
+        return float(np.sqrt((d ** 2).mean()))
+
+    # Initial candidates: plain centroid shift, plus PCA-axis alignment. The
+    # eigenvector signs are ambiguous, so all four proper-rotation sign
+    # combinations compete; the cheapest (probe RMS) one seeds the ICP.
+    sc, dc = src_pts.mean(axis=0), dst_pts.mean(axis=0)
+    candidates = [(np.eye(3), dc - sc)]
+    try:
+        _, vs = np.linalg.eigh(np.cov((src_pts - sc).T))
+        _, vd = np.linalg.eigh(np.cov((dst_pts - dc).T))
+        parity = np.sign(np.linalg.det(vs) * np.linalg.det(vd)) or 1.0
+        for fx in (1.0, -1.0):
+            for fy in (1.0, -1.0):
+                f = np.diag([fx, fy, parity * fx * fy])  # det(R) = +1
+                rot = vd @ f @ vs.T
+                candidates.append((rot, dc - rot @ sc))
+    except Exception:  # noqa: BLE001 - degenerate covariance: centroid only
+        pass
+    rms_before = rms_of(src_pts)
+    rot, t = min(candidates, key=lambda c: rms_of(src_pts @ c[0].T + c[1]))
+    s = 1.0
+    cur = src_pts @ rot.T + t
+
+    rms = prev_rms = None
+    used = 0
+    while used < max(1, int(iterations)):
+        used += 1
+        _, idx = _nearest(cur, dst_pts)
+        r_step, s_step, t_step = _kabsch(cur, dst_pts[idx], allow_scale=scale)
+        cur = s_step * (cur @ r_step.T) + t_step
+        rot = r_step @ rot
+        s = s_step * s
+        t = s_step * (r_step @ t) + t_step
+        rms = float(np.sqrt(((cur - dst_pts[idx]) ** 2).sum(axis=1).mean()))
+        if prev_rms is not None and abs(prev_rms - rms) < tolerance:
+            break
+        prev_rms = rms
+
+    matrix = np.eye(4)
+    matrix[:3, :3] = s * rot
+    matrix[:3, 3] = t
+    report = {
+        'scan': scan_path,
+        'model': model_path,
+        'matrix_mm': _rounded([list(row) for row in matrix], 6),
+        'scale': _rounded(float(s), 6),
+        'rms_before_mm': _rounded(rms_before),
+        'rms_after_mm': _rounded(rms),
+        'iterations': used,
+        'samples': samples,
+        'samples_clamped': samples != requested,
+        'note': ('Nearest-sample RMS (approximate). Apply matrix_mm to scan '
+                 'coordinates to land in model coordinates. If rms_after is '
+                 'still large the shapes may genuinely differ, or the PCA '
+                 'seed picked a wrong symmetry — retry with scale=True or '
+                 'pre-rotate the scan.'),
+    }
+    if out_path:
+        aligned = scan_mesh.copy()
+        aligned.vertices = np.asarray(aligned.vertices) @ (s * rot).T + t
+        aligned.export(out_path)
+        report['aligned_path'] = out_path
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# fit_check — does the scanned object fit the designed part?
+# --------------------------------------------------------------------------- #
+_MAX_FIT_POINTS = 20000
+
+
+def fit_check(scan_path, model_path, clearance_mm=0.0, max_points=_MAX_FIT_POINTS):
+    """Check a rebuilt/designed part (model file) against the scanned object
+    (scan file), both mm and ALREADY in one frame (scan_align first if not):
+    per-scan-vertex exact distance to the model surface, signed by
+    inside/outside when the model is watertight. Reports collisions (scan
+    vertices inside the model — the part would not seat), penetration depths
+    and clearance percentiles; `clearance_mm` adds a fraction-below-target.
+    This is the printed-part fit verification used before committing a print."""
+    scan_mesh = _load(scan_path)
+    model_mesh = _load(model_path)
+    pts = np.asarray(scan_mesh.vertices, dtype=float)
+    requested = len(pts)
+    stride = max(1, -(-requested // int(max_points)))
+    pts = pts[::stride]
+
+    # Candidate faces from a dense surface sampling, then the exact
+    # point-to-triangle distance (same scheme as deviation()).
+    dst_pts, dst_fidx = _sample_surface(
+        model_mesh, min(max(4 * len(pts), 2000), 24000), seed=1)
+    _, idx = _nearest(pts, dst_pts)
+    tris = model_mesh.triangles[dst_fidx[idx]]
+    closest = trimesh.triangles.closest_point(tris, pts)
+    dist = np.linalg.norm(pts - closest, axis=1)
+
+    inside = None
+    if model_mesh.is_watertight:
+        try:
+            inside = np.zeros(len(pts), dtype=bool)
+            # Chunked: trimesh's pure-python ray backend allocates per query.
+            for i in range(0, len(pts), 800):
+                inside[i:i + 800] = model_mesh.contains(pts[i:i + 800])
+        except Exception:  # noqa: BLE001 - ray backend availability varies
+            inside = None
+
+    report = {
+        'scan': scan_path,
+        'model': model_path,
+        'points': int(len(pts)),
+        'points_stride': int(stride),
+    }
+    if inside is None:
+        report['signed'] = False
+        report['note'] = ('Model is not watertight (or no ray backend) — '
+                          'distances are unsigned, collision count unavailable. '
+                          'Repair/re-export the model for a full fit check.')
+        clearance = dist
+    else:
+        report['signed'] = True
+        collisions = int(inside.sum())
+        report['collisions'] = collisions
+        if collisions:
+            depth = dist[inside]
+            worst = np.argsort(depth)[::-1][:10]
+            report['penetration_mm'] = {
+                'max': _rounded(float(depth.max())),
+                'p95': _rounded(float(np.percentile(depth, 95))),
+            }
+            report['worst_points_mm'] = _rounded(
+                [list(p) for p in pts[inside][worst]], 2)
+        clearance = dist[~inside] if collisions else dist
+    if len(clearance):
+        report['clearance_mm'] = {
+            'min': _rounded(float(clearance.min())),
+            'p5': _rounded(float(np.percentile(clearance, 5))),
+            'p50': _rounded(float(np.percentile(clearance, 50))),
+        }
+        if clearance_mm:
+            report['clearance_target_mm'] = float(clearance_mm)
+            report['below_target'] = _rounded(
+                float((clearance < clearance_mm).mean()))
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# cavity_sections — drop-on cavity outlines from a scan
+# --------------------------------------------------------------------------- #
+_MAX_CAVITY_SECTIONS = 40
+
+
+def _hull2d(points):
+    """Convex hull (Andrew monotone chain), CCW order. Pure Python."""
+    pts = sorted({(round(float(x), 6), round(float(y), 6)) for x, y in points})
+    if len(pts) <= 2:
+        return [list(p) for p in pts]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return [list(p) for p in lower[:-1] + upper[:-1]]
+
+
+def _offset_convex(poly, margin):
+    """Offset a CCW convex polygon outward by `margin` (exact miter join)."""
+    n = len(poly)
+    if n < 3 or margin <= 0:
+        return [list(p) for p in poly]
+
+    def edge_normal(a, b):
+        ex, ey = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(ex, ey) or 1.0
+        return ey / length, -ex / length  # outward for CCW
+
+    out = []
+    for i in range(n):
+        prv, cur, nxt = poly[i - 1], poly[i], poly[(i + 1) % n]
+        n1, n2 = edge_normal(prv, cur), edge_normal(cur, nxt)
+        bx, by = n1[0] + n2[0], n1[1] + n2[1]
+        denom = 1.0 + (n1[0] * n2[0] + n1[1] * n2[1])
+        if denom < 1e-9:  # degenerate spike — push along the mean normal
+            length = math.hypot(bx, by) or 1.0
+            out.append([cur[0] + margin * bx / length,
+                        cur[1] + margin * by / length])
+        else:
+            out.append([cur[0] + margin * bx / denom,
+                        cur[1] + margin * by / denom])
+    return out
+
+
+def _shoelace(poly):
+    return 0.5 * abs(sum(
+        poly[i][0] * poly[(i + 1) % len(poly)][1]
+        - poly[(i + 1) % len(poly)][0] * poly[i][1]
+        for i in range(len(poly))))
+
+
+def _anchor_start(poly):
+    """Rotate a polygon's start vertex to the max-x (tie: max-y) vertex so
+    every section shares the loft anchor (prevents twisted lofts)."""
+    if not poly:
+        return poly
+    start = max(range(len(poly)), key=lambda i: (poly[i][0], poly[i][1]))
+    return poly[start:] + poly[:start]
+
+
+def cavity_sections(scan_path, axis='z', spacing=2.0, margin=2.0,
+                    cumulative='above', lookback=None, start=None, end=None,
+                    max_sections=_MAX_CAVITY_SECTIONS):
+    """Design a straight-insertion cavity around a scanned object: per-level
+    CONVEX-HULL outlines that are cumulative along the insertion axis, offset
+    outward by `margin` mm and guaranteed monotone (each section contains the
+    previous one), so lofting them yields a cavity the object drops into.
+
+    cumulative="above" (default) fits a cover lowered along -axis onto the
+    object (each level swallows every scan point above it); "below" fits a
+    pocket the object is inserted into from +axis. `lookback` (default
+    = spacing) additionally swallows points one section behind the level —
+    without it, lofts pinch between sections on steep zones. Convex hulls
+    only: concave openings (grilles etc.) need the occupancy-raster approach.
+
+    Rebuild flow per section: construction_plane(offset), one fitted
+    sketch_spline through points_mm (NOT a polyline — polyline lofts bead),
+    then loft; sections already share a start anchor and CCW orientation.
+    Verify the result with scan_fit_check."""
+    mesh = _load(scan_path)
+    axis = (axis or 'z').lower()
+    if axis not in _AXES:
+        raise RuntimeError('axis must be x|y|z, got %r' % axis)
+    ax, (u, v), sketch_plane, coord_names = _AXES[axis]
+    cumulative = (cumulative or 'above').lower()
+    if cumulative not in ('above', 'below'):
+        raise RuntimeError("cumulative must be 'above' or 'below', got %r"
+                           % cumulative)
+
+    pts = np.asarray(mesh.vertices, dtype=float)
+    # Scan clouds are dense, but converted/CAD meshes may have almost no
+    # vertices on large faces (a cone's side has none at mid-height), which
+    # would leave whole levels empty — densify with deterministic surface
+    # samples so every level sees geometry.
+    sampled, _ = _sample_surface(mesh, _SAMPLE_PRIMITIVES)
+    pts = np.vstack([pts, sampled])
+    coord = pts[:, ax]
+    lo = float(coord.min()) if start is None else float(start)
+    hi = float(coord.max()) if end is None else float(end)
+    if hi <= lo:
+        raise RuntimeError('Empty level range %.3f..%.3f' % (lo, hi))
+
+    spacing = max(0.2, float(spacing))
+    spacing_clamped = False
+    count = int(math.floor((hi - lo) / spacing)) + 1
+    if count > int(max_sections):
+        spacing = (hi - lo) / (int(max_sections) - 1)
+        count = int(max_sections)
+        spacing_clamped = True
+    levels = [lo + i * spacing for i in range(count)]
+    if levels[-1] < hi - 1e-9:
+        levels.append(hi)
+    lookback = spacing if lookback is None else max(0.0, float(lookback))
+
+    # Build from the contained (small) end so monotonicity is enforced by
+    # unioning each hull with the previous one's vertices.
+    build_order = list(reversed(levels)) if cumulative == 'above' else levels
+    prev_hull = None
+    by_level = {}
+    for level in build_order:
+        if cumulative == 'above':
+            sel = pts[coord >= level - lookback]
+        else:
+            sel = pts[coord <= level + lookback]
+        flat = [(p[u], p[v]) for p in sel]
+        if prev_hull:
+            flat.extend((p[0], p[1]) for p in prev_hull)
+        hull = _hull2d(flat)
+        if len(hull) < 3:
+            by_level[level] = None
+            continue
+        prev_hull = hull
+        by_level[level] = hull
+
+    sections = []
+    for level in levels:
+        hull = by_level.get(level)
+        if not hull:
+            sections.append({'level_mm': _rounded(level),
+                             'error': 'fewer than 3 scan points at this level'})
+            continue
+        poly = _anchor_start(_offset_convex(hull, float(margin)))
+        sections.append({
+            'level_mm': _rounded(level),
+            'points_mm': _rounded(poly),
+            'area_mm2': _rounded(_shoelace(poly), 2),
+        })
+
+    return {
+        'file': scan_path,
+        'axis': axis,
+        'sketch_plane': sketch_plane,
+        'coords': list(coord_names),
+        'cumulative': cumulative,
+        'spacing_mm': _rounded(spacing),
+        'spacing_clamped': spacing_clamped,
+        'margin_mm': float(margin),
+        'lookback_mm': _rounded(lookback),
+        'note': ('For each section: construction_plane(method="offset", '
+                 'base="%s", offset=level_mm), one closed fitted spline '
+                 'through points_mm (sections already share start anchor + '
+                 'CCW), then loft through all profiles. Monotone sections '
+                 'guarantee straight insertion along %s. Verify with '
+                 'scan_fit_check.' % (sketch_plane, axis)),
+        'sections': sections,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# convert — phone-scan formats (GLB/PLY/OFF/OBJ) -> Fusion-importable mesh
+# --------------------------------------------------------------------------- #
+def convert(path, out_path=None, fmt='stl'):
+    """Convert a mesh file Fusion cannot import (GLB/GLTF/PLY/OFF — typical
+    phone-scanner exports) into STL or OBJ for import_mesh. Scene files are
+    flattened into one mesh. Returns the output path plus size stats and a
+    units warning when the extents look non-millimetre."""
+    mesh = _load(path)
+    fmt = (fmt or 'stl').lower()
+    if fmt not in ('stl', 'obj'):
+        raise RuntimeError("fmt must be 'stl' or 'obj', got %r" % fmt)
+    if not out_path:
+        out_path = os.path.splitext(path)[0] + '.' + fmt
+    mesh.export(out_path)
+    bounds = mesh.bounds
+    size = bounds[1] - bounds[0]
+    scale = float(size.max())
+    report = {
+        'input': path,
+        'output': out_path,
+        'format': fmt,
+        'triangles': int(len(mesh.faces)),
+        'vertices': int(len(mesh.vertices)),
+        'watertight': bool(mesh.is_watertight),
+        'size_mm': _rounded(size),
+        'note': "Import with import_mesh(path, units='mm').",
+    }
+    if scale < 5 or scale > 5000:
+        report['units_warning'] = (
+            'Largest extent is %.3f mm — the file may not be in millimetres '
+            '(GLB is metres by convention). Import with the matching units, '
+            'e.g. import_mesh(units="m").' % scale)
     return report

@@ -14,6 +14,7 @@ import io
 import math
 import os
 import re
+import struct
 import tempfile
 import time
 import traceback
@@ -23,7 +24,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.10.0'
+VERSION = '1.11.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -60,6 +61,9 @@ _READ_ONLY_OPS = frozenset({
     'list_materials', 'list_appearances', 'data_folders', 'version_history',
     'share_link', 'annotate', 'annotations_clear',
     'design_diagnostics', 'sketch_status',
+    # File writers that do not mutate the design (cache-wise read-only; the
+    # server still omits readOnlyHint on them because they write user paths).
+    'mesh_export', 'face_groups', 'canvas_list',
 })
 
 
@@ -2535,8 +2539,10 @@ def op_mesh_reduce(app, p):
 
 def op_mesh_remesh(app, p):
     """Regenerate a mesh's triangulation (fixes long slivers before convert).
-    Requires the mesh-feature API (Fusion 2024+); defaults are used for the
-    remesh settings."""
+    Requires the mesh-feature API (Fusion 2024+). Optional settings (applied
+    best-effort per build): density 0-1, shape_preservation 0-1,
+    preserve_boundaries / preserve_sharp_edges bools, method
+    adaptive|uniform."""
     root = _root(app)
     feats = getattr(root.features, 'meshRemeshFeatures', None)
     if feats is None:
@@ -2550,6 +2556,24 @@ def op_mesh_remesh(app, p):
             rin = feats.createInput(m)
         with contextlib.suppress(Exception):
             rin.mesh = m
+        if p.get('density') is not None:
+            with contextlib.suppress(Exception):
+                rin.density = float(p['density'])
+        if p.get('shape_preservation') is not None:
+            with contextlib.suppress(Exception):
+                rin.shapePreservation = float(p['shape_preservation'])
+        if p.get('preserve_boundaries') is not None:
+            with contextlib.suppress(Exception):
+                rin.isPreserveBoundariesEnabled = bool(p['preserve_boundaries'])
+        if p.get('preserve_sharp_edges') is not None:
+            with contextlib.suppress(Exception):
+                rin.isPreserveSharpEdgesEnabled = bool(p['preserve_sharp_edges'])
+        if (p.get('method') or '').lower() == 'uniform':
+            value = _fusion_enum_any(['UniformMeshRemeshMethodType',
+                                      'UniformRemeshType'])
+            if value is not None:
+                with contextlib.suppress(Exception):
+                    rin.meshRemeshMethodType = value
         feats.add(rin)
         out.append(_mesh_info_entry(m))
     return {'remeshed': out}
@@ -2650,6 +2674,436 @@ def op_mesh_section(app, p):
                            'sketch (%s). Convert with mesh_to_brep first, then '
                            'section the solid.' % exc)
     return {'sketch': _registry.add('skt', sk),
+            'curves': sk.sketchCurves.count,
+            'profiles': sk.profiles.count}
+
+
+def _fusion_enum_any(names):
+    """First enum value found among candidate names (Preview APIs rename
+    their enum members between builds). None when none exist."""
+    for name in names:
+        value = _enum_value(adsk.fusion, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _triangle_data(mesh_body):
+    """(vertices_mm, triangles) of a mesh body, probing the per-build property
+    names (TriangleMesh exposes nodeIndices, PolygonMesh triangleNodeIndices;
+    nodeCoordinatesAsDouble is the fast path when present)."""
+    for attr in ('mesh', 'displayMesh'):
+        dm = getattr(mesh_body, attr, None)
+        if dm is None:
+            continue
+        idx = None
+        for name in ('nodeIndices', 'triangleNodeIndices'):
+            idx = getattr(dm, name, None)
+            if idx:
+                break
+        if not idx:
+            continue
+        flat = getattr(dm, 'nodeCoordinatesAsDouble', None)
+        if flat:
+            verts = [(flat[i] / MM, flat[i + 1] / MM, flat[i + 2] / MM)
+                     for i in range(0, len(flat), 3)]
+        else:
+            verts = [(pt.x / MM, pt.y / MM, pt.z / MM)
+                     for pt in dm.nodeCoordinates]
+        if verts:
+            tris = [(idx[i], idx[i + 1], idx[i + 2])
+                    for i in range(0, len(idx), 3)]
+            return verts, tris
+    raise RuntimeError('Mesh body exposes no triangle data in this build')
+
+
+def _write_mesh_file(path, verts, tris):
+    """Write vertices (mm) + triangles to binary STL or OBJ by extension."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.obj':
+        with open(path, 'w', encoding='ascii') as fh:
+            for v in verts:
+                fh.write('v %.6f %.6f %.6f\n' % v)
+            for t in tris:
+                fh.write('f %d %d %d\n' % (t[0] + 1, t[1] + 1, t[2] + 1))
+        return
+    if ext != '.stl':
+        raise ValueError('path must end in .stl or .obj, got %r' % path)
+    with open(path, 'wb') as fh:
+        fh.write(b'FusionMCP mesh export'.ljust(80, b' '))
+        fh.write(struct.pack('<I', len(tris)))
+        for a, b, c in tris:
+            va, vb, vc = verts[a], verts[b], verts[c]
+            ux, uy, uz = vb[0] - va[0], vb[1] - va[1], vb[2] - va[2]
+            wx, wy, wz = vc[0] - va[0], vc[1] - va[1], vc[2] - va[2]
+            nx, ny, nz = uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx
+            ln = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+            fh.write(struct.pack('<12fH', nx / ln, ny / ln, nz / ln,
+                                 *va, *vb, *vc, 0))
+
+
+def op_mesh_export(app, p):
+    """Write ONE mesh body (token) to an STL or OBJ file in mm (format from
+    the extension) — the bridge to the server-side scan tools
+    (scan_analyze/scan_align/scan_deviation/scan_cavity_sections work on
+    files, not on live Fusion meshes). Pure-Python write: large scans take a
+    few seconds on Fusion's UI thread."""
+    m = _registry.get(p['mesh'])
+    verts, tris = _triangle_data(m)
+    _write_mesh_file(p['path'], verts, tris)
+    return {'exported': p['path'], 'triangles': len(tris), 'nodes': len(verts)}
+
+
+def op_face_groups(app, p):
+    """List a mesh body's face groups (segmentation regions painted in the
+    MESH workspace or auto-generated): tempId, area, centroid, bounding box,
+    planarity. With `group` (a tempId) + `export_path` (.stl/.obj) also
+    writes that group's triangles to a file for server-side surface fitting —
+    that part needs PolygonMesh.triangleFaceGroupTempIds (Preview API,
+    Fusion Sep 2024+). tempIds are only stable while the document stays open
+    and the mesh unmodified."""
+    m = _registry.get(p['mesh'])
+    groups = getattr(m, 'faceGroups', None)
+    if groups is None:
+        raise RuntimeError('Face groups are not available in this Fusion '
+                           'version.')
+    out = []
+    for i in range(groups.count):
+        g = groups.item(i)
+        entry = {'index': i}
+        for attr in ('tempId', 'isPlanar'):
+            with contextlib.suppress(Exception):
+                entry[attr] = getattr(g, attr)
+        with contextlib.suppress(Exception):
+            entry['area_mm2'] = round(g.area / (MM * MM), 2)
+        with contextlib.suppress(Exception):
+            entry['centroid_mm'] = _xyz_mm(g.centroid)
+        with contextlib.suppress(Exception):
+            bb = g.boundingBox
+            entry['min_mm'] = _xyz_mm(bb.minPoint)
+            entry['max_mm'] = _xyz_mm(bb.maxPoint)
+        out.append(entry)
+    result = {'mesh': p['mesh'], 'count': len(out), 'groups': out}
+    if not out:
+        result['note'] = ('No face groups on this mesh — generate them in the '
+                          'MESH workspace (Modify > Generate Face Groups) '
+                          'first.')
+
+    if p.get('export_path') and p.get('group') is not None:
+        pm = getattr(m, 'mesh', None)
+        ids = getattr(pm, 'triangleFaceGroupTempIds', None) if pm else None
+        if not ids:
+            raise RuntimeError(
+                'PolygonMesh.triangleFaceGroupTempIds is not available in '
+                'this Fusion build (Preview API, Sep 2024+) — export the '
+                'whole mesh with mesh_export and segment it server-side '
+                'instead.')
+        verts, tris = _triangle_data(m)
+        want = int(p['group'])
+        picked = [t for k, t in enumerate(tris)
+                  if k < len(ids) and int(ids[k]) == want]
+        if not picked:
+            raise RuntimeError('No triangles carry face-group tempId %d — '
+                               'use a tempId from the groups list.' % want)
+        _write_mesh_file(p['export_path'], verts, picked)
+        result['exported'] = {'path': p['export_path'], 'group': want,
+                              'triangles': len(picked)}
+    return result
+
+
+def op_mesh_repair(app, p):
+    """Repair scan defects (holes, floaters, non-manifold junk) on mesh
+    bodies (tokens; all meshes when omitted). mode: "stitch" (close gaps and
+    remove debris, default) or "rebuild" (full re-wrap; `quality` fast |
+    accurate, `density` 8-256, `offset` mm grows the rebuilt skin). Preview
+    mesh-feature API — parameters are applied best-effort per build."""
+    root = _root(app)
+    feats = getattr(root.features, 'meshRepairFeatures', None)
+    if feats is None:
+        raise RuntimeError('meshRepairFeatures not available in this Fusion '
+                           'version — use the MESH workspace Repair command.')
+    mode = (p.get('mode') or 'stitch').lower()
+    if mode not in ('stitch', 'rebuild'):
+        raise ValueError('mode must be stitch|rebuild, got %r' % p.get('mode'))
+    out = []
+    for m in _mesh_targets(root, p):
+        try:
+            rin = feats.createInput()
+        except TypeError:
+            rin = feats.createInput(m)
+        with contextlib.suppress(Exception):
+            rin.mesh = m
+        if mode == 'rebuild':
+            value = _fusion_enum_any(['RebuildMeshRepairType'])
+            if value is not None:
+                with contextlib.suppress(Exception):
+                    rin.meshRepairType = value
+            if (p.get('quality') or '').lower() == 'accurate':
+                value = _fusion_enum_any(['AccurateMeshRepairRebuildType',
+                                          'AccurateRebuildType'])
+                if value is not None:
+                    with contextlib.suppress(Exception):
+                        rin.meshRepairRebuildType = value
+            if p.get('density'):
+                with contextlib.suppress(Exception):
+                    rin.density = int(p['density'])
+            if p.get('offset'):
+                with contextlib.suppress(Exception):
+                    rin.offset = float(p['offset']) * MM
+        feats.add(rin)
+        out.append(_mesh_info_entry(m))
+    return {'repaired': out, 'mode': mode}
+
+
+def op_mesh_smooth(app, p):
+    """Smooth mesh bodies (tokens; all when omitted) — soften scanner noise
+    before converting. smoothness 0-1 (Fusion default when omitted). Preview
+    mesh-feature API."""
+    root = _root(app)
+    feats = getattr(root.features, 'meshSmoothFeatures', None)
+    if feats is None:
+        raise RuntimeError('meshSmoothFeatures not available in this Fusion '
+                           'version — use the MESH workspace Smooth command.')
+    out = []
+    for m in _mesh_targets(root, p):
+        try:
+            sin = feats.createInput()
+        except TypeError:
+            sin = feats.createInput(m)
+        with contextlib.suppress(Exception):
+            sin.mesh = m
+        if p.get('smoothness') is not None:
+            with contextlib.suppress(Exception):
+                sin.smoothness = float(p['smoothness'])
+        feats.add(sin)
+        out.append(_mesh_info_entry(m))
+    return {'smoothed': out}
+
+
+def op_mesh_shell(app, p):
+    """Shell (hollow/offset) mesh bodies by `thickness` mm — turn a scanned
+    outer skin into a wall of even thickness. Preview mesh-feature API; the
+    thickness property name is probed per build."""
+    root = _root(app)
+    feats = getattr(root.features, 'meshShellFeatures', None)
+    if feats is None:
+        raise RuntimeError('meshShellFeatures not available in this Fusion '
+                           'version — use the MESH workspace Shell command.')
+    thickness = float(p['thickness']) * MM
+    out = []
+    for m in _mesh_targets(root, p):
+        try:
+            sin = feats.createInput()
+        except TypeError:
+            sin = feats.createInput(m)
+        with contextlib.suppress(Exception):
+            sin.mesh = m
+        applied = False
+        for value in (thickness, _vi(thickness)):
+            for attr in ('thickness', 'shellThickness', 'offset'):
+                try:
+                    setattr(sin, attr, value)
+                    applied = True
+                    break
+                except Exception:  # noqa: PERF203 - probing property names
+                    continue
+            if applied:
+                break
+        if not applied:
+            raise RuntimeError('Could not set the shell thickness on this '
+                               "build's MeshShellFeatureInput — run "
+                               "api_introspect('MeshShellFeatureInput') and "
+                               'report the property name.')
+        feats.add(sin)
+        out.append(_mesh_info_entry(m))
+    return {'shelled': out, 'thickness_mm': p['thickness']}
+
+
+def op_mesh_separate(app, p):
+    """Split mesh bodies (tokens; all when omitted) into their disconnected
+    shells — a scan session that captured several parts becomes one mesh body
+    per part. Preview mesh-feature API."""
+    root = _root(app)
+    feats = getattr(root.features, 'meshSeparateFeatures', None)
+    if feats is None:
+        raise RuntimeError('meshSeparateFeatures not available in this Fusion '
+                           'version — use the MESH workspace Separate command.')
+    before = root.meshBodies.count
+    for m in _mesh_targets(root, p):
+        try:
+            sin = feats.createInput()
+        except TypeError:
+            sin = feats.createInput(m)
+        with contextlib.suppress(Exception):
+            sin.mesh = m
+        feats.add(sin)
+    return {'meshes_before': before,
+            'meshes_after': root.meshBodies.count,
+            'meshes': [_mesh_info_entry(m) for m in root.meshBodies]}
+
+
+# --------------------------------------------------------------------------- #
+# Canvases (photos as tracing references)
+# --------------------------------------------------------------------------- #
+def _matrix2d_cells(t):
+    return [[t.getCell(r, c) for c in range(3)] for r in range(3)]
+
+
+def _mat3_mul(a, b):
+    return [[sum(a[r][k] * b[k][c] for k in range(3)) for c in range(3)]
+            for r in range(3)]
+
+
+def op_canvas_calibrate(app, p):
+    """Two-point canvas calibration, fully scripted (Fusion's right-click
+    Calibrate has no API): pass two feature points p1/p2 as [x, y] in the
+    canvas plane's sketch coordinates (mm — read them off a screenshot or
+    sketch points over the photo) and the true `distance` mm between them.
+    The canvas is scaled uniformly about p1; optional rotate_to_deg also
+    rotates so p1->p2 points at that angle, and move_p1_to=[x, y] then
+    translates p1 onto a target point."""
+    c = _registry.get(p['canvas'])
+    p1 = [float(v) * MM for v in p['p1']]
+    p2 = [float(v) * MM for v in p['p2']]
+    distance = float(p['distance']) * MM
+    if distance <= 0:
+        raise ValueError('distance must be positive')
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    current = math.hypot(dx, dy)
+    if current < 1e-9:
+        raise ValueError('p1 and p2 coincide — pick two distinct features')
+    factor = distance / current
+    angle = 0.0
+    if p.get('rotate_to_deg') is not None:
+        angle = math.radians(float(p['rotate_to_deg'])) - math.atan2(dy, dx)
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    # M = T(p1) . R . S . T(-p1): scale+rotate about p1 in plane space.
+    a, b = factor * cos_a, -factor * sin_a
+    c2, d = factor * sin_a, factor * cos_a
+    m = [[a, b, p1[0] - (a * p1[0] + b * p1[1])],
+         [c2, d, p1[1] - (c2 * p1[0] + d * p1[1])],
+         [0.0, 0.0, 1.0]]
+    if p.get('move_p1_to') is not None:
+        target = [float(v) * MM for v in p['move_p1_to']]
+        m[0][2] += target[0] - p1[0]
+        m[1][2] += target[1] - p1[1]
+    t = c.transform
+    new = _mat3_mul(m, _matrix2d_cells(t))
+    for r in range(3):
+        for col in range(3):
+            t.setCell(r, col, new[r][col])
+    c.transform = t
+    return {'canvas': p['canvas'],
+            'scale_applied': round(factor, 6),
+            'rotation_applied_deg': round(math.degrees(angle), 4),
+            'note': 'The p1-p2 features now span %.3f mm in the canvas plane.'
+                    % (distance / MM)}
+
+
+def op_canvas_list(app, p):
+    """List the canvases in the root component with tokens for
+    canvas_calibrate/canvas_update/canvas_delete."""
+    root = _root(app)
+    canvases = getattr(root, 'canvases', None)
+    if canvases is None:
+        raise RuntimeError('Canvases are not available in this Fusion version.')
+    out = []
+    for i in range(canvases.count):
+        c = canvases.item(i)
+        entry = {'token': _registry.add('cnv', c)}
+        for attr in ('name', 'opacity', 'isDisplayedThrough', 'isSelectable'):
+            with contextlib.suppress(Exception):
+                entry[attr] = getattr(c, attr)
+        with contextlib.suppress(Exception):
+            entry['image'] = c.imageFilename
+        out.append(entry)
+    return {'count': len(out), 'canvases': out}
+
+
+def op_canvas_update(app, p):
+    """Adjust a canvas (token): opacity 0-100, name, displayed_through
+    (visible through the model), selectable, flip_h/flip_v mirror the image
+    in place."""
+    c = _registry.get(p['canvas'])
+    changed = []
+    if p.get('opacity') is not None:
+        c.opacity = int(p['opacity'])
+        changed.append('opacity')
+    if p.get('name'):
+        c.name = p['name']
+        changed.append('name')
+    if p.get('displayed_through') is not None:
+        c.isDisplayedThrough = bool(p['displayed_through'])
+        changed.append('displayed_through')
+    if p.get('selectable') is not None:
+        c.isSelectable = bool(p['selectable'])
+        changed.append('selectable')
+    if p.get('flip_h'):
+        c.flipHorizontal()
+        changed.append('flip_h')
+    if p.get('flip_v'):
+        c.flipVertical()
+        changed.append('flip_v')
+    if not changed:
+        raise ValueError('Nothing to change — pass opacity, name, '
+                         'displayed_through, selectable, flip_h or flip_v.')
+    return {'canvas': p['canvas'], 'changed': changed}
+
+
+def op_canvas_delete(app, p):
+    """Remove a canvas (token) from the design."""
+    token = p['canvas']
+    c = _registry.get(token)
+    if not c.deleteMe():
+        raise RuntimeError('Fusion refused to delete the canvas — is it '
+                           'referenced by a sketch?')
+    _registry.remove(token)
+    return {'deleted': token}
+
+
+def op_import_svg(app, p):
+    """Import an SVG file's curves into a sketch (ImportManager, Fusion Oct
+    2022+): into an existing sketch (token) or a new sketch on `plane`.
+    Options: flip_h/flip_v mirror the import, scale applies a uniform factor.
+    Typical photo flow: photo_rectify -> photo_to_sketch makes a DXF instead
+    (import_file format=dxf); use this for real vector art (logos, gaskets
+    from a vector datasheet)."""
+    im = app.importManager
+    make_opts = getattr(im, 'createSVGImportOptions', None)
+    if make_opts is None:
+        raise RuntimeError('SVG import is not available in this Fusion '
+                           'version — convert the SVG to DXF and use '
+                           'import_file.')
+    root = _root(app)
+    if p.get('sketch'):
+        sk = _registry.get(p['sketch'])
+    else:
+        sk = root.sketches.add(_resolve_plane(app, p.get('plane', 'XY')))
+    try:
+        opts = make_opts(p['path'])
+    except TypeError:
+        opts = make_opts()
+        opts.filename = p['path']
+    if p.get('flip_h'):
+        with contextlib.suppress(Exception):
+            opts.isHorizontalFlip = True
+    if p.get('flip_v'):
+        with contextlib.suppress(Exception):
+            opts.isVerticalFlip = True
+    with contextlib.suppress(Exception):
+        opts.isViewFit = False
+    if p.get('scale'):
+        with contextlib.suppress(Exception):
+            t = opts.transform
+            m = adsk.core.Matrix3D.create()
+            for i in range(3):
+                m.setCell(i, i, float(p['scale']))
+            t.transformBy(m)
+            opts.transform = t
+    before = sk.sketchCurves.count
+    im.importToTarget(opts, sk)
+    return {'sketch': _registry.add('skt', sk),
+            'curves_added': sk.sketchCurves.count - before,
             'curves': sk.sketchCurves.count,
             'profiles': sk.profiles.count}
 
@@ -4901,6 +5355,18 @@ DISPATCH = {
     'design_diagnostics': op_design_diagnostics,
     'sketch_status': op_sketch_status,
     'create_appearance': op_create_appearance,
+    # v1.11.0: scan + photo wave
+    'mesh_export': op_mesh_export,
+    'face_groups': op_face_groups,
+    'mesh_repair': op_mesh_repair,
+    'mesh_smooth': op_mesh_smooth,
+    'mesh_shell': op_mesh_shell,
+    'mesh_separate': op_mesh_separate,
+    'canvas_calibrate': op_canvas_calibrate,
+    'canvas_list': op_canvas_list,
+    'canvas_update': op_canvas_update,
+    'canvas_delete': op_canvas_delete,
+    'import_svg': op_import_svg,
 }
 
 

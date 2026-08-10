@@ -16,6 +16,7 @@ Conventions
 import json
 import os
 
+import photo
 import scan
 import updater
 import viewer
@@ -1143,10 +1144,25 @@ def mesh_reduce(meshes: list[str] = [], target_faces: int = 0,
 
 
 @mcp.tool()
-def mesh_remesh(meshes: list[str] = []) -> dict:
+def mesh_remesh(meshes: list[str] = [], density: float = -1.0,
+                shape_preservation: float = -1.0,
+                preserve_boundaries: int = -1,
+                preserve_sharp_edges: int = -1,
+                method: str = 'adaptive') -> dict:
     """Regenerate mesh triangulation (fixes slivers/degenerate triangles that
-    break mesh_to_brep). Default Fusion remesh settings."""
-    return _call('mesh_remesh', meshes=meshes)
+    break mesh_to_brep). Optional settings (leave at -1 for Fusion defaults,
+    applied best-effort on Preview builds): density 0-1, shape_preservation
+    0-1, preserve_boundaries / preserve_sharp_edges (0/1), method
+    adaptive|uniform."""
+    return _call('mesh_remesh', meshes=meshes,
+                 density=None if density < 0 else density,
+                 shape_preservation=None if shape_preservation < 0
+                 else shape_preservation,
+                 preserve_boundaries=None if preserve_boundaries < 0
+                 else bool(preserve_boundaries),
+                 preserve_sharp_edges=None if preserve_sharp_edges < 0
+                 else bool(preserve_sharp_edges),
+                 method=method)
 
 
 @mcp.tool()
@@ -1190,6 +1206,125 @@ def mesh_compare(mesh_a: str, mesh_b: str, tolerance: float = 0.2) -> dict:
                  tolerance=tolerance)
 
 
+# NOT readOnlyHint: writes a file at the model-chosen path.
+@mcp.tool()
+def mesh_export(mesh: str, path: str) -> dict:
+    """Write ONE mesh body (token) to an STL or OBJ file in mm (format from
+    the extension) — the bridge from a mesh living in Fusion to the
+    server-side scan tools (scan_analyze, scan_align, scan_deviation,
+    scan_cavity_sections, print_check), which work on files."""
+    return _call('mesh_export', mesh=mesh, path=path)
+
+
+# NOT readOnlyHint: the export branch writes a file at the model-chosen path.
+@mcp.tool()
+def face_groups(mesh: str, group: int = -1, export_path: str = '') -> dict:
+    """List a mesh body's face groups (segmentation regions): tempId, area,
+    centroid, bounding box, planarity. Pass group=<tempId> plus export_path
+    (.stl/.obj) to also write that group's triangles to a file for
+    server-side surface fitting (needs a Preview API — Fusion Sep 2024+; the
+    error says so when absent). tempIds are stable only while the document
+    stays open and the mesh unmodified."""
+    return _call('face_groups', mesh=mesh,
+                 group=None if group < 0 else group,
+                 export_path=export_path or None)
+
+
+@mcp.tool()
+def mesh_repair(meshes: list[str] = [], mode: str = 'stitch',
+                quality: str = 'fast', density: int = 0,
+                offset: float = 0.0) -> dict:
+    """Repair scan defects (holes, floaters, non-manifold junk) on mesh
+    bodies (all meshes when tokens omitted). mode: "stitch" (close gaps,
+    remove debris — default) or "rebuild" (full re-wrap: quality
+    fast|accurate, density 8-256, offset mm grows the skin). Preview
+    mesh-feature API — falls back to a clear error on builds without it."""
+    return _call('mesh_repair', meshes=meshes, mode=mode, quality=quality,
+                 density=density or None, offset=offset or None)
+
+
+@mcp.tool()
+def mesh_smooth(meshes: list[str] = [], smoothness: float = -1.0) -> dict:
+    """Smooth mesh bodies (all when tokens omitted) to soften scanner noise
+    before converting. smoothness 0-1; leave at -1 for Fusion's default.
+    Preview mesh-feature API."""
+    return _call('mesh_smooth', meshes=meshes,
+                 smoothness=None if smoothness < 0 else smoothness)
+
+
+@mcp.tool()
+def mesh_shell(thickness: float, meshes: list[str] = []) -> dict:
+    """Hollow mesh bodies into an even wall of `thickness` mm (a scanned
+    outer skin becomes a printable shell). Preview mesh-feature API."""
+    return _call('mesh_shell', thickness=thickness, meshes=meshes)
+
+
+@mcp.tool()
+def mesh_separate(meshes: list[str] = []) -> dict:
+    """Split mesh bodies (all when tokens omitted) into their disconnected
+    shells — one mesh body per physical part after a multi-part scan.
+    Preview mesh-feature API."""
+    return _call('mesh_separate', meshes=meshes)
+
+
+@mcp.tool()
+def canvas_calibrate(canvas: str, p1: list[float], p2: list[float],
+                     distance: float, rotate_to_deg: float = -9999.0,
+                     move_p1_to: list[float] = []) -> dict:
+    """Two-point canvas calibration, fully scripted (the UI's right-click
+    Calibrate has no API): p1/p2 are [x, y] mm in the canvas plane's sketch
+    coordinates (read them off a screenshot or sketch points placed over two
+    known features) and `distance` is the true mm between those features.
+    Scales the canvas uniformly about p1; rotate_to_deg (leave at -9999 to
+    skip) also rotates so p1->p2 points at that angle; move_p1_to=[x, y]
+    then puts p1 on a target point."""
+    return _call('canvas_calibrate', canvas=canvas, p1=p1, p2=p2,
+                 distance=distance,
+                 rotate_to_deg=None if rotate_to_deg <= -9998 else rotate_to_deg,
+                 move_p1_to=move_p1_to or None)
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def canvas_list() -> dict:
+    """List the canvases in the design with tokens for canvas_calibrate /
+    canvas_update / canvas_delete (name, opacity, image file)."""
+    return _call('canvas_list')
+
+
+@mcp.tool()
+def canvas_update(canvas: str, opacity: int = -1, name: str = '',
+                  displayed_through: int = -1, selectable: int = -1,
+                  flip_h: bool = False, flip_v: bool = False) -> dict:
+    """Adjust a canvas (token): opacity 0-100, rename, displayed_through /
+    selectable (0/1; -1 leaves unchanged), flip_h/flip_v mirror the image in
+    place."""
+    return _call('canvas_update', canvas=canvas,
+                 opacity=None if opacity < 0 else opacity,
+                 name=name or None,
+                 displayed_through=None if displayed_through < 0
+                 else bool(displayed_through),
+                 selectable=None if selectable < 0 else bool(selectable),
+                 flip_h=flip_h, flip_v=flip_v)
+
+
+@mcp.tool()
+def canvas_delete(canvas: str) -> dict:
+    """Remove a canvas (token) from the design."""
+    return _call('canvas_delete', canvas=canvas)
+
+
+@mcp.tool()
+def import_svg(path: str, sketch: str = '', plane: str = 'XY',
+               scale: float = 0.0, flip_h: bool = False,
+               flip_v: bool = False) -> dict:
+    """Import an SVG file's curves into a sketch — an existing one (token)
+    or a new sketch on `plane`. scale applies a uniform factor; flip_h/flip_v
+    mirror. For photos use photo_rectify + photo_to_sketch (DXF) instead;
+    this is for genuine vector art (logos, gasket outlines)."""
+    return _call('import_svg', path=path, sketch=sketch or None, plane=plane,
+                 scale=scale or None, flip_h=flip_h, flip_v=flip_v)
+
+
 @mcp.tool()
 def create_drawing(template: str = '', headless: bool = True,
                    sheet_size: str = '', orientation: str = '',
@@ -1217,8 +1352,8 @@ def drawing_export(path: str, format: str = 'pdf') -> dict:
 
 # --------------------------------------------------------------------------- #
 # Scan analysis — runs IN THE SERVER PROCESS (no Fusion needed, no load on
-# Fusion's UI thread). Requires the optional "re" extras (numpy, scipy,
-# trimesh, pyransac3d); returns a clear install hint when they are missing.
+# Fusion's UI thread). Requires the optional "re" extras (numpy, trimesh,
+# pyransac3d); returns a clear install hint when they are missing.
 # --------------------------------------------------------------------------- #
 @mcp.tool(**_annot(readOnlyHint=True))
 def scan_analyze(path: str, max_primitives: int = 8) -> dict:
@@ -1275,6 +1410,129 @@ def print_check(path: str, bed_x: float = 256.0, bed_y: float = 256.0,
         return scan.print_check(path, bed=(bed_x, bed_y, bed_z),
                                 overhang_deg=overhang_deg, min_wall=min_wall,
                                 nozzle=nozzle)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the aligned mesh at the model-chosen path.
+@mcp.tool()
+def scan_align(scan_path: str, model_path: str, out_path: str = '',
+               samples: int = 3000, scale: bool = False) -> dict:
+    """Rigidly align a scan file onto a model file (both mm) with
+    deterministic ICP (centroid + PCA seeds). Run this BEFORE scan_deviation
+    or scan_fit_check whenever the scan and the model are not already in one
+    coordinate frame. Returns the 4x4 transform and before/after RMS;
+    out_path also writes the aligned scan (STL/OBJ by extension).
+    scale=True additionally solves a uniform scale (scanner calibration)."""
+    try:
+        return scan.align(scan_path, model_path, out_path=out_path or None,
+                          samples=samples, scale=scale)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_fit_check(scan_path: str, model_path: str, clearance_mm: float = 0.0,
+                   max_points: int = 20000) -> dict:
+    """Verify a designed part (model file, e.g. export("stl")) against the
+    scanned object it must fit (scan file), both mm and already aligned
+    (scan_align first if not): per-scan-vertex distance to the model, signed
+    inside/outside when the model is watertight. Reports collisions (scan
+    points inside the part — it would not seat), penetration depth, and
+    clearance percentiles; clearance_mm adds a fraction-below-target. The
+    printed-part fit gate before committing a print."""
+    try:
+        return scan.fit_check(scan_path, model_path, clearance_mm=clearance_mm,
+                              max_points=max_points)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_cavity_sections(scan_path: str, axis: str = 'z', spacing: float = 2.0,
+                         margin: float = 2.0, cumulative: str = 'above',
+                         lookback: float = -1.0,
+                         level_range: list[float] = []) -> dict:
+    """Design a straight-insertion cavity around a scanned object: per-level
+    convex-hull outlines, cumulative along the insertion axis, offset by
+    `margin` mm and guaranteed monotone — loft them and the object drops
+    straight in. cumulative="above" fits a cover lowered onto the object;
+    "below" fits a pocket entered from +axis. level_range=[start, end] limits
+    the levels (mm); lookback (-1 = one spacing) swallows points one section
+    behind to stop lofts pinching between sections. Sections already share a
+    start anchor + CCW order: per section make construction_plane(offset) +
+    ONE closed fitted sketch_spline through points_mm (never a polyline —
+    polyline lofts bead), then loft and combine-cut. Verify with
+    scan_fit_check. Convex hulls only — concave openings need the raster
+    approach by hand."""
+    try:
+        start = level_range[0] if len(level_range) > 0 else None
+        end = level_range[1] if len(level_range) > 1 else None
+        return scan.cavity_sections(
+            scan_path, axis=axis, spacing=spacing, margin=margin,
+            cumulative=cumulative,
+            lookback=None if lookback < 0 else lookback,
+            start=start, end=end)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the converted mesh at the model-chosen path.
+@mcp.tool()
+def scan_convert(path: str, out_path: str = '', fmt: str = 'stl') -> dict:
+    """Convert a mesh file Fusion cannot import (GLB/GLTF/PLY/OFF — typical
+    phone-scan exports) to STL or OBJ, flattening scenes, then import the
+    result with import_mesh. Warns when the extents suggest non-mm units
+    (GLB is metres by convention: import_mesh(units="m"))."""
+    try:
+        return scan.convert(path, out_path=out_path or None, fmt=fmt)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# Photo -> CAD — runs IN THE SERVER PROCESS. Requires the optional "photo"
+# extras (opencv-contrib-python-headless, ezdxf); clear install hint when
+# missing.
+# --------------------------------------------------------------------------- #
+# NOT readOnlyHint: writes the rectified image at the model-chosen path.
+@mcp.tool()
+def photo_rectify(image: str, out_path: str = '', marker: str = '4x4_50',
+                  marker_size_mm: float = 50.0, mm_per_px: float = 0.2,
+                  margin_mm: float = 10.0) -> dict:
+    """Remove perspective from a photo of a flat part using a printed square
+    marker lying IN the part's plane, and fix the scale: after this, every
+    pixel is exactly mm_per_px millimetres. marker: an ArUco dictionary
+    (default "4x4_50" — have the user print one) or "qr"; marker_size_mm is
+    the printed side length. Writes <name>_rect.png (or out_path) and
+    returns mm_per_px for photo_to_sketch or canvas_add. Accuracy is real
+    (~0.2-1 mm) only in the marker's plane."""
+    try:
+        return photo.rectify(image, out_path=out_path or None, marker=marker,
+                             marker_size_mm=marker_size_mm,
+                             mm_per_px=mm_per_px, margin_mm=margin_mm)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the DXF at the model-chosen path.
+@mcp.tool()
+def photo_to_sketch(image: str, mm_per_px: float, dxf_path: str = '',
+                    threshold: float = -1.0, invert: bool = False,
+                    epsilon_mm: float = 0.3, min_area_mm2: float = 4.0,
+                    holes: bool = True, blur_px: int = 3) -> dict:
+    """Vectorise a part silhouette (rectified photo or flat scan) into a DXF
+    of closed polylines (mm, Y up), then bring it into Fusion with
+    import_file(format="dxf", plane=...) — photo to sketch profiles in two
+    calls. Dark part on light background by default (invert=True for the
+    opposite); threshold -1 = automatic; epsilon_mm controls simplification;
+    min_area_mm2 drops specks; holes=False keeps only outer outlines."""
+    try:
+        return photo.to_sketch_dxf(image, mm_per_px, dxf_path=dxf_path or None,
+                                   threshold=threshold, invert=invert,
+                                   epsilon_mm=epsilon_mm,
+                                   min_area_mm2=min_area_mm2, holes=holes,
+                                   blur_px=blur_px)
     except Exception as exc:  # noqa: BLE001
         return {'error': str(exc)}
 
@@ -1789,9 +2047,33 @@ def reverse_engineer_scan(scan_path: str = '', tolerance_mm: float = 0.2) -> str
         '4) Add parameters (add_parameter) for key dimensions so the rebuild '
         'is editable.\n'
         '5) Verify: export("stl", temp_path) then scan_deviation(scan, temp) '
-        '— iterate on the worst regions until within tolerance.\n'
+        '— scan_align first if the rebuild is not in the scan frame; iterate '
+        'on the worst regions until within tolerance.\n'
         '6) Show the result: multi_screenshot + the deviation summary.'
         % ((' at %r' % scan_path) if scan_path else '', tolerance_mm)
+    )
+
+
+@mcp.prompt()
+def trace_photo(image_path: str = '', marker_size_mm: float = 50.0) -> str:
+    """Guide the model from a workshop photo to sketch geometry."""
+    return (
+        'Turn the photo%s into Fusion sketch geometry.\n'
+        '1) Ask whether a square marker (ArUco/QR, %g mm side) lies in the '
+        "part's plane; without one, scale needs a known dimension instead.\n"
+        '2) photo_rectify(image, marker_size_mm=%g) — perspective off, exact '
+        'mm_per_px scale.\n'
+        '3) Either trace curves: photo_to_sketch(rectified, mm_per_px) then '
+        'import_file(format="dxf", plane=...) — profiles ready to extrude; '
+        'or keep the photo visible: canvas_add(rectified, width_mm=size from '
+        'the rectify report) and refine with canvas_calibrate on two known '
+        'features.\n'
+        '4) Clean the imported sketch (sketch_status, auto_constrain, '
+        'sketch_dimension with parameters) — vectorised curves are unclean '
+        'by nature.\n'
+        '5) Verify a key dimension against the real part and adjust.'
+        % ((' at %r' % image_path) if image_path else '',
+           marker_size_mm, marker_size_mm)
     )
 
 

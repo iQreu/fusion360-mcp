@@ -1,6 +1,6 @@
 [project]
 name = "fusion360-mcp"
-version = "1.10.0"
+version = "1.11.0"
 description = "Model Context Protocol server for Autodesk Fusion 360"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,11 +20,18 @@ dev = [
     "ruff>=0.6",
 ]
 # Scan analysis for reverse engineering (scan_analyze/scan_sections/
-# scan_deviation) — heavy, so opt-in. The server runs fine without them.
+# scan_deviation/scan_align/scan_fit_check/scan_cavity_sections) — heavy,
+# so opt-in. The server runs fine without them.
 re = [
     "numpy>=1.26",
     "trimesh>=4.0",
     "pyransac3d>=0.6",
+]
+# Photo -> CAD (photo_rectify/photo_to_sketch). The -contrib- headless OpenCV
+# wheel carries the ArUco marker detector; plain opencv-python would clash.
+photo = [
+    "opencv-contrib-python-headless>=4.10",
+    "ezdxf>=1.3",
 ]
 
 [tool.uv]
