@@ -23,6 +23,7 @@ jobs:
         run: >-
           python -m pip install --upgrade pip pytest ruff
           "mcp>=1.9,<2" numpy trimesh pyransac3d
+          opencv-contrib-python-headless ezdxf
       - name: Ruff lint
         run: python -m ruff check .
       - name: Run tests

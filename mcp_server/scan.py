@@ -744,13 +744,13 @@ def fit_check(scan_path, model_path, clearance_mm=0.0, max_points=_MAX_FIT_POINT
 
     inside = None
     if model_mesh.is_watertight:
-        try:
-            inside = np.zeros(len(pts), dtype=bool)
-            # Chunked: trimesh's pure-python ray backend allocates per query.
-            for i in range(0, len(pts), 800):
-                inside[i:i + 800] = model_mesh.contains(pts[i:i + 800])
-        except Exception:  # noqa: BLE001 - ray backend availability varies
-            inside = None
+        # Inside/outside from the candidate face's outward normal (positive
+        # dot = outside). No ray backend needed — mesh.contains() requires
+        # rtree/embree, which target machines may not have. Near-surface
+        # points at concave edges can misclassify by a hair; real seating
+        # collisions have depth and classify robustly.
+        normals = np.asarray(model_mesh.face_normals)[dst_fidx[idx]]
+        inside = np.einsum('ij,ij->i', pts - closest, normals) < 0.0
 
     report = {
         'scan': scan_path,
@@ -760,9 +760,9 @@ def fit_check(scan_path, model_path, clearance_mm=0.0, max_points=_MAX_FIT_POINT
     }
     if inside is None:
         report['signed'] = False
-        report['note'] = ('Model is not watertight (or no ray backend) — '
-                          'distances are unsigned, collision count unavailable. '
-                          'Repair/re-export the model for a full fit check.')
+        report['note'] = ('Model is not watertight — distances are unsigned, '
+                          'collision count unavailable. Repair/re-export the '
+                          'model for a full fit check.')
         clearance = dist
     else:
         report['signed'] = True
