@@ -24,7 +24,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.11.0'
+VERSION = '1.11.1'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -64,6 +64,8 @@ _READ_ONLY_OPS = frozenset({
     # File writers that do not mutate the design (cache-wise read-only; the
     # server still omits readOnlyHint on them because they write user paths).
     'mesh_export', 'face_groups', 'canvas_list',
+    # Popups: no design mutation.
+    'show_message', 'notify_update',
 })
 
 
@@ -3109,6 +3111,45 @@ def op_import_svg(app, p):
 
 
 # --------------------------------------------------------------------------- #
+# User-facing popups (update notifications and important messages)
+# --------------------------------------------------------------------------- #
+def op_show_message(app, p):
+    """Show a native Fusion information popup to the USER (not the model) —
+    used by the server to announce finished updates and other events the user
+    must see without reading the chat. Modal: blocks this op (and the single
+    op socket) until dismissed, so keep it rare and short."""
+    app.userInterface.messageBox(str(p['text']),
+                                 str(p.get('title') or 'FusionMCP'))
+    return {'shown': True}
+
+
+def op_notify_update(app, p):
+    """Ask the user IN FUSION whether to install a FusionMCP update: a native
+    Yes/No popup showing the new version and its release notes. Returns
+    {'install': bool}; the server applies the update only after a Yes.
+    Driven automatically by the server's startup update check — the popup IS
+    the user's consent, no typed command needed."""
+    ui = app.userInterface
+    notes = (p.get('notes') or '').strip() or '(no release notes)'
+    text = ('A new version of FusionMCP is available.\n\n'
+            'Installed:  %s\n'
+            'Available:  %s\n\n'
+            'Changes:\n%s\n\n'
+            'Install now? Fusion and the MCP client must be restarted '
+            'afterwards.' % (p.get('current') or VERSION, p['version'], notes))
+    try:
+        res = ui.messageBox(text, 'FusionMCP update',
+                            adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+                            adsk.core.MessageBoxIconTypes.QuestionIconType)
+        agreed = res == adsk.core.DialogResults.DialogYes
+    except Exception:  # noqa: BLE001 - enum shapes vary; fall back to info-only
+        ui.messageBox(text + '\n\n(Install via apply_update in the MCP chat.)',
+                      'FusionMCP update')
+        agreed = False
+    return {'install': agreed, 'version': p['version']}
+
+
+# --------------------------------------------------------------------------- #
 # Drawings (2D documentation)
 # --------------------------------------------------------------------------- #
 def op_mesh_compare(app, p):
@@ -5367,6 +5408,9 @@ DISPATCH = {
     'canvas_update': op_canvas_update,
     'canvas_delete': op_canvas_delete,
     'import_svg': op_import_svg,
+    # v1.11.1: user-facing update popups
+    'show_message': op_show_message,
+    'notify_update': op_notify_update,
 }
 
 

@@ -34,7 +34,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Create GitHub release with generated notes
+      # Release body = the CHANGELOG.md section for this tag (user-facing
+      # Added/Fixed lists — shown by the in-Fusion update popup), plus the
+      # auto-generated compare link appended by generate_release_notes.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          awk -v tag="$GITHUB_REF_NAME" '
+            $0 ~ "^## " tag "( |$)" { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if ! [ -s RELEASE_NOTES.md ]; then
+            echo "No CHANGELOG.md section for $GITHUB_REF_NAME" > RELEASE_NOTES.md
+          fi
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true

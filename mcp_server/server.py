@@ -13,8 +13,11 @@ Conventions
 * Sketch planes: "XY" | "XZ" | "YZ", or a planar-face token.
 * Axes: "X" | "Y" | "Z", or a token (sketch line / edge).
 """
+import contextlib
 import json
 import os
+import threading
+import time
 
 import photo
 import scan
@@ -1314,6 +1317,15 @@ def canvas_delete(canvas: str) -> dict:
 
 
 @mcp.tool()
+def show_message(text: str, title: str = 'FusionMCP') -> dict:
+    """Show a native popup dialog inside Fusion so the USER sees a message
+    without reading the chat — announce a finished long job or something
+    that needs their attention at the machine. Modal: blocks further tool
+    calls until dismissed, so use sparingly and keep the text short."""
+    return _call('show_message', text=text, title=title)
+
+
+@mcp.tool()
 def import_svg(path: str, sketch: str = '', plane: str = 'XY',
                scale: float = 0.0, flip_h: bool = False,
                flip_v: bool = False) -> dict:
@@ -2108,6 +2120,52 @@ def cam_to_gcode(post: str = 'fanuc.cps') -> str:
     )
 
 
+def _update_popup_worker(check_thread, attempts=30, retry_delay=60):
+    """Surface a pending update to the USER as a native Fusion popup — no
+    typed command needed. Waits for the startup update check, asks in Fusion
+    via the notify_update op (Yes/No with release notes), applies the update
+    on Yes and reports the outcome with a second popup. Quietly retries while
+    Fusion is not running yet; gives up silently after ~30 min (the model
+    notice from consume_notice still covers that case). Safe alongside tool
+    calls: FusionClient.call serialises the socket under a lock. Opt out with
+    FUSION_MCP_UPDATE_POPUP=off."""
+    if os.environ.get('FUSION_MCP_UPDATE_POPUP', '').lower() == 'off':
+        return
+    if check_thread is not None:
+        check_thread.join(timeout=120)
+    info = updater.pending_info()
+    if not info or not info.get('update_available'):
+        return
+    payload = {
+        'version': info.get('latest_version'),
+        'current': updater.LOCAL_VERSION,
+        'notes': updater.plain_notes(info.get('release_notes')),
+    }
+    answer = None
+    for _ in range(attempts):
+        try:
+            answer = fusion.call('notify_update', payload)
+            break
+        except FusionNotConnected:
+            time.sleep(retry_delay)
+        except FusionError:
+            # Older add-in without the notify_update op — the model-facing
+            # notice still announces the update in chat.
+            return
+    if not (isinstance(answer, dict) and answer.get('install')):
+        return
+    result = updater.apply(confirm=True)
+    if result.get('applied'):
+        text = ('FusionMCP was updated to %s.\n\nTo finish: fully restart '
+                'Fusion (not just add-in Stop/Run) and restart the MCP '
+                'client.' % result.get('new_version'))
+    else:
+        text = ('FusionMCP update was not installed: %s'
+                % result.get('reason', 'unknown error'))
+    with contextlib.suppress(Exception):
+        fusion.call('show_message', {'title': 'FusionMCP update', 'text': text})
+
+
 @mcp.prompt()
 def assemble_components() -> str:
     """Guide the model to build a multi-component assembly with joints."""
@@ -2123,5 +2181,7 @@ if __name__ == '__main__':
     # Non-blocking: checks GitHub and pre-downloads a newer version so the
     # first tool result can announce it (with release notes). Installation
     # still happens only via apply_update(confirm=True).
-    updater.start_background_check()
+    check_thread = updater.start_background_check()
+    threading.Thread(target=_update_popup_worker, args=(check_thread,),
+                     name='fusionmcp-update-popup', daemon=True).start()
     mcp.run()

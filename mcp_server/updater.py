@@ -287,6 +287,35 @@ def start_background_check():
     return t
 
 
+def pending_info():
+    """Non-consuming snapshot of the startup check result (or None while the
+    check is still running). Used by the server's popup worker; consume_notice
+    stays the one-shot channel for the model-facing notice."""
+    with _pending_lock:
+        return dict(_pending) if _pending else None
+
+
+def plain_notes(notes, limit=1200):
+    """Flatten GitHub-flavoured release notes into plain popup text: strip
+    markdown emphasis/headers, normalise bullets, collapse blank runs and
+    truncate with an ellipsis (Fusion message boxes are small)."""
+    if not notes:
+        return ''
+    lines = []
+    for raw in str(notes).splitlines():
+        line = raw.strip()
+        line = re.sub(r'^#+\s*', '', line)          # headers -> plain
+        line = re.sub(r'^[*+]\s+', '- ', line)      # bullets -> "- "
+        line = line.replace('**', '').replace('`', '')
+        line = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', line)  # [t](url) -> t
+        if line or (lines and lines[-1]):
+            lines.append(line)
+    text = '\n'.join(lines).strip()
+    if len(text) > limit:
+        text = text[:limit].rsplit('\n', 1)[0].rstrip() + '\n…'
+    return text
+
+
 def consume_notice():
     """One-shot pending-update notice for the first tool result of a session,
     or None. Includes the release notes so the user sees what changed."""
@@ -321,7 +350,9 @@ def _git(root, *args):
 
 
 def _apply_git(root):
-    dirty = _git(root, 'status', '--porcelain')
+    # --untracked-files=no: stray untracked files (handoff notes, .claude/)
+    # must not block a fast-forward pull — only real local edits conflict.
+    dirty = _git(root, 'status', '--porcelain', '--untracked-files=no')
     if dirty.stdout.strip():
         return {'applied': False, 'method': 'git',
                 'reason': 'The install has uncommitted local changes. Commit/stash '
