@@ -108,27 +108,39 @@ def check(path, process='fdm', axis='z', min_draft_deg=1.0, min_wall=1.0,
 
         # Undercuts: a cavity-side face (along > 0) must see open sky along
         # +pull; a core-side face along -pull. Shadowed faces cannot release.
+        # trimesh's ray backend needs rtree — degrade to a clear note when it
+        # is missing instead of failing the whole report.
         undercut = np.zeros(len(areas), dtype=bool)
         capped = False
+        ray_error = None
         for sign in (1.0, -1.0):
             side = along * sign > 0.1
             candidates = np.nonzero(side)[0]
             order = candidates[np.argsort(areas[candidates])[::-1]]
             origins = centroids[order] + normals[order] * eps
-            hit, was_capped = _occluded(mesh, np, origins, pull * sign)
+            try:
+                hit, was_capped = _occluded(mesh, np, origins, pull * sign)
+            except Exception as exc:  # noqa: BLE001 - missing rtree etc.
+                ray_error = str(exc)
+                break
             undercut[order[:len(hit)]] |= hit
             capped |= was_capped
-        frac = float(areas[undercut].sum() / total)
-        report['undercuts'] = {
-            'area_fraction': round(frac, 3),
-            'worst': _worst(np, centroids, areas, undercut),
-            'ray_capped': capped,
-        }
-        if frac > 0.005:
-            recommendations.append(
-                'Shadowed (undercut) surfaces detected (%.1f%% of area) — '
-                'they need side actions/lifters or a redesign to release '
-                'along the pull direction.' % (100 * frac))
+        if ray_error is not None:
+            report['undercuts'] = {
+                'error': 'undercut ray test unavailable (%s) — pip install '
+                         'rtree to enable it' % ray_error}
+        else:
+            frac = float(areas[undercut].sum() / total)
+            report['undercuts'] = {
+                'area_fraction': round(frac, 3),
+                'worst': _worst(np, centroids, areas, undercut),
+                'ray_capped': capped,
+            }
+            if frac > 0.005:
+                recommendations.append(
+                    'Shadowed (undercut) surfaces detected (%.1f%% of area) '
+                    '— they need side actions/lifters or a redesign to '
+                    'release along the pull direction.' % (100 * frac))
 
         walls = scan._wall_thickness(mesh, scale)
         report['walls'] = walls
@@ -154,19 +166,25 @@ def check(path, process='fdm', axis='z', min_draft_deg=1.0, min_wall=1.0,
         candidates = np.nonzero(up)[0]
         order = candidates[np.argsort(areas[candidates])[::-1]]
         origins = centroids[order] + normals[order] * eps
-        hit, capped = _occluded(mesh, np, origins, pull)
-        blocked = np.zeros(len(areas), dtype=bool)
-        blocked[order[:len(hit)]] = hit
-        frac_blocked = float(areas[blocked].sum() / total)
         report['down_facing'] = {
             'area_fraction': round(frac_down, 3),
             'worst': _worst(np, centroids, areas, down),
         }
-        report['occluded_from_above'] = {
-            'area_fraction': round(frac_blocked, 3),
-            'worst': _worst(np, centroids, areas, blocked),
-            'ray_capped': capped,
-        }
+        blocked = np.zeros(len(areas), dtype=bool)
+        frac_blocked = 0.0
+        try:
+            hit, capped = _occluded(mesh, np, origins, pull)
+            blocked[order[:len(hit)]] = hit
+            frac_blocked = float(areas[blocked].sum() / total)
+            report['occluded_from_above'] = {
+                'area_fraction': round(frac_blocked, 3),
+                'worst': _worst(np, centroids, areas, blocked),
+                'ray_capped': capped,
+            }
+        except Exception as exc:  # noqa: BLE001 - missing rtree etc.
+            report['occluded_from_above'] = {
+                'error': 'occlusion ray test unavailable (%s) — pip install '
+                         'rtree to enable it' % exc}
         if frac_down > 0.01:
             recommendations.append(
                 'Down-facing surfaces (%.0f%% of area) cannot be machined '

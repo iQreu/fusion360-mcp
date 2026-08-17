@@ -24,7 +24,7 @@ jobs:
         # of silently skipping.
         run: >-
           python -m pip install --upgrade pip pytest ruff
-          "mcp>=1.9,<2" numpy trimesh pyransac3d
+          "mcp>=1.9,<2" numpy trimesh pyransac3d rtree
           opencv-contrib-python-headless ezdxf
       - name: Ruff lint
         run: python -m ruff check .

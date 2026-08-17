@@ -26,6 +26,8 @@ re = [
     "numpy>=1.26",
     "trimesh>=4.0",
     "pyransac3d>=0.6",
+    # trimesh's ray backend (wall thickness, dfm occlusion) needs rtree.
+    "rtree>=1.0",
 ]
 # Photo -> CAD (photo_rectify/photo_to_sketch). The -contrib- headless OpenCV
 # wheel carries the ArUco marker detector; plain opencv-python would clash.
