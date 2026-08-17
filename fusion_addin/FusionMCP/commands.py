@@ -24,7 +24,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.11.1'
+VERSION = '1.12.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -3150,6 +3150,309 @@ def op_notify_update(app, p):
 
 
 # --------------------------------------------------------------------------- #
+# v1.12: workshop wave — loft from sections, silhouette, sketch doctor,
+# drawing tables, fastener refresh
+# --------------------------------------------------------------------------- #
+def op_loft_from_sections(app, p):
+    """Build a loft body from scan_sections / scan_cavity_sections output in
+    ONE call: per section {level_mm, points_mm: [[u, v], ...]} an offset
+    construction plane and one CLOSED fitted spline are created on `plane`
+    (XY|XZ|YZ or a plane token), then every profile is lofted. rail=True adds
+    a centreline rail through each section's first point — the cure for
+    scalloped lofts with smooth profiles. operation: new|join|cut|intersect.
+    Sections must share point ordering and start anchor (scan_cavity_sections
+    output already does; never feed raw unordered polylines)."""
+    root = _root(app)
+    base = _resolve_plane(app, p.get('plane', 'XY'))
+    sections = p.get('sections') or []
+    if len(sections) < 2:
+        raise ValueError('Need at least 2 sections with points_mm')
+    planes = root.constructionPlanes
+    made = []
+    anchors_world = []
+    for sec in sections:
+        pts = sec.get('points_mm') or []
+        if len(pts) < 3:
+            raise ValueError('Each section needs >= 3 points_mm')
+        level = float(sec.get('level_mm', 0.0))
+        plane = base
+        if abs(level) > 1e-9:
+            cin = planes.createInput()
+            cin.setByOffset(base, _vi(level * MM))
+            plane = planes.add(cin)
+        sk = root.sketches.add(plane)
+        coll = adsk.core.ObjectCollection.create()
+        for u, v in pts:
+            coll.add(adsk.core.Point3D.create(u * MM, v * MM, 0.0))
+        spline = sk.sketchCurves.sketchFittedSplines.add(coll)
+        with contextlib.suppress(Exception):
+            spline.isClosed = True
+        if sk.profiles.count == 0:
+            raise RuntimeError(
+                'Section at %.2f mm produced no closed profile — points may '
+                'self-intersect after the spline fit; decimate or clean them.'
+                % level)
+        made.append(sk)
+        with contextlib.suppress(Exception):
+            anchors_world.append(sk.sketchToModelSpace(
+                adsk.core.Point3D.create(pts[0][0] * MM, pts[0][1] * MM, 0.0)))
+    lofts = root.features.loftFeatures
+    lin = lofts.createInput(_operation(p.get('operation')))
+    for sk in made:
+        lin.loftSections.add(sk.profiles.item(0))
+    used_rail = False
+    if p.get('rail') and len(anchors_world) == len(made):
+        with contextlib.suppress(Exception):
+            rail_sk = root.sketches.add(base)
+            coll = adsk.core.ObjectCollection.create()
+            for w in anchors_world:
+                coll.add(rail_sk.modelToSketchSpace(w))
+            rail = rail_sk.sketchCurves.sketchFittedSplines.add(coll)
+            lin.centerLineOrRails.addRail(rail)
+            used_rail = True
+    feat = lofts.add(lin)
+    bodies = [{'token': _registry.add('bdy', b), 'name': b.name}
+              for b in feat.bodies]
+    return {'bodies': bodies, 'sections': len(made), 'rail': used_rail,
+            'sketches': [_registry.add('skt', sk) for sk in made]}
+
+
+def _stroke_curves_into_sketch(sk, bodies, tolerance_cm):
+    """Sample every edge of the given (temporary) BRep bodies into fitted
+    splines on sketch `sk`. Returns the number of curves created."""
+    count = 0
+    for body in bodies:
+        for edge in getattr(body, 'edges', []) or []:
+            with contextlib.suppress(Exception):
+                ev = edge.evaluator
+                ok, start, end = ev.getParameterExtents()
+                if not ok:
+                    continue
+                ok, pts = ev.getStrokes(start, end, tolerance_cm)
+                if not ok or len(pts) < 2:
+                    continue
+                coll = adsk.core.ObjectCollection.create()
+                for pt in pts:
+                    coll.add(sk.modelToSketchSpace(pt))
+                sk.sketchCurves.sketchFittedSplines.add(coll)
+                count += 1
+    return count
+
+
+def op_silhouette(app, p):
+    """EXPERIMENTAL (April 2026+ preview): project the outline of a body or
+    mesh along a view direction into a new sketch — cutting templates and
+    gaskets from any angle; export with export_sketch_dxf. Pass body= (BRep
+    token; TemporaryBRepManager.createSilhouetteCurves) or mesh= (mesh token;
+    MeshBody.silhouette). direction: "x"|"y"|"z" or [x, y, z]; the curves
+    land on `plane` (default XY)."""
+    root = _root(app)
+    d = p.get('direction', 'z')
+    if isinstance(d, (list, tuple)):
+        vec = adsk.core.Vector3D.create(*[float(v) for v in d])
+    else:
+        axes = {'x': (1.0, 0.0, 0.0), 'y': (0.0, 1.0, 0.0),
+                'z': (0.0, 0.0, 1.0)}
+        key = str(d).lower()
+        if key not in axes:
+            raise ValueError('direction must be x|y|z or [x,y,z], got %r' % d)
+        vec = adsk.core.Vector3D.create(*axes[key])
+
+    result = None
+    if p.get('mesh'):
+        m = _registry.get(p['mesh'])
+        fn = getattr(m, 'silhouette', None)
+        if fn is None:
+            raise RuntimeError('MeshBody.silhouette is not available in this '
+                               'Fusion build (needs April 2026+).')
+        try:
+            result = fn(vec)
+        except TypeError as exc:
+            raise RuntimeError('MeshBody.silhouette signature mismatch on '
+                               'this build (%s) — run api_introspect('
+                               '"MeshBody") and report it.' % exc)
+    else:
+        body = _registry.get(p['body'])
+        tbm = adsk.fusion.TemporaryBRepManager.get()
+        fn = getattr(tbm, 'createSilhouetteCurves', None)
+        if fn is None:
+            raise RuntimeError('TemporaryBRepManager.createSilhouetteCurves '
+                               'is not available in this Fusion build.')
+        try:
+            result = fn(body, vec, True)
+        except TypeError:
+            result = fn(body, vec)
+
+    # Normalise the result to a list of things with .edges; the preview APIs
+    # return an ObjectCollection of temporary wire bodies.
+    items = []
+    if result is not None:
+        if hasattr(result, 'count') and hasattr(result, 'item'):
+            items = [result.item(i) for i in range(result.count)]
+        elif isinstance(result, (list, tuple)):
+            items = list(result)
+        else:
+            items = [result]
+    items = [it for it in items if hasattr(it, 'edges')]
+    if not items:
+        raise RuntimeError(
+            'Silhouette returned no usable curve bodies (got %r) — the '
+            'preview API shape changed; run api_introspect and report it.'
+            % (type(result).__name__ if result is not None else None))
+
+    sk = root.sketches.add(_resolve_plane(app, p.get('plane', 'XY')))
+    count = _stroke_curves_into_sketch(sk, items, 0.02)  # 0.2 mm tolerance
+    if not count:
+        with contextlib.suppress(Exception):
+            sk.deleteMe()
+        raise RuntimeError('Silhouette produced no sketch curves.')
+    return {'sketch': _registry.add('skt', sk), 'curves': count,
+            'profiles': sk.profiles.count}
+
+
+def op_sketch_doctor(app, p):
+    """One-stop sketch health check and repair: per sketch (token, or every
+    root sketch) — fully-constrained state, Fusion's own health state and
+    error/warning message, profile count and open endpoints; with fix=True
+    also runs Fusion's auto-constrain on under-constrained sketches and
+    reports how many constraints were added. Follow up remaining gaps with
+    sketch_dimension."""
+    status = op_sketch_status(app, p)
+    fix = bool(p.get('fix'))
+    health_names = {}
+    with contextlib.suppress(Exception):
+        holder = adsk.fusion.FeatureHealthStates
+        for attr in dir(holder):
+            value = getattr(holder, attr, None)
+            if isinstance(value, int):
+                health_names[value] = attr
+    for entry in status['sketches']:
+        sk = _registry.get(entry['token'])
+        with contextlib.suppress(Exception):
+            hs = sk.healthState
+            entry['health'] = health_names.get(hs, hs)
+        with contextlib.suppress(Exception):
+            msg = sk.errorOrWarningMessage
+            if msg:
+                entry['message'] = msg
+        if fix and not entry.get('fully_constrained', True):
+            gc = sk.geometricConstraints
+            before = None
+            with contextlib.suppress(Exception):
+                before = gc.count
+            applied = False
+            with contextlib.suppress(Exception):
+                cin = gc.createAutoConstrainInput()
+                gc.autoConstrain(cin)
+                applied = True
+            if not applied:
+                with contextlib.suppress(Exception):
+                    gc.autoConstrain()
+                    applied = True
+            entry['auto_constrained'] = applied
+            if applied and before is not None:
+                with contextlib.suppress(Exception):
+                    entry['constraints_added'] = gc.count - before
+            with contextlib.suppress(Exception):
+                entry['fully_constrained_after'] = bool(sk.isFullyConstrained)
+    status['fix'] = fix
+    return status
+
+
+def op_drawing_table(app, p):
+    """Add a custom table to the ACTIVE drawing's sheet (Fusion July 2026+
+    preview): data = rows of cell strings (first row = header), optional
+    title and position_mm [x, y]. Open/create the drawing first
+    (create_drawing); cut lists, parameter tables and mini-BOMs land right
+    on the sheet."""
+    doc = app.activeDocument
+    product = doc.products.itemByProductType('DrawingProductType') if doc else None
+    if not product:
+        raise RuntimeError('The active document is not a drawing — run '
+                           'create_drawing (or open the drawing tab) first.')
+    try:
+        import adsk.drawing
+        drawing = adsk.drawing.Drawing.cast(product) or product
+    except ImportError:
+        drawing = product
+    sheet = getattr(drawing, 'activeSheet', None)
+    if sheet is None:
+        with contextlib.suppress(Exception):
+            sheet = drawing.sheets.item(0)
+    if sheet is None:
+        raise RuntimeError('The drawing has no sheets.')
+    tables = getattr(sheet, 'customTables', None)
+    if tables is None:
+        raise RuntimeError('Sheet.customTables is not available in this '
+                           'Fusion build (preview, July 2026+).')
+    data = p.get('data') or []
+    if not data or not all(isinstance(row, list) and row for row in data):
+        raise ValueError('data must be a non-empty list of non-empty rows')
+    rows, cols = len(data), max(len(row) for row in data)
+    try:
+        tin = tables.createInput()
+    except TypeError:
+        tin = tables.createInput(rows, cols)
+    for attr, value in (('rowCount', rows), ('numberOfRows', rows),
+                        ('columnCount', cols), ('numberOfColumns', cols)):
+        with contextlib.suppress(Exception):
+            setattr(tin, attr, value)
+    if p.get('title'):
+        with contextlib.suppress(Exception):
+            tin.title = p['title']
+    if p.get('position_mm'):
+        with contextlib.suppress(Exception):
+            x, y = p['position_mm']
+            tin.position = adsk.core.Point2D.create(float(x) * MM,
+                                                    float(y) * MM)
+    table = tables.add(tin)
+    filled = 0
+    for r, row in enumerate(data):
+        for c, cell in enumerate(row):
+            for setter in ('setCellData', 'setCellText', 'setCellValue'):
+                fn = getattr(table, setter, None)
+                if fn is None:
+                    continue
+                with contextlib.suppress(Exception):
+                    fn(r, c, str(cell))
+                    filled += 1
+                    break
+    return {'rows': rows, 'columns': cols, 'cells_set': filled,
+            'sheet': getattr(sheet, 'name', None)}
+
+
+def op_fastener_update_size(app, p):
+    """Refresh inserted Content-Library fasteners after their host geometry
+    changed (Fusion July 2026+ preview): finds every occurrence backed by a
+    FastenerOccurrenceDefinition and calls updateSize() so screw
+    diameter/length re-match the plates they clamp."""
+    root = _root(app)
+    out = []
+    occs = root.allOccurrences
+    for i in range(occs.count):
+        occ = occs.item(i)
+        definition = getattr(occ, 'definition', None)
+        if definition is None or 'fastener' not in \
+                str(getattr(definition, 'objectType', '')).lower():
+            continue
+        entry = {'occurrence': occ.name}
+        with contextlib.suppress(Exception):
+            entry['size_up_to_date'] = bool(definition.isSizeUpToDate)
+        if not entry.get('size_up_to_date', False):
+            try:
+                definition.updateSize()
+                entry['updated'] = True
+            except Exception as exc:  # noqa: BLE001 - per-fastener report
+                entry['error'] = str(exc)
+        out.append(entry)
+    if not out:
+        return {'fasteners': [], 'count': 0,
+                'note': 'No Content-Library fasteners found (they must be '
+                        'inserted via the Fusion UI; needs July 2026+).'}
+    return {'fasteners': out, 'count': len(out)}
+
+
+# --------------------------------------------------------------------------- #
 # Drawings (2D documentation)
 # --------------------------------------------------------------------------- #
 def op_mesh_compare(app, p):
@@ -3250,6 +3553,29 @@ def _create_drawing_via_manager(app, drawing_mod, p):
             {'mm': 'MillimeterDrawingUnitType', 'in': 'InchDrawingUnitType'}.get(units),))
         if value is not None:
             din.units = value
+    # Automation preferences (July 2026 preview): the generator can lay out
+    # views AND dimensions by itself. Property names are probed by keyword —
+    # the preview surface renames members between builds.
+    if p.get('auto_dimension') is not None or p.get('flat_pattern') is not None:
+        with contextlib.suppress(Exception):
+            ap = din.automationPreferences
+            holders = [ap]
+            for name in ('globalPreferences', 'mainAssemblyPreferences',
+                         'flatPatternPreferences'):
+                holder = getattr(ap, name, None)
+                if holder is not None:
+                    holders.append(holder)
+            for holder in holders:
+                for attr in dir(holder):
+                    low = attr.lower()
+                    if p.get('auto_dimension') is not None and \
+                            'dimension' in low and low.startswith('is'):
+                        with contextlib.suppress(Exception):
+                            setattr(holder, attr, bool(p['auto_dimension']))
+                    if p.get('flat_pattern') is not None and \
+                            'flatpattern' in low and low.startswith('is'):
+                        with contextlib.suppress(Exception):
+                            setattr(holder, attr, bool(p['flat_pattern']))
     created = mgr.createDrawing(din)
     out = {'headless': True, 'api': 'DrawingManager'}
     with contextlib.suppress(Exception):
@@ -5411,6 +5737,12 @@ DISPATCH = {
     # v1.11.1: user-facing update popups
     'show_message': op_show_message,
     'notify_update': op_notify_update,
+    # v1.12.0: workshop wave
+    'loft_from_sections': op_loft_from_sections,
+    'silhouette': op_silhouette,
+    'sketch_doctor': op_sketch_doctor,
+    'drawing_table': op_drawing_table,
+    'fastener_update_size': op_fastener_update_size,
 }
 
 

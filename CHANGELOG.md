@@ -5,6 +5,32 @@ The section matching the pushed tag becomes the GitHub release body
 `fusionmcp_update` notice show to the user — keep entries short, user-facing
 and grouped under **Added / Fixed / Changed**.
 
+## v1.12.0 — 2026-08-17
+
+### Added
+- `print_estimate`: slice an exported STL with your installed slicer
+  (PrusaSlicer / OrcaSlicer / Bambu Studio, auto-detected) and get print
+  time, filament grams and cost — with your own profile and prices.
+- `fastener_lookup` + `hole_spec`: metric fastener tables (ISO/DIN M2-M12)
+  — clearance/tapped/heat-set-insert holes, counterbores, suggested bolt
+  lengths — ready for the hole tool.
+- `dfm_check`: design-for-manufacturing report — FDM (bed/overhangs/walls),
+  injection molding (draft angles, undercuts) and 3-axis CNC (unreachable
+  surfaces, flip advice).
+- `loft_from_sections`: one call from scan_sections/scan_cavity_sections
+  output to a lofted body (offset planes + closed fitted splines + optional
+  centreline rail).
+- `sketch_doctor`: sketch health + auto-constrain repair in one call.
+- `drawing_table` and create_drawing `auto_dimension`/`flat_pattern`
+  automation options (July 2026 preview) — auto-generated drawings with
+  dimensions and custom tables on the sheet.
+- `silhouette` (experimental): body/mesh outline along any direction into a
+  sketch — cutting templates via export_sketch_dxf.
+- `fastener_update_size`: refresh Content-Library screws after geometry
+  changes (preview).
+- `FUSIONMCP_TOOLSETS` env var trims the tool list to named groups for
+  clients without tool search.
+
 ## v1.11.1 — 2026-08-17
 
 ### Added

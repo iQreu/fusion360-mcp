@@ -19,8 +19,11 @@ import os
 import threading
 import time
 
+import dfm
+import fasteners
 import photo
 import scan
+import slicer
 import updater
 import viewer
 from fusion_client import FusionClient, FusionError, FusionNotConnected
@@ -1340,18 +1343,78 @@ def import_svg(path: str, sketch: str = '', plane: str = 'XY',
 @mcp.tool()
 def create_drawing(template: str = '', headless: bool = True,
                    sheet_size: str = '', orientation: str = '',
-                   standard: str = '', drawing_units: str = '') -> dict:
+                   standard: str = '', drawing_units: str = '',
+                   auto_dimension: int = -1, flat_pattern: int = -1) -> dict:
     """Create a drawing for the active design. Fusion July 2026+ does this
     fully headlessly (DrawingManager API): optional `template` file,
     sheet_size ("A0".."A4" ISO or "A".."E" ASME), orientation
     ("landscape"|"portrait"), standard ("iso"|"asme"), drawing_units
-    ("mm"|"in"). Older versions fall back to a bare drawing document or the
-    "Drawing from Design" dialog, which the user completes in the UI. Then
-    export with drawing_export. For fully scripted 2D output without a
-    drawing sheet use export_sketch_dxf / export_flat_pattern."""
+    ("mm"|"in"). auto_dimension=1 asks the generator to place dimensions
+    automatically and flat_pattern=1 to add sheet-metal flat-pattern sheets
+    (July 2026 preview automation; -1 leaves Fusion defaults). Older
+    versions fall back to a bare drawing document or the "Drawing from
+    Design" dialog. Then export with drawing_export; add tables with
+    drawing_table. For 2D output without a sheet use export_sketch_dxf /
+    export_flat_pattern."""
     return _call('create_drawing', template=template or None, headless=headless,
                  sheet_size=sheet_size or None, orientation=orientation or None,
-                 standard=standard or None, drawing_units=drawing_units or None)
+                 standard=standard or None, drawing_units=drawing_units or None,
+                 auto_dimension=None if auto_dimension < 0 else bool(auto_dimension),
+                 flat_pattern=None if flat_pattern < 0 else bool(flat_pattern))
+
+
+@mcp.tool()
+def drawing_table(data: list[list[str]], title: str = '',
+                  position_mm: list[float] = []) -> dict:
+    """Add a custom table to the active drawing's sheet (Fusion July 2026+
+    preview): `data` is rows of cell strings, first row = header — cut
+    lists, parameter tables, mini-BOMs right on the sheet. Open/create the
+    drawing first (create_drawing)."""
+    return _call('drawing_table', data=data, title=title or None,
+                 position_mm=position_mm or None)
+
+
+@mcp.tool()
+def loft_from_sections(sections: list[dict], plane: str = 'XY',
+                       operation: str = 'new', rail: bool = False) -> dict:
+    """Loft a body straight from scan_sections / scan_cavity_sections output:
+    per section {level_mm, points_mm: [[u,v],...]} this creates the offset
+    plane + closed fitted spline and lofts all profiles in one call (the
+    manual multi-batch rebuild, automated). rail=True threads a centreline
+    rail through each section's first point — use it when profiles are
+    smooth and the loft shows scalloping. operation: new|join|cut|intersect.
+    Verify cavity fits afterwards with scan_fit_check."""
+    return _call('loft_from_sections', sections=sections, plane=plane,
+                 operation=operation, rail=rail)
+
+
+@mcp.tool()
+def silhouette(body: str = '', mesh: str = '', direction: str = 'z',
+               plane: str = 'XY') -> dict:
+    """EXPERIMENTAL (Fusion April 2026+): project a body's or mesh's outline
+    along a view direction into a new sketch — cutting templates and gasket
+    outlines from any angle; export with export_sketch_dxf. Pass body= (BRep
+    token) or mesh= (mesh token); direction "x"|"y"|"z"."""
+    return _call('silhouette', body=body or None, mesh=mesh or None,
+                 direction=direction, plane=plane)
+
+
+@mcp.tool()
+def sketch_doctor(sketch: str = '', fix: bool = False) -> dict:
+    """Sketch health check and repair in one call: per sketch (token, or all)
+    — fully-constrained state, Fusion's health state and error message,
+    profiles and open endpoints; fix=True also runs auto-constrain on
+    under-constrained sketches and reports the constraint delta. Finish the
+    remaining degrees of freedom with sketch_dimension."""
+    return _call('sketch_doctor', sketch=sketch or None, fix=fix)
+
+
+@mcp.tool()
+def fastener_update_size() -> dict:
+    """Refresh inserted Content-Library fasteners after host geometry changed
+    (Fusion July 2026+ preview): re-runs sizing on every fastener occurrence
+    so screw diameter/length match the plates again."""
+    return _call('fastener_update_size')
 
 
 @mcp.tool()
@@ -1545,6 +1608,79 @@ def photo_to_sketch(image: str, mm_per_px: float, dxf_path: str = '',
                                    epsilon_mm=epsilon_mm,
                                    min_area_mm2=min_area_mm2, holes=holes,
                                    blur_px=blur_px)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# Workshop tools — run IN THE SERVER PROCESS: slicing estimates (external
+# slicer CLI), fastener data (vendored standards tables), DFM heuristics.
+# --------------------------------------------------------------------------- #
+# NOT readOnlyHint: runs an external slicer and can write the G-code file.
+@mcp.tool()
+def print_estimate(model_path: str, profile: str = '', slicer_name: str = 'auto',
+                   gcode_out: str = '', material: str = 'pla',
+                   price_per_kg: float = 0.0, printer_watts: float = 0.0,
+                   energy_price_kwh: float = 0.0) -> dict:
+    """Slice an exported STL/3MF with the user's installed slicer
+    (PrusaSlicer / OrcaSlicer / Bambu Studio, auto-detected) and report print
+    time, filament grams and cost — model to "how long and how much" in one
+    call after export("stl", ...). profile: a config exported from the
+    slicer GUI (PrusaSlicer .ini, or "machine.json;process.json" for
+    Orca/Bambu); without one PrusaSlicer slices with generic defaults.
+    gcode_out keeps the G-code. Cost adds price_per_kg (your filament price)
+    and optionally printer_watts x energy_price_kwh."""
+    try:
+        return slicer.estimate(model_path, profile=profile or None,
+                               slicer=slicer_name, gcode_out=gcode_out or None,
+                               material=material,
+                               price_per_kg=price_per_kg or None,
+                               printer_watts=printer_watts or None,
+                               energy_price_kwh=energy_price_kwh or None)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def fastener_lookup(size: str) -> dict:
+    """Metric fastener data (ISO/DIN via the BOLTS tables, mm): coarse pitch,
+    tap drill, clearance holes (close/normal/loose), socket/hex head, nut,
+    washer and counterbore envelope, heat-set insert hole — everything
+    needed to model around a screw. Sizes M2-M12."""
+    try:
+        return fasteners.lookup(size)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def hole_spec(size: str, kind: str = 'clearance', fit: str = 'normal',
+              head: str = 'none', material_thickness: float = 0.0) -> dict:
+    """The exact hole to model for a metric screw, ready for the `hole` tool:
+    kind "clearance" (fit close|normal|loose), "tapped" (tap drill + thread
+    designation) or "heat_set" (FDM brass-insert pocket). head "counterbore"
+    (socket head sits flush) or "countersink" adds the head recess;
+    material_thickness suggests a bolt length."""
+    try:
+        return fasteners.hole_spec(
+            size, kind=kind, fit=fit, head=head,
+            material_thickness=material_thickness or None)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def dfm_check(path: str, process: str = 'fdm', axis: str = 'z',
+              min_draft_deg: float = 1.0, min_wall: float = 1.0) -> dict:
+    """Design-for-manufacturing check of an exported mesh (export("stl")
+    first). process: "fdm" (bed fit, overhangs, thin walls), "injection"
+    (draft angles vs the pull `axis`, undercut detection by ray occlusion,
+    uniform-wall), "cnc3axis" (down-facing surfaces and pockets a straight
+    tool cannot reach, flip-setup advice). Transparent trimesh heuristics —
+    area fractions, worst offender locations and recommendations."""
+    try:
+        return dfm.check(path, process=process, axis=axis,
+                         min_draft_deg=min_draft_deg, min_wall=min_wall)
     except Exception as exc:  # noqa: BLE001
         return {'error': str(exc)}
 
@@ -2120,6 +2256,58 @@ def cam_to_gcode(post: str = 'fanuc.cps') -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Toolsets — trim the tool list for clients without tool search (Claude
+# Desktop). FUSIONMCP_TOOLSETS="scan,photo" keeps 'core' plus the named
+# groups; unset = every tool. Server-side convention (GitHub-MCP style) —
+# the protocol has no toolset mechanism.
+# --------------------------------------------------------------------------- #
+_TOOLSET_RULES = (
+    ('scan', ('scan_', 'mesh_', 'import_mesh', 'face_groups')),
+    ('photo', ('photo_', 'canvas_', 'import_svg')),
+    ('cam', ('cam_',)),
+    ('drawing', ('create_drawing', 'drawing_', 'export_sketch_dxf',
+                 'export_flat_pattern')),
+    ('electronics', ('electronics_',)),
+    ('print', ('print_estimate', 'print_check', 'dfm_check',
+               'fastener_lookup', 'hole_spec', 'insert_fastener',
+               'fastener_update_size')),
+    ('sheetmetal', ('fold', 'join_by_bend', 'corner_closure', 'flat_pattern')),
+    ('data', ('data_folders', 'version_history', 'share_link',
+              'list_documents', 'open_document')),
+    ('diag', ('design_diagnostics', 'sketch_status', 'sketch_doctor',
+              'interference', 'mass_properties', 'api_introspect')),
+)
+
+
+def _toolset_of(name):
+    for group, prefixes in _TOOLSET_RULES:
+        for prefix in prefixes:
+            if name == prefix or name.startswith(prefix):
+                return group
+    return 'core'
+
+
+def _apply_toolsets():
+    """Drop tools outside FUSIONMCP_TOOLSETS (+ implicit 'core') from the
+    FastMCP registry. Best-effort over a private SDK surface: any failure
+    leaves the full tool list, never breaks startup."""
+    raw = os.environ.get('FUSIONMCP_TOOLSETS', '').strip()
+    if not raw:
+        return None
+    wanted = {part.strip().lower() for part in raw.split(',') if part.strip()}
+    wanted.add('core')
+    try:
+        registry = mcp._tool_manager._tools
+        dropped = [name for name in list(registry)
+                   if _toolset_of(name) not in wanted]
+        for name in dropped:
+            del registry[name]
+        return {'enabled': sorted(wanted), 'dropped': len(dropped)}
+    except Exception:  # noqa: BLE001 - private SDK internals may move
+        return None
+
+
 def _update_popup_worker(check_thread, attempts=30, retry_delay=60):
     """Surface a pending update to the USER as a native Fusion popup — no
     typed command needed. Waits for the startup update check, asks in Fusion
@@ -2181,6 +2369,7 @@ if __name__ == '__main__':
     # Non-blocking: checks GitHub and pre-downloads a newer version so the
     # first tool result can announce it (with release notes). Installation
     # still happens only via apply_update(confirm=True).
+    _apply_toolsets()
     check_thread = updater.start_background_check()
     threading.Thread(target=_update_popup_worker, args=(check_thread,),
                      name='fusionmcp-update-popup', daemon=True).start()
