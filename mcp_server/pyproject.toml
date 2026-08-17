@@ -1,6 +1,6 @@
 [project]
 name = "fusion360-mcp"
-version = "1.12.0"
+version = "1.13.0"
 description = "Model Context Protocol server for Autodesk Fusion 360"
 requires-python = ">=3.10"
 dependencies = [
@@ -32,6 +32,10 @@ re = [
 photo = [
     "opencv-contrib-python-headless>=4.10",
     "ezdxf>=1.3",
+]
+# Code-CAD (codecad_run): build123d pulls the VTK-free OCP wheel (~50 MB).
+codecad = [
+    "build123d>=0.11",
 ]
 
 [tool.uv]

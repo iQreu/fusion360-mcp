@@ -5,6 +5,17 @@ The section matching the pushed tag becomes the GitHub release body
 `fusionmcp_update` notice show to the user — keep entries short, user-facing
 and grouped under **Added / Fixed / Changed**.
 
+## v1.13.0 — 2026-08-17
+
+### Added
+- `codecad_run`: build123d scripts to STEP/STL without Fusion in the loop
+  (optional `codecad` extras) — parametric generators in pure Python, then
+  import_file brings the solid in. Note: Windows Smart App Control blocks
+  the OCP kernel DLL on locked-down machines.
+- `photogrammetry_run`: photos folder to mesh via an installed RealityScan
+  (preferred) or Meshroom — auto-detected, arbitrary scale flagged, result
+  feeds the normal scan pipeline (scan_convert, import_mesh, scan_align).
+
 ## v1.12.0 — 2026-08-17
 
 ### Added

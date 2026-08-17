@@ -219,7 +219,7 @@ def test_new_ops_registered():
 def test_versions_in_sync():
     import commands
     from _version import __version__
-    assert commands.VERSION == __version__ == '1.12.0'
+    assert commands.VERSION == __version__
     pyproject = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'mcp_server', 'pyproject.toml')
     with open(pyproject, encoding='utf-8') as fh:

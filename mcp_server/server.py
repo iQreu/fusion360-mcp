@@ -19,9 +19,11 @@ import os
 import threading
 import time
 
+import codecad
 import dfm
 import fasteners
 import photo
+import photogrammetry
 import scan
 import slicer
 import updater
@@ -1669,6 +1671,41 @@ def hole_spec(size: str, kind: str = 'clearance', fit: str = 'normal',
         return {'error': str(exc)}
 
 
+# NOT readOnlyHint: executes a user-supplied script and writes the export.
+@mcp.tool()
+def codecad_run(script: str, out_path: str) -> dict:
+    """Run a build123d Python script WITHOUT Fusion in the loop and export
+    STEP/STL (extension of out_path decides) — millisecond parametric
+    prototypes and bracket generators; then import_file(format="step")
+    brings a real solid into the design. The script gets `from build123d
+    import *` and must assign its final shape to `result`. Same trust model
+    as run_fusion_code: the script has full Python access. Needs the
+    optional 'codecad' extras (pip install build123d)."""
+    try:
+        return codecad.run(script, out_path)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: launches a long external reconstruction and writes files.
+@mcp.tool()
+def photogrammetry_run(images_dir: str, out_obj: str, backend: str = 'auto',
+                       simplify_faces: int = 1000000,
+                       timeout: int = 7200) -> dict:
+    """Reconstruct a 3D mesh from a folder of photos using an installed
+    photogrammetry app (RealityScan preferred, Meshroom fallback — detected
+    automatically). Needs 20+ sharp overlapping photos of all sides; runs
+    minutes to hours. The OBJ has ARBITRARY scale: import_mesh, then
+    scan_align to a known model or scale from a measured feature. Shiny or
+    black parts reconstruct poorly — matte spray helps."""
+    try:
+        return photogrammetry.run(images_dir, out_obj, backend=backend,
+                                  simplify_faces=simplify_faces,
+                                  timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
 @mcp.tool(**_annot(readOnlyHint=True))
 def dfm_check(path: str, process: str = 'fdm', axis: str = 'z',
               min_draft_deg: float = 1.0, min_wall: float = 1.0) -> dict:
@@ -2264,7 +2301,7 @@ def cam_to_gcode(post: str = 'fanuc.cps') -> str:
 # --------------------------------------------------------------------------- #
 _TOOLSET_RULES = (
     ('scan', ('scan_', 'mesh_', 'import_mesh', 'face_groups')),
-    ('photo', ('photo_', 'canvas_', 'import_svg')),
+    ('photo', ('photo_', 'canvas_', 'import_svg', 'photogrammetry_')),
     ('cam', ('cam_',)),
     ('drawing', ('create_drawing', 'drawing_', 'export_sketch_dxf',
                  'export_flat_pattern')),

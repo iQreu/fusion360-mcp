@@ -24,7 +24,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.12.0'
+VERSION = '1.13.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
