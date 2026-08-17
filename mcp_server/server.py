@@ -1576,20 +1576,70 @@ def scan_convert(path: str, out_path: str = '', fmt: str = 'stl') -> dict:
 @mcp.tool()
 def photo_rectify(image: str, out_path: str = '', marker: str = '4x4_50',
                   marker_size_mm: float = 50.0, mm_per_px: float = 0.2,
-                  margin_mm: float = 10.0) -> dict:
-    """Remove perspective from a photo of a flat part using a printed square
-    marker lying IN the part's plane, and fix the scale: after this, every
-    pixel is exactly mm_per_px millimetres. marker: an ArUco dictionary
-    (default "4x4_50" — have the user print one) or "qr"; marker_size_mm is
-    the printed side length. Writes <name>_rect.png (or out_path) and
-    returns mm_per_px for photo_to_sketch or canvas_add. Accuracy is real
-    (~0.2-1 mm) only in the marker's plane."""
+                  margin_mm: float = 10.0, ref_points: list = [],
+                  ref_width_mm: float = 0.0, ref_height_mm: float = 0.0,
+                  scale_points: list = [], known_mm: float = 0.0,
+                  undistort: str = 'off', refine: bool = True) -> dict:
+    """Remove perspective from a photo of a flat part and fix the scale:
+    after this every pixel is exactly mm_per_px millimetres in the part's
+    plane. Reference, best first: (1) printed square marker(s) IN the plane
+    (marker: ArUco dictionary, default "4x4_50", or "qr"; marker_size_mm =
+    printed side; SEVERAL same-size markers refine the fit and report their
+    agreement, and undistort="auto" then also removes lens distortion);
+    (2) no marker — ref_points=[[x,y]x4] pixel corners TL,TR,BR,BL of a
+    known rectangle (A4 210x297, bank card 85.6x53.98) + ref_width_mm/
+    ref_height_mm; (3) last resort — scale_points=[[x,y],[x,y]] two points
+    a known_mm apart (ruler): scale only, NO perspective fix. Writes
+    <name>_rect.png (or out_path) and returns mm_per_px for photo_measure,
+    photo_to_sketch or canvas_add. Accuracy is real (~0.2-1 mm) only in the
+    reference plane."""
     try:
         return photo.rectify(image, out_path=out_path or None, marker=marker,
                              marker_size_mm=marker_size_mm,
-                             mm_per_px=mm_per_px, margin_mm=margin_mm)
+                             mm_per_px=mm_per_px, margin_mm=margin_mm,
+                             ref_points=ref_points or None,
+                             ref_width_mm=ref_width_mm,
+                             ref_height_mm=ref_height_mm,
+                             scale_points=scale_points or None,
+                             known_mm=known_mm, undistort=undistort,
+                             refine=refine)
     except Exception as exc:  # noqa: BLE001
         return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the annotated preview image.
+@mcp.tool()
+def photo_measure(image: str, mm_per_px: float, segments: list = [],
+                  holes: bool = False, snap_px: int = 0,
+                  min_diameter_mm: float = 2.0, max_diameter_mm: float = 60.0,
+                  sensitivity: int = 30, annotate_path: str = '',
+                  include_image: bool = True):
+    """Measure a RECTIFIED photo in millimetres — the step that turns
+    'I can see the part' into real dimensions. segments:
+    [[[x1,y1],[x2,y2]], ...] pixel point pairs -> distances in mm (snap_px
+    snaps endpoints to the nearest image edge); holes=true detects circular
+    holes (centres, diameters, centre-to-centre bolt spacing; tune with
+    min/max_diameter_mm and sensitivity — lower finds more). Run
+    photo_rectify first and use ITS output image and mm_per_px. Returns the
+    numbers plus an annotated preview image (include_image=false for the
+    JSON only) — verify every drawn line/circle sits where intended before
+    trusting the numbers."""
+    try:
+        result = photo.measure(image, mm_per_px, segments=segments or None,
+                               holes=holes, snap_px=snap_px,
+                               min_diameter_mm=min_diameter_mm,
+                               max_diameter_mm=max_diameter_mm,
+                               sensitivity=sensitivity,
+                               annotate_path=annotate_path or None)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+    if include_image and isinstance(result, dict) and result.get('annotated'):
+        try:
+            with open(result['annotated'], 'rb') as fh:
+                return [result, Image(data=fh.read(), format='png')]
+        except Exception:  # noqa: BLE001 - the preview is best-effort
+            pass
+    return result
 
 
 # NOT readOnlyHint: writes the DXF at the model-chosen path.
@@ -1690,18 +1740,46 @@ def codecad_run(script: str, out_path: str) -> dict:
 # NOT readOnlyHint: launches a long external reconstruction and writes files.
 @mcp.tool()
 def photogrammetry_run(images_dir: str, out_obj: str, backend: str = 'auto',
-                       simplify_faces: int = 1000000,
-                       timeout: int = 7200) -> dict:
+                       simplify_faces: int = 1000000, timeout: int = 7200,
+                       detect_markers: bool = False,
+                       distances: list = []) -> dict:
     """Reconstruct a 3D mesh from a folder of photos using an installed
     photogrammetry app (RealityScan preferred, Meshroom fallback — detected
     automatically). Needs 20+ sharp overlapping photos of all sides; runs
-    minutes to hours. The OBJ has ARBITRARY scale: import_mesh, then
-    scan_align to a known model or scale from a measured feature. Shiny or
-    black parts reconstruct poorly — matte spray helps."""
+    minutes to hours. Real-world scale: with RealityScan pass
+    distances=[[marker_a, marker_b, mm], ...] between coded targets in the
+    scene (+detect_markers=true; solved during alignment, CLI verbs
+    unverified live) — otherwise the mesh has ARBITRARY scale: fix it with
+    photogrammetry_scale (ArUco markers) or scan_align to a known model.
+    Shiny or black parts reconstruct poorly — matte spray helps."""
     try:
         return photogrammetry.run(images_dir, out_obj, backend=backend,
                                   simplify_faces=simplify_faces,
-                                  timeout=timeout)
+                                  timeout=timeout,
+                                  detect_markers=detect_markers,
+                                  distances=distances or None)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the scaled mesh copy.
+@mcp.tool()
+def photogrammetry_scale(mesh: str, images_dir: str, marker_length_mm: float,
+                         sfm_path: str = '', marker: str = '4x4_50',
+                         out_path: str = '', min_views: int = 2) -> dict:
+    """Recover the REAL millimetre scale of a photogrammetry mesh from
+    printed ArUco markers that were lying in the scene: detects them in the
+    source photos, triangulates their corners with the Meshroom camera poses
+    (cameras.sfm — auto-found next to the mesh, or pass sfm_path) and writes
+    a rescaled copy (default <mesh>_mm.obj). All markers must share the same
+    printed side length (marker_length_mm). Closes the 'arbitrary units'
+    gap of photogrammetry_run for the Meshroom backend; check spread_pct in
+    the result — >3% means a noisy reconstruction."""
+    try:
+        return photogrammetry.scale_from_markers(
+            mesh, images_dir, marker_length_mm,
+            sfm_path=sfm_path or None, marker=marker,
+            out_path=out_path or None, min_views=min_views)
     except Exception as exc:  # noqa: BLE001
         return {'error': str(exc)}
 
@@ -2245,18 +2323,24 @@ def trace_photo(image_path: str = '', marker_size_mm: float = 50.0) -> str:
     return (
         'Turn the photo%s into Fusion sketch geometry.\n'
         '1) Ask whether a square marker (ArUco/QR, %g mm side) lies in the '
-        "part's plane; without one, scale needs a known dimension instead.\n"
+        "part's plane; more markers = better. Without one, use the corners "
+        'of a known rectangle (ref_points: A4, bank card) or two points a '
+        'known distance apart (scale_points) instead.\n'
         '2) photo_rectify(image, marker_size_mm=%g) — perspective off, exact '
-        'mm_per_px scale.\n'
-        '3) Either trace curves: photo_to_sketch(rectified, mm_per_px) then '
+        'mm_per_px scale; check scale_spread_pct when several markers are '
+        "in frame, and undistort='auto' if they disagree.\n"
+        '3) photo_measure(rectified, mm_per_px, segments/holes=true) — pull '
+        'the driving dimensions (hole diameters, bolt spacing, outline '
+        'sizes) off the photo and VERIFY them on the annotated preview.\n'
+        '4) Either trace curves: photo_to_sketch(rectified, mm_per_px) then '
         'import_file(format="dxf", plane=...) — profiles ready to extrude; '
         'or keep the photo visible: canvas_add(rectified, width_mm=size from '
         'the rectify report) and refine with canvas_calibrate on two known '
         'features.\n'
-        '4) Clean the imported sketch (sketch_status, auto_constrain, '
-        'sketch_dimension with parameters) — vectorised curves are unclean '
-        'by nature.\n'
-        '5) Verify a key dimension against the real part and adjust.'
+        '5) Clean the imported sketch (sketch_status, auto_constrain, '
+        'sketch_dimension with the measured values as parameters) — '
+        'vectorised curves are unclean by nature.\n'
+        '6) Verify a key dimension against the real part and adjust.'
         % ((' at %r' % image_path) if image_path else '',
            marker_size_mm, marker_size_mm)
     )

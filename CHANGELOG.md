@@ -5,6 +5,25 @@ The section matching the pushed tag becomes the GitHub release body
 `fusionmcp_update` notice show to the user — keep entries short, user-facing
 and grouped under **Added / Fixed / Changed**.
 
+## v1.14.0 — 2026-08-17
+
+### Added
+- `photo_measure`: millimetre dimensions straight off a rectified photo —
+  point-to-point distances (with optional edge snapping), automatic hole
+  detection (centres, diameters, bolt-pattern spacing) and an annotated
+  preview image so every measurement can be verified by eye.
+- `photo_rectify` upgrades: several markers in one frame refine the fit and
+  report how well they agree; no printed marker needed — the 4 corners of
+  any known rectangle (A4 sheet, bank card) or two points a known distance
+  apart work too; optional lens-distortion removal (`undistort="auto"` with
+  2+ markers) and an EXIF ultra-wide-lens warning.
+- `photogrammetry_scale`: recover the real millimetre scale of a Meshroom
+  reconstruction from ArUco markers lying in the scene (corners
+  triangulated from cameras.sfm) — closes the "arbitrary units" gap.
+- `photogrammetry_run` can forward known marker distances to RealityScan
+  (`distances=[[a, b, mm], ...]`) so the scale is solved during alignment
+  (CLI verbs not yet verified against a live install).
+
 ## v1.13.0 — 2026-08-17
 
 ### Added
