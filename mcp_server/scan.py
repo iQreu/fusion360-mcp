@@ -207,10 +207,142 @@ def _planes_from_facets(mesh, max_primitives, min_fraction=0.02):
     return out
 
 
+def _plane_basis(axis):
+    """Orthonormal (u, v) spanning the plane perpendicular to `axis`."""
+    helper = np.array([1.0, 0.0, 0.0])
+    if abs(float(axis @ helper)) > 0.9:
+        helper = np.array([0.0, 1.0, 0.0])
+    u_vec = np.cross(axis, helper)
+    u_vec = u_vec / np.linalg.norm(u_vec)
+    return u_vec, np.cross(axis, u_vec)
+
+
+def _fit_circle2d(xy):
+    """Least-squares (Kasa) circle through Nx2 points -> (cx, cy, r) or
+    None when degenerate."""
+    a_mat = np.column_stack([2.0 * xy[:, 0], 2.0 * xy[:, 1],
+                             np.ones(len(xy))])
+    try:
+        sol, *_ = np.linalg.lstsq(a_mat, (xy ** 2).sum(axis=1), rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx, cy, c0 = (float(v) for v in sol)
+    r_sq = c0 + cx * cx + cy * cy
+    if r_sq <= 0:
+        return None
+    return cx, cy, math.sqrt(r_sq)
+
+
+def _cylinder_inlier_ids(sub, centre, axis, radius, thresh):
+    rel = sub - centre
+    radial = rel - np.outer(rel @ axis, axis)
+    dist = np.abs(np.linalg.norm(radial, axis=1) - radius)
+    return np.where(dist <= thresh)[0]
+
+
+def _refine_cylinder(sub, sub_normals, centre, axis, radius, thresh):
+    """Polish a cylinder candidate with deterministic geometry — pyransac3d's
+    3-point cylinder is a lottery (its own docstring warns) and its quality
+    shifts between releases (0.7.0 broke an 8 mm test fit). Per round: drop
+    inliers whose surface normal runs along the current axis (caps/planes),
+    re-estimate the axis as the smallest-eigenvector of the remaining normal
+    covariance (cylinder-side normals span the radial plane), fit
+    centre/radius with a Kasa circle in the axis-normal plane, re-select
+    inliers at the same threshold. Returns (centre, axis, radius,
+    inlier_ids) — ids is None when refinement had nothing to work with."""
+    centre = np.asarray(centre, dtype=float)
+    axis = np.asarray(axis, dtype=float)
+    norm = np.linalg.norm(axis)
+    if norm == 0:
+        return centre, axis, radius, None
+    axis = axis / norm
+    ids = _cylinder_inlier_ids(sub, centre, axis, radius, thresh)
+    if len(ids) < 30:
+        return centre, axis, radius, None
+    best = None
+    for _ in range(2):
+        picked = sub_normals[ids]
+        keep = np.abs(picked @ axis) < 0.5  # cap/plane normals out
+        if int(keep.sum()) >= 12:
+            picked = picked[keep]
+        new_axis = np.linalg.eigh(picked.T @ picked)[1][:, 0]
+        new_axis = new_axis / np.linalg.norm(new_axis)
+        u_vec, v_vec = _plane_basis(new_axis)
+        origin = sub[ids].mean(axis=0)
+        rel = sub[ids] - origin
+        fit = _fit_circle2d(np.column_stack([rel @ u_vec, rel @ v_vec]))
+        if fit is None:
+            break
+        cx, cy, new_radius = fit
+        new_centre = origin + cx * u_vec + cy * v_vec
+        new_ids = _cylinder_inlier_ids(sub, new_centre, new_axis, new_radius,
+                                       thresh)
+        if best is None or len(new_ids) > len(best[3]):
+            best = (new_centre, new_axis, new_radius, new_ids)
+        if len(new_ids) < 30:
+            break
+        ids, axis = new_ids, new_axis
+    return best if best is not None else (centre, axis, radius, None)
+
+
+def _radial_mode(dists, thresh):
+    """Centre of the densest radial band (histogram mode) — a robust initial
+    radius when the point set mixes a cylinder shell with caps or other
+    surfaces (a least-squares circle would split the difference)."""
+    if not len(dists):
+        return None
+    width = max(2.0 * thresh, 1e-6)
+    bins = np.floor(dists / width).astype(int)
+    counts = np.bincount(bins - bins.min())
+    return float((int(np.argmax(counts)) + bins.min() + 0.5) * width)
+
+
+def _global_axis_candidate(sub, sub_normals, thresh):
+    """RANSAC-free cylinder candidate for the DOMINANT cylinder: its side
+    normals outweigh everything else, so the axis is the smallest-eigenvector
+    of the full normal covariance; centre = in-plane centroid, radius =
+    densest radial band. _refine_cylinder tightens it afterwards."""
+    if len(sub) < 200:
+        return None
+    axis = np.linalg.eigh(sub_normals.T @ sub_normals)[1][:, 0]
+    u_vec, v_vec = _plane_basis(axis)
+    xy = np.column_stack([sub @ u_vec, sub @ v_vec])
+    centroid = xy.mean(axis=0)
+    radius = _radial_mode(np.linalg.norm(xy - centroid, axis=1), thresh)
+    if not radius or radius <= 0:
+        return None
+    return centroid[0] * u_vec + centroid[1] * v_vec, axis, radius
+
+
+def _considered(sub, sub_normals, thresh, centre, axis, radius, raw_ids):
+    """Refine one cylinder candidate and score it by inlier count; falls
+    back to the raw RANSAC inliers when refinement cannot improve on them.
+    Returns (count, centre, unit_axis, radius, ids) or None."""
+    refined = _refine_cylinder(sub, sub_normals, centre, axis, radius,
+                               thresh)
+    if refined[3] is not None and (raw_ids is None
+                                   or len(refined[3]) >= len(raw_ids)):
+        centre, axis, radius, ids = refined
+    else:
+        ids = raw_ids
+    if ids is None or not len(ids):
+        return None
+    axis = np.asarray(axis, dtype=float)
+    norm = np.linalg.norm(axis)
+    if norm == 0:
+        return None
+    return (len(ids), np.asarray(centre, dtype=float), axis / norm,
+            float(radius), np.asarray(ids, dtype=int))
+
+
 def _ransac_primitives(mesh, scale, max_primitives):
-    """Iteratively fit cylinders (and one sphere) with pyRANSAC-3D, removing
-    inliers between rounds. Cylinders are classified hole vs boss using the
-    surface normals of their inlier points."""
+    """Iteratively fit cylinders (and one sphere), removing inliers between
+    rounds. Each round pits several candidates against each other — a free
+    normals-covariance candidate plus up to 3 pyRANSAC-3D restarts — every
+    one polished by _refine_cylinder, best refined inlier count wins; the
+    result no longer hangs on pyransac3d's sampling luck (0.7.0 regression).
+    Cylinders are classified hole vs boss using the surface normals of
+    their inlier points."""
     try:
         import pyransac3d
     except ImportError:
@@ -230,20 +362,30 @@ def _ransac_primitives(mesh, scale, max_primitives):
         if len(remaining) < 200:
             break
         sub = pts[remaining]
-        try:
-            with np.errstate(all='ignore'):  # degenerate draws are expected
-                centre, axis, radius, inliers = pyransac3d.Cylinder().fit(
-                    sub, thresh=thresh, maxIteration=800)
-        except Exception:  # noqa: BLE001 - RANSAC can fail on degenerate leftovers
+        sub_normals = normals[remaining]
+        best = None
+        free = _global_axis_candidate(sub, sub_normals, thresh)
+        if free is not None:
+            best = _considered(sub, sub_normals, thresh, *free, None)
+        for _restart in range(3):
+            if best is not None and best[0] >= 0.05 * len(pts):
+                break  # a strong model already — don't pay for more draws
+            try:
+                with np.errstate(all='ignore'):  # degenerate draws expected
+                    centre, axis, radius, inliers = pyransac3d.Cylinder().fit(
+                        sub, thresh=thresh, maxIteration=800)
+            except Exception:  # noqa: BLE001 - RANSAC can fail on leftovers
+                break
+            cand = _considered(sub, sub_normals, thresh, centre, axis,
+                               float(radius), np.asarray(inliers, dtype=int))
+            if cand is not None and (best is None or cand[0] > best[0]):
+                best = cand
+        if best is None:
             break
-        if radius <= 0 or radius > scale or len(inliers) / len(pts) < 0.03:
+        count, centre, axis, radius, inliers = best
+        if radius <= 0 or radius > scale or count / len(pts) < 0.03:
             break
         chosen = remaining[np.asarray(inliers, dtype=int)]
-        axis = np.asarray(axis, dtype=float)
-        norm = np.linalg.norm(axis)
-        if norm == 0:
-            break
-        axis = axis / norm
         radial = pts[chosen] - np.asarray(centre, dtype=float)
         radial -= np.outer(radial @ axis, axis)
         lengths = np.linalg.norm(radial, axis=1)

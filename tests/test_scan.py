@@ -159,6 +159,29 @@ def test_analyze_cylinder_finds_boss_cylinder(tmp_path):
     assert cyls[0]['kind'] == 'boss'
 
 
+def test_refine_cylinder_rescues_a_bad_ransac_model():
+    # pyransac3d's 3-point cylinder lottery shifts between releases (0.7.0
+    # returned r=6.33 for an 8 mm cylinder); the deterministic refinement
+    # must recover the true model from a poor-but-overlapping candidate.
+    np = pytest.importorskip('numpy')
+    angles = np.linspace(0.0, 2.0 * math.pi, 240, endpoint=False)
+    heights = np.linspace(-15.0, 15.0, 25)
+    ang, hgt = np.meshgrid(angles, heights)
+    pts = np.column_stack([8.0 * np.cos(ang).ravel(),
+                           8.0 * np.sin(ang).ravel(), hgt.ravel()])
+    normals = np.column_stack([np.cos(ang).ravel(), np.sin(ang).ravel(),
+                               np.zeros(ang.size)])
+    # Deliberately bad start: tilted axis, offset centre, wrong radius.
+    bad_axis = np.array([0.25, 0.1, 1.0])
+    bad_axis /= np.linalg.norm(bad_axis)
+    centre, axis, radius, ids = scan._refine_cylinder(
+        pts, normals, np.array([1.5, -1.0, 2.0]), bad_axis, 6.3, thresh=0.6)
+    assert ids is not None and len(ids) > 0.9 * len(pts)
+    assert abs(radius - 8.0) < 0.05
+    assert abs(abs(float(axis @ np.array([0.0, 0.0, 1.0]))) - 1.0) < 1e-3
+    assert math.hypot(float(centre[0]), float(centre[1])) < 0.05
+
+
 def test_deviation_of_identical_meshes_is_tiny(tmp_path):
     tm = pytest.importorskip('trimesh')
     path = str(tmp_path / 'part.stl')

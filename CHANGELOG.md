@@ -24,6 +24,13 @@ and grouped under **Added / Fixed / Changed**.
   (`distances=[[a, b, mm], ...]`) so the scale is solved during alignment
   (CLI verbs not yet verified against a live install).
 
+### Fixed
+- `scan_analyze` cylinder fits no longer depend on pyransac3d's sampling
+  luck (0.7.0 regressed an 8 mm fit to 6.3 mm): every candidate is refined
+  deterministically — axis from the surface normals, centre/radius from a
+  least-squares circle — and a free normals-based candidate plus RANSAC
+  restarts compete for the most inliers.
+
 ## v1.13.0 — 2026-08-17
 
 ### Added
