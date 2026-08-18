@@ -15,8 +15,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install dev tooling + runtime deps
@@ -33,7 +33,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Release body = the CHANGELOG.md section for this tag (user-facing
       # Added/Fixed lists — shown by the in-Fusion update popup), plus the
       # auto-generated compare link appended by generate_release_notes.
