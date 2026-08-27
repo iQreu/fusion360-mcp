@@ -25,7 +25,7 @@ jobs:
         run: >-
           python -m pip install --upgrade pip pytest ruff
           "mcp>=1.9,<2" numpy trimesh pyransac3d rtree
-          opencv-contrib-python-headless ezdxf
+          opencv-contrib-python-headless ezdxf isofits
       - name: Ruff lint
         run: python -m ruff check .
       - name: Run tests (no skips allowed for missing deps)

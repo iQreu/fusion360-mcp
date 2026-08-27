@@ -154,6 +154,28 @@ raport odchyłek odbudowa↔skan (pętla: buduj → mierz → poprawiaj);
 FDM: zmieszczenie na stole (wszystkie orientacje), pole nawisów bez podpór,
 cienkie ścianki, szczelność + rekomendacje (bez Fusion; wymaga extras `re`).
 Prompt `reverse_engineer_scan` prowadzi cały przepływ skan→CAD.
+**FreeCAD (drugi kernel, v1.15+)** — headless przez `freecadcmd` (FreeCAD 1.x
+wykrywany automatycznie lub `FUSION_MCP_FREECAD`; subprocess — serwer nie
+importuje FreeCAD): `freecad_fem(path, fixed, loads, material)` — „czy ta
+część wytrzyma?": statyczna analiza MES (gmsh + CalculiX w komplecie z
+FreeCAD) na wyeksportowanym STEP — naprężenia von Misesa, ugięcie, masa,
+współczynnik bezpieczeństwa względem granicy plastyczności (presety stal/
+aluminium/PLA/PETG/… + wariant „printed" z derate'em na anizotropię FDM);
+`freecad_inspect(path)` — niezależna weryfikacja geometrii kernelem
+OpenCascade (poprawność bryły, objętość, spis ścian z typami/normalnymi/
+promieniami — stąd nazwy ścian do więzów MES); `freecad_convert` —
+STEP/IGES/BREP/FCStd ↔ STL/OBJ/PLY/3MF; `freecad_run(script)` — furtka na
+cały FreeCAD (TechDraw DXF, Draft, OCC); `freecad_info` — status instalacji.
+**Części zamienne — dane normowe (v1.15+)**: `fit_suggest(measured_mm,
+application)` — zmierzona średnica → najbliższy nominał + pasowanie ISO 286
+(H7/g6 itd.) z granicami w mm i zakresem luzu/wcisku; `bearing_lookup` —
+obwiednie łożysk kulkowych (608, 6000–6310, serie cienkie) po oznaczeniu LUB
+po zmierzonym gnieździe; `circlip_lookup` — pierścienie DIN 471/472 z pełnym
+wymiarowaniem rowka; `oring_gland` — projekt rowka o-ringa ze zmierzonego
+sznura (static/dynamic/face, docisk + wypełnienie wg reguł Parkera);
+`belt_calc` — geometria przekładni pasowych GT2/HTD/T (średnice podziałowe,
+długość pasa ↔ rozstaw osi). Prompt `spare_part` spina cały łańcuch:
+zmierz → znormalizuj → zamodeluj → MES → druk.
 **Rysunki 2D**: `create_drawing(template, sheet_size, orientation, standard,
 drawing_units)` — na Fusion lipiec 2026+ w pełni headless przez oficjalne
 DrawingManager API (arkusz A0–A4/A–E, ISO/ASME, mm/cale, szablon), na
@@ -211,8 +233,10 @@ API (token, `$nazwa` ze store, ścieżka `adsk.*`) przed napisaniem snippetu
 **Resources** (odczyt bez wywołania narzędzia): `fusion://design/state`,
 `fusion://design/parameters`, `fusion://design/tree`.
 **Prompts** (gotowe szablony): `parametric_bracket`, `prepare_for_3d_print`,
-`reverse_engineer_scan`, `assemble_components`, `constrain_and_dimension`,
-`cam_to_gcode`.
+`reverse_engineer_scan`, `trace_photo`, `assemble_components`,
+`constrain_and_dimension`, `cam_to_gcode`, `spare_part`.
+**Minimalna wersja Fusion**: od 2026-09-07 Autodesk wymusza build ≥2703.1.11
+(maj 2026) — FusionMCP zakłada API z fali maj/lipiec 2026.
 Narzędzia inspekcyjne są oznaczone adnotacją `readOnlyHint`, a `delete` —
 `destructiveHint` (klient MCP wie, które operacje są bezpieczne). Błędy niosą
 **kod strukturalny** (`code`: `stale_token`/`bad_params`/`no_design`/

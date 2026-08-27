@@ -367,7 +367,7 @@ def test_scale_from_detections_recovers_scale_in_both_conventions():
 def test_versions_in_sync_v114():
     import commands
     from _version import __version__
-    assert commands.VERSION == __version__ == '1.14.0'
+    assert commands.VERSION == __version__
     pyproject = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'mcp_server', 'pyproject.toml')
     with open(pyproject, encoding='utf-8') as fh:

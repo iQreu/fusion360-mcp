@@ -22,6 +22,8 @@ import time
 import codecad
 import dfm
 import fasteners
+import freecad
+import mech
 import photo
 import photogrammetry
 import scan
@@ -1801,6 +1803,176 @@ def dfm_check(path: str, process: str = 'fdm', axis: str = 'z',
 
 
 # --------------------------------------------------------------------------- #
+# FreeCAD bridge — headless freecadcmd subprocess: FEM strength checks,
+# neutral-kernel geometry inspection, format conversion. FreeCAD bundles its
+# own Python + gmsh + CalculiX, so none of this touches the server process.
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def freecad_info() -> dict:
+    """Is FreeCAD installed and FEM-ready? Reports the freecadcmd path,
+    version, bundled gmsh/CalculiX solvers and the available material
+    presets for freecad_fem. Run this before the other freecad_* tools."""
+    try:
+        return freecad.info()
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def freecad_inspect(path: str, max_faces: int = 120) -> dict:
+    """Second-opinion geometry census of a CAD file through the OpenCascade
+    kernel — works on STEP/IGES/BREP/FCStd (per-solid validity, volume,
+    bbox and every face's surface type, area, center, plane normal or
+    cylinder radius+axis) and meshes (watertightness, self-intersections).
+    Use it to verify an export("step") and to pick faces ('Face7') for
+    freecad_fem constraints."""
+    try:
+        return freecad.inspect(path, max_faces=max_faces)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: runs external solvers (long) in a temp sandbox.
+@mcp.tool()
+def freecad_fem(path: str, fixed: list, loads: list,
+                material: str = 'steel', mesh_max_mm: float = 0.0,
+                gravity: bool = False, E: float = 0.0, nu: float = 0.0,
+                density: float = 0.0, yield_mpa: float = 0.0,
+                timeout: int = 900) -> dict:
+    """Will this part hold? Linear static FEM (FreeCAD + gmsh + CalculiX)
+    on an exported STEP: von Mises max/p95 [MPa], displacement [mm], mass
+    and a safety factor vs the material's yield strength. fixed: face specs
+    — 'FaceN' from freecad_inspect or bbox keywords xmin/xmax/ymin/ymax/
+    zmin/zmax. loads: [{"faces": ["zmax"], "force_n": 200}] (along the face
+    normal, pushing; "pull": true flips) or {"faces": [...],
+    "pressure_mpa": 2.5}. material: steel|stainless|aluminum|brass|titanium|
+    pla|petg|abs|nylon|pc or "custom" (+E [MPa], nu, density [kg/m^3],
+    yield_mpa). Printed materials also get safety_factor_printed (~60%,
+    layer anisotropy). mesh_max_mm 0 = auto; halve it once to check mesh
+    convergence — stress at sharp corners is singular and grows with
+    refinement (fillet the corner, judge by p95)."""
+    try:
+        return freecad.fem_analyze(
+            path, fixed, loads, material=material, mesh_max_mm=mesh_max_mm,
+            gravity=gravity, E=E, nu=nu, density=density,
+            yield_mpa=yield_mpa, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the converted file.
+@mcp.tool()
+def freecad_convert(in_path: str, out_path: str,
+                    linear_deflection_mm: float = 0.1,
+                    angular_deflection_deg: float = 15.0) -> dict:
+    """Convert CAD files through the OpenCascade kernel: STEP/IGES/BREP/
+    FCStd between each other, solid -> STL/OBJ/PLY/3MF (deflection controls
+    tessellation quality), mesh -> mesh, or mesh -> faceted STEP/BREP
+    reference body. Covers formats Fusion cannot open (BREP, FCStd) and
+    gives a slicer-independent tessellation with explicit quality knobs."""
+    try:
+        return freecad.convert(
+            in_path, out_path, linear_deflection_mm=linear_deflection_mm,
+            angular_deflection_deg=angular_deflection_deg)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: executes a user-supplied script with full access.
+@mcp.tool()
+def freecad_run(script: str, timeout: int = 600) -> dict:
+    """Arbitrary Python in headless FreeCAD (freecadcmd) — the escape hatch
+    to everything the dedicated freecad_* tools do not cover (TechDraw
+    SVG/DXF drawings, Draft, OCC modeling, FEM variants). FreeCAD/App/Part
+    are pre-imported; any FreeCAD module can be imported; assign a
+    JSON-serializable `result`. Same trust model as run_fusion_code."""
+    try:
+        return freecad.run_script(script, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# Spare-part mechanical data — vendored standards tables and textbook
+# formulas that turn MEASURED dimensions (scan/photo) into INTENTIONAL ones.
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def fit_suggest(measured_mm: float, feature: str = 'shaft',
+                application: str = 'sliding', fit: str = '') -> dict:
+    """Turn a measured diameter into a proper ISO 286 toleranced spec:
+    nearest standard nominal, hole+shaft limits in mm and the resulting
+    clearance/interference range. feature: which member was measured
+    ("shaft"|"hole"). application: loose_running|running|sliding|
+    close_sliding|location|transition|press|heavy_press — or pass an
+    explicit fit like "H7/g6". The bridge from scan_analyze/photo_measure
+    numbers to dimensions you can put on a drawing."""
+    try:
+        return mech.fit_suggest(measured_mm, feature=feature,
+                                application=application, fit=fit or None)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def bearing_lookup(designation: str = '', bore_mm: float = 0.0,
+                   od_mm: float = 0.0, tolerance_mm: float = 0.5) -> dict:
+    """Deep-groove ball bearing envelopes (60x/62x/63x/68x/69x miniature,
+    6800-6806, 6900-6906, 6000-6010, 6200-6210, 6300-6310): look up "608"
+    /"6204ZZ", or identify a bearing from MEASURED seat dimensions (bore
+    and/or OD ± tolerance) — "the scanned pocket is Ø21.9x7, what was in
+    it?". Includes shaft/housing seat fit advice and FDM compensation."""
+    try:
+        return mech.bearing_lookup(designation=designation or None,
+                                   bore=bore_mm or None, od=od_mm or None,
+                                   tolerance=tolerance_mm)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def circlip_lookup(diameter_mm: float, kind: str = 'shaft') -> dict:
+    """DIN 471 (external/shaft) and DIN 472 (internal/bore) retaining-ring
+    data for Ø3-100: ring thickness, groove diameter, groove width (H13)
+    and depth — model the groove straight from the numbers. Non-standard
+    diameters return the nearest standard sizes."""
+    try:
+        return mech.circlip_lookup(diameter_mm, kind=kind)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def oring_gland(cs_mm: float, id_mm: float = 0.0,
+                seal: str = 'static_radial') -> dict:
+    """O-ring groove design from the cord thickness: depth/width for
+    static_radial | dynamic_radial | face seals with standard squeeze and
+    ~75-80% fill, nearest standard cross-section (metric + AS568), and —
+    with id_mm — bore/groove-root diameters and the stretch check. Measure
+    the old ring's cord with photo_measure/scan and model the groove from
+    this."""
+    try:
+        return mech.oring_gland(cs_mm, id_mm=id_mm, seal=seal)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def belt_calc(profile: str, teeth_small: int, teeth_large: int = 0,
+              belt_teeth: int = 0, center_distance_mm: float = 0.0) -> dict:
+    """Synchronous-belt drive geometry (GT2/GT3/GT5/HTD3/HTD5/HTD8/T2.5/T5/
+    T10/MXL/XL): pulley pitch diameters from tooth counts and belt length
+    <-> center distance (give belt_teeth for the exact center, or
+    center_distance_mm for the nearest whole-tooth belt + adjustment).
+    Replacement-pulley printing: pitch Ø, ratio and printed-part notes."""
+    try:
+        return mech.belt_calc(profile, teeth_small, teeth_large=teeth_large,
+                              belt_teeth=belt_teeth,
+                              center_distance_mm=center_distance_mm)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# --------------------------------------------------------------------------- #
 # Mass report, parameter CSV round-trip, CAM
 # --------------------------------------------------------------------------- #
 @mcp.tool(**_annot(readOnlyHint=True))
@@ -2377,6 +2549,34 @@ def cam_to_gcode(post: str = 'fanuc.cps') -> str:
     )
 
 
+@mcp.prompt()
+def spare_part(source: str = '', material: str = 'petg') -> str:
+    """Guide the model through the full replacement-part workflow:
+    measure -> standardize -> model -> verify strength -> print."""
+    return (
+        'Recreate the part%s as a printable replacement.\n'
+        '1) MEASURE, never guess: scan_analyze / photo_rectify + '
+        'photo_measure turn the source into millimetres. Distrust shiny/'
+        'black-surface scan diameters by 2-3 mm.\n'
+        '2) STANDARDIZE every measured dimension: fit_suggest (measured '
+        'diameter -> ISO 286 nominal + fit), bearing_lookup (seat dims -> '
+        'catalog bearing), circlip_lookup (groove specs), oring_gland '
+        '(cord -> groove design), hole_spec/fastener_lookup (screw holes), '
+        'belt_calc (pulleys). A spare part built from catalog numbers '
+        'beats one built from noisy measurements.\n'
+        '3) MODEL parametrically in Fusion; validate_only=true on risky '
+        'sweeps/lofts; design_diagnostics before moving on.\n'
+        '4) VERIFY: export("step", ...) then freecad_inspect (independent '
+        'kernel check) and freecad_fem with the real fixing faces and '
+        'loads, material="%s" — check safety_factor_printed, and fillet '
+        'any corner the FEM flags before trusting max stress.\n'
+        '5) PRINT: dfm_check + print_check on the exported STL, then '
+        'print_estimate for time/cost. Report all measured->standardized '
+        'substitutions so the user can veto them.'
+        % (' from %s' % source if source else '', material)
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Toolsets — trim the tool list for clients without tool search (Claude
 # Desktop). FUSIONMCP_TOOLSETS="scan,photo" keeps 'core' plus the named
@@ -2394,6 +2594,9 @@ _TOOLSET_RULES = (
                'fastener_lookup', 'hole_spec', 'insert_fastener',
                'fastener_update_size')),
     ('sheetmetal', ('fold', 'join_by_bend', 'corner_closure', 'flat_pattern')),
+    ('freecad', ('freecad_',)),
+    ('mech', ('fit_suggest', 'bearing_lookup', 'circlip_lookup',
+              'oring_gland', 'belt_calc')),
     ('data', ('data_folders', 'version_history', 'share_link',
               'list_documents', 'open_document')),
     ('diag', ('design_diagnostics', 'sketch_status', 'sketch_doctor',

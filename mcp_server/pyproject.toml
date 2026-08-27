@@ -1,6 +1,6 @@
 [project]
 name = "fusion360-mcp"
-version = "1.14.0"
+version = "1.15.0"
 description = "Model Context Protocol server for Autodesk Fusion 360"
 requires-python = ">=3.10"
 dependencies = [
@@ -11,7 +11,11 @@ dependencies = [
     # (mcp.server.fastmcp imports die), moves sync tools onto anyio worker
     # threads, and replaces ctx.elicit on new-spec connections with the
     # Resolve() pattern — migrate deliberately, not via a silent pip upgrade.
-    "mcp>=1.29,<2",
+    # >=1.29.1: final 1.x maintenance release (2026-08-24) — request-body
+    # limits on SSE/OAuth endpoints.
+    "mcp>=1.29.1,<2",
+    # ISO 286 fit/tolerance data for fit_suggest (MIT, pure Python, tiny).
+    "isofits>=1.0",
 ]
 
 [project.optional-dependencies]

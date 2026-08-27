@@ -5,6 +5,44 @@ The section matching the pushed tag becomes the GitHub release body
 `fusionmcp_update` notice show to the user — keep entries short, user-facing
 and grouped under **Added / Fixed / Changed**.
 
+## v1.15.0 — 2026-08-27
+
+### Added
+- FreeCAD integration (new `freecad_*` tools, FreeCAD 1.x found
+  automatically or via `FUSION_MCP_FREECAD`):
+  - `freecad_fem`: "will this part hold?" — linear static FEM on an
+    exported STEP through FreeCAD's bundled gmsh + CalculiX: von Mises
+    stress, displacement, mass and a safety factor vs yield, with material
+    presets (steel/aluminum/PLA/PETG/... or custom) and a derated
+    safety factor for printed parts.
+  - `freecad_inspect`: independent OpenCascade-kernel second opinion on any
+    STEP/IGES/BREP/mesh — validity, volume, and a per-face census (type,
+    area, normals, cylinder radius/axis) that also names faces for FEM
+    constraints.
+  - `freecad_convert`: STEP/IGES/BREP/FCStd conversions, tessellation to
+    STL/OBJ/PLY/3MF with quality knobs, mesh -> faceted reference solid.
+  - `freecad_run`: headless FreeCAD Python escape hatch (TechDraw DXF
+    drawings, Draft, OCC modeling); `freecad_info` reports the install.
+- Spare-part data tools — measured dimensions become intentional ones:
+  - `fit_suggest`: measured diameter -> nearest standard nominal + ISO 286
+    fit (H7/g6 & friends) with exact limits and clearance/interference
+    range.
+  - `bearing_lookup`: deep-groove bearing envelopes (608, 6000-6310,
+    thin/miniature series) by designation or by measured seat dimensions,
+    with seat-fit and FDM advice.
+  - `circlip_lookup`: DIN 471/472 ring + groove dimensions for Ø3-100.
+  - `oring_gland`: O-ring groove design (static/dynamic/face) from the
+    measured cord, with standard cross-section snapping.
+  - `belt_calc`: GT2/HTD/T-profile pulley and belt geometry, belt length
+    <-> center distance.
+- `spare_part` prompt: the full measure -> standardize -> model -> FEM ->
+  print workflow.
+- New toolsets `freecad` and `mech` for `FUSIONMCP_TOOLSETS`.
+
+### Changed
+- mcp pin raised to >=1.29.1 (final 1.x maintenance release); new
+  dependency `isofits` (MIT) for ISO 286 data.
+
 ## v1.14.0 — 2026-08-17
 
 ### Added
@@ -113,3 +151,4 @@ and grouped under **Added / Fixed / Changed**.
   `create_appearance`, native fastener probe, `validate_only` dry-runs,
   `include_screenshot` on mutating tools, `electronics_bom`, and the
   `constrain_and_dimension` / `cam_to_gcode` prompts.
+
