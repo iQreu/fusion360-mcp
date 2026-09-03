@@ -344,7 +344,8 @@ def test_belt_calc_roundtrip():
 def test_versions_in_sync_v115():
     import commands
     from _version import __version__
-    assert __version__ == '1.15.0'
+    # Sync only — the literal lives in the newest wave's test (test_v1_16).
+    assert __version__ == commands.VERSION
     assert commands.VERSION == __version__
     pyproject = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'mcp_server', 'pyproject.toml')

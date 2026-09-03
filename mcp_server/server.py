@@ -26,12 +26,20 @@ import freecad
 import mech
 import photo
 import photogrammetry
+import recon
 import scan
 import slicer
 import updater
 import viewer
 from fusion_client import FusionClient, FusionError, FusionNotConnected
-from mcp.server.fastmcp import FastMCP, Image
+
+try:
+    from mcp.server.fastmcp import FastMCP, Image
+    MCP_SDK_MAJOR = 1
+except ImportError:  # mcp >= 2.0: FastMCP was renamed MCPServer (same decorators)
+    from mcp.server.mcpserver import Image
+    from mcp.server.mcpserver import MCPServer as FastMCP
+    MCP_SDK_MAJOR = 2
 
 HOST = os.environ.get('FUSION_MCP_HOST', '127.0.0.1')
 PORT = int(os.environ.get('FUSION_MCP_PORT', '9123'))
@@ -137,7 +145,10 @@ def check_for_updates() -> dict:
 # to accept the specific update in-band, instead of trusting a model-set flag.
 # Everything degrades gracefully to the confirm=True gate when unavailable.
 try:
-    from mcp.server.fastmcp import Context as _Context
+    if MCP_SDK_MAJOR == 1:
+        from mcp.server.fastmcp import Context as _Context
+    else:
+        from mcp.server.mcpserver import Context as _Context
 except Exception:  # pragma: no cover - depends on installed SDK
     _Context = None
 
@@ -348,6 +359,98 @@ def chamfer(edges: list[str], distance: float,
     """Bevel one or more edge tokens with an equal distance (mm)."""
     return _with_screenshot(_call('chamfer', edges=edges, distance=distance),
                             include_screenshot)
+
+
+@mcp.tool()
+def fillet_max_radius(edges: list[str], radius: float, r_min: float = 0.2,
+                      steps: int = 7, apply: bool = True,
+                      fallback: str = 'none', chamfer_distance: float = 0.0,
+                      include_screenshot: bool = False):
+    """Fillet that cannot fail: try `radius`, and when Fusion refuses
+    (BLEND_TOO_BIG on short edges), bisect down to the largest radius that
+    works (each trial is added and removed). apply=True adds the winner;
+    fallback="chamfer" bevels instead when no radius >= r_min works (slim
+    decks, short tangent edges). Returns max_radius_mm and every trial."""
+    return _with_screenshot(
+        _call('fillet_max_radius', edges=edges, radius=radius, r_min=r_min,
+              steps=steps, apply=apply, fallback=fallback,
+              chamfer_distance=chamfer_distance or None), include_screenshot)
+
+
+@mcp.tool()
+def sketch_profile(segments: list[dict] = [], loops: list[dict] = [],
+                   plane: str = 'XY', offset: float = 0.0, closed: bool = True,
+                   constraints: bool = True, dimensions: bool = False,
+                   name: str = '') -> dict:
+    """Sketch a profile from LINE + ARC segments (scan_profile output, or your
+    own): each {kind:"line"|"arc", start, end, mid (arc)} in sketch mm, or
+    with *_3d world coordinates. Consecutive curves share endpoints (one
+    closed profile, no spline); constraints=True adds horizontal/vertical/
+    tangent where the geometry is within 0.5-2 deg; dimensions=True adds
+    driving dimensions. loops=[{segments, closed}] for several contours."""
+    return _call('sketch_profile', segments=segments, loops=loops, plane=plane,
+                 offset=offset, closed=closed, constraints=constraints,
+                 dimensions=dimensions, name=name or None)
+
+
+@mcp.tool()
+def add_boss(diameter: float, height: float, x: float = 0.0, y: float = 0.0,
+             plane: str = 'XY', offset: float = 0.0, hole_diameter: float = 0.0,
+             hole_depth: float = 0.0, base_fillet: float = 0.0,
+             operation: str = 'join', name: str = 'boss',
+             include_screenshot: bool = False):
+    """Screw / heat-set boss on a face: cylinder Ø`diameter` x `height` at
+    (x, y) on `plane` (planar face token or XY/XZ/YZ + offset), blind hole
+    Ø`hole_diameter` x `hole_depth` from the top (hole_spec gives the
+    numbers), optional base fillet. Warns when the wall is under 1.6 mm."""
+    return _with_screenshot(
+        _call('add_boss', diameter=diameter, height=height, x=x, y=y, plane=plane,
+              offset=offset, hole_diameter=hole_diameter, hole_depth=hole_depth,
+              base_fillet=base_fillet, operation=operation, name=name),
+        include_screenshot)
+
+
+@mcp.tool()
+def add_snap_fit(length: float, thickness: float, undercut: float,
+                 width: float = 6.0, lead_angle: float = 30.0, x: float = 0.0,
+                 y: float = 0.0, direction_deg: float = 0.0, plane: str = 'XY',
+                 offset: float = 0.0, taper: bool = False, one_sided: bool = False,
+                 material: str = 'petg', operation: str = 'join',
+                 name: str = 'snap_fit', include_screenshot: bool = False):
+    """Cantilever snap-fit hook sketched on `plane` (side view, root at (x,
+    y), beam along direction_deg) and extruded `width` symmetric about the
+    plane: beam length x thickness, hook undercut, lead-in angle, optional
+    taper to half thickness. Returns strain vs the material allowable and
+    deflection/insertion forces with redesign hints when it would break."""
+    return _with_screenshot(
+        _call('add_snap_fit', length=length, thickness=thickness, undercut=undercut,
+              width=width, lead_angle=lead_angle, x=x, y=y,
+              direction_deg=direction_deg, plane=plane, offset=offset, taper=taper,
+              one_sided=one_sided, material=material, operation=operation, name=name),
+        include_screenshot)
+
+
+@mcp.tool()
+def add_clip_fir_tree(hole_diameter: float, panel_thickness: float = 1.5,
+                      head_diameter: float = 0.0, head_thickness: float = 1.5,
+                      fins: int = 3, fin_pitch: float = 0.0, interference: float = 0.4,
+                      stem_diameter: float = 0.0, lead: float = 1.2,
+                      fin_thickness: float = 0.4, x: float = 0.0, y: float = 0.0,
+                      plane: str = 'XY', offset: float = 0.0, flip: bool = False,
+                      operation: str = 'new', name: str = 'clip',
+                      include_screenshot: bool = False):
+    """Push-in "fir tree" (Christmas-tree) clip for a round hole — the
+    automotive trim fastener: head on the plane, stem with `fins` conical
+    fins oversize by `interference` through a `panel_thickness` panel. One
+    revolve = one clean body. Print standing on the head; PETG/PA, not PLA."""
+    return _with_screenshot(
+        _call('add_clip_fir_tree', hole_diameter=hole_diameter,
+              panel_thickness=panel_thickness,
+              head_diameter=head_diameter or None, head_thickness=head_thickness,
+              fins=fins, fin_pitch=fin_pitch or None, interference=interference,
+              stem_diameter=stem_diameter or None, lead=lead,
+              fin_thickness=fin_thickness, x=x, y=y, plane=plane, offset=offset,
+              flip=flip, operation=operation, name=name), include_screenshot)
 
 
 @mcp.tool()
@@ -791,10 +894,12 @@ def center_of_mass(body: str) -> dict:
 
 
 @mcp.tool(**_annot(readOnlyHint=True))
-def interference(bodies: list[str]) -> dict:
+def interference(bodies: list[str], ignore_coincident: bool = False) -> dict:
     """Detect interference (overlap) between two or more body tokens. Returns
-    interfering pairs with overlap volume (mm^3)."""
-    return _call('interference', bodies=bodies)
+    interfering pairs with overlap volume (mm^3). ignore_coincident=True
+    treats touching (coincident) faces as NOT interfering — the assembly
+    check: pass every body of a multi-part build and expect count 0."""
+    return _call('interference', bodies=bodies, ignore_coincident=ignore_coincident)
 
 
 @mcp.tool()
@@ -916,11 +1021,13 @@ def fit_view() -> dict:
 
 
 @mcp.tool()
-def set_design_mode(mode: str) -> dict:
-    """Switch modeling mode. mode="direct" drops timeline/history for faster
-    one-shot builds and lower memory (good on Personal-tier hardware);
-    mode="parametric" keeps editable history (default). Switching an existing
-    parametric design to direct flattens its history."""
+def set_design_mode(mode: str = 'get') -> dict:
+    """Read or switch the modelling mode. mode="get" reports parametric/direct,
+    the timeline size (>300 features: bulk deletes can hit the 300 s bridge
+    timeout — go direct) and the direct-mode rules; mode="direct" drops
+    timeline/history for fast one-shot builds; mode="parametric" keeps
+    editable history. The result says `applied` — Fusion silently ignores
+    the switch in documents that had mesh edits (build in new_document)."""
     return _call('set_design_mode', mode=mode)
 
 
@@ -1567,6 +1674,179 @@ def scan_convert(path: str, out_path: str = '', fmt: str = 'stl') -> dict:
         return scan.convert(path, out_path=out_path or None, fmt=fmt)
     except Exception as exc:  # noqa: BLE001
         return {'error': str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# Scan -> FEATURES (v1.16, recon.py) — deterministic, server-side.
+# --------------------------------------------------------------------------- #
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_segment(path: str, angle_deg: float = 10.0, dist_tol: float = 0.5,
+                 smooth_deg: float = 30.0, min_faces: int = 20,
+                 max_patches: int = 40, out_path: str = '') -> dict:
+    """Split a scan/mesh (mm) into primitive patches by region growing:
+    planes (normal, point, rms), cylinders (axis, Ø, length, convex=boss vs
+    concave=hole, angular coverage), spheres, freeform — with a patch
+    adjacency graph. Deterministic (no RANSAC). out_path writes a PLY
+    coloured per patch. Patch ids are what scan_features refers to."""
+    try:
+        return recon.segment(path, angle_deg=angle_deg, dist_tol=dist_tol,
+                             smooth_deg=smooth_deg, min_faces=min_faces,
+                             max_patches=max_patches, out_path=out_path or None)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_features(path: str, angle_deg: float = 10.0, dist_tol: float = 0.5,
+                  min_faces: int = 20, max_features: int = 60) -> dict:
+    """Measurement sheet straight off a scan (mm): holes (centre, Ø, depth,
+    through/blind), non-circular cutouts (size, area), bosses (Ø, height),
+    fillet rounds (radius), hole PATTERNS (pair spacing, linear pitch,
+    rectangle sides, PCD) and plate thicknesses. Snap the numbers with
+    fit_suggest/hole_spec before modelling — shiny/dark surfaces scan
+    undersize."""
+    try:
+        return recon.features(path, angle_deg=angle_deg, dist_tol=dist_tol,
+                              min_faces=min_faces, max_features=max_features)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool()
+def scan_profile(path: str, axis: str = 'z', offset: float = -9999.0,
+                 plane_normal: list[float] = [], plane_point: list[float] = [],
+                 tol: float = 0.15, angle_snap_deg: float = 2.0,
+                 radius_snap_mm: float = 0.5, max_loops: int = 4,
+                 to_fusion: bool = False, sketch_plane: str = '',
+                 sketch_offset: float = -9999.0, constraints: bool = True,
+                 dimensions: bool = False, name: str = '') -> dict:
+    """Cut a scan with one plane (world axis + offset mm, default mid-extent,
+    or plane_normal/plane_point) and return the contour as LINES + ARCS —
+    corners detected, arcs merged, tangent junctions fixed, angles snapped
+    to 45 deg and radii to radius_snap_mm when within tol. to_fusion=true
+    then builds the sketch in Fusion via sketch_profile (on sketch_plane /
+    sketch_offset, defaulting to the section plane) — one closed profile
+    ready for extrude. Prismatic reverse engineering in one step."""
+    try:
+        report = recon.profile(
+            path, axis=axis, offset=None if offset == -9999.0 else offset,
+            plane_normal=plane_normal or None, plane_point=plane_point or None,
+            tol=tol, angle_snap_deg=angle_snap_deg, radius_snap_mm=radius_snap_mm,
+            max_loops=max_loops)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+    if not to_fusion:
+        return report
+    loops = [{'segments': lp['segments'], 'closed': lp['closed']}
+             for lp in report.get('loops', []) if lp['segments']]
+    if not loops:
+        report['fusion'] = {'error': 'no loops to sketch'}
+        return report
+    plane = sketch_plane or report.get('sketch_plane')
+    if not plane:
+        report['fusion'] = {'error': 'section plane is not a world plane — pass '
+                                     'sketch_plane (a planar face/plane token) '
+                                     'and rely on the *_3d coordinates'}
+        return report
+    off = sketch_offset if sketch_offset != -9999.0 else report.get('offset_mm', 0.0)
+    report['fusion'] = _call('sketch_profile', loops=loops, plane=plane, offset=off,
+                             constraints=constraints, dimensions=dimensions,
+                             name=name or None)
+    return report
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_thread_identify(path: str, max_points: int = 20000,
+                         pitch_min: float = 0.3, pitch_max: float = 6.0) -> dict:
+    """Identify a scanned thread (mesh of the threaded portion, mm): pitch,
+    handedness, major/minor diameter, external/internal, and the standard
+    designation (ISO 261 coarse/fine, UNC/UNF) with alternatives. Uses a
+    folded-phase periodogram — harmonics rejected, 3+ turns recommended."""
+    try:
+        return recon.thread_identify(path, max_points=max_points,
+                                     pitch_min=pitch_min, pitch_max=pitch_max)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the re-framed mesh.
+@mcp.tool()
+def scan_frame(path: str, out_path: str = '', base_plane: int = 0,
+               x_from: str = 'auto', origin: str = 'bbox_min') -> dict:
+    """Put a scan on its own datums WITHOUT a CAD model: the chosen large
+    plane (0 = largest) becomes Z=0 with the part on +Z, X follows a
+    perpendicular cylinder axis or the long direction (x_from auto|pca|
+    cylinder), origin at bbox_min | centroid | a Z-parallel cylinder axis.
+    Writes the transformed STL and returns the 4x4 transform. Do this
+    before scan_features/scan_profile so coordinates are design-ready."""
+    try:
+        return recon.frame(path, out_path=out_path or None, base_plane=base_plane,
+                           x_from=x_from, origin=origin)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+# NOT readOnlyHint: writes the cutter mesh.
+@mcp.tool()
+def scan_mesh_offset(path: str, distance: float, out_path: str = '',
+                     mode: str = 'offset', axis: str = 'z', approach: str = '+',
+                     pitch: float = 0.0, smooth_iterations: int = 2,
+                     extend_mm: float = -1.0) -> dict:
+    """Grow a scanned object by `distance` mm into a solid cutter mesh:
+    mode="offset" follows the shape; mode="monotone" also removes undercuts
+    along `axis` (approach "+" = the cover comes down onto the object from
+    +axis) so it drops straight on, and extends the cutter `extend_mm`
+    (default 3x distance) past the part on the OPENING side (opposite the
+    approach) so the cut opens the cavity at the rim. Import +
+    mesh_to_brep + combine(cut) = the cavity. Voxel-based
+    (surface at +distance +- pitch/2, pitch reported; needs scikit-image).
+    Replaces hand-written cavity scripts."""
+    try:
+        return recon.mesh_offset(path, distance, out_path=out_path or None, mode=mode,
+                                 axis=axis, approach=approach, pitch=pitch or None,
+                                 smooth_iterations=smooth_iterations,
+                                 extend_mm=None if extend_mm < 0 else extend_mm)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def scan_fit_report(model_path: str, scan_path: str = '', clearance_mm: float = 0.3,
+                    min_wall_mm: float = 1.2, max_penetration_mm: float = 0.0,
+                    bed_x: float = 256.0, bed_y: float = 256.0, bed_z: float = 256.0,
+                    overhang_deg: float = 45.0, process: str = 'fdm') -> dict:
+    """One PASS / WARN / FAIL sheet before printing a part designed against a
+    scan: seating (scan_fit_check: collisions, penetration, clearance vs
+    target), printability (bed, overhangs), wall thickness vs min_wall_mm,
+    and DFM for injection/cnc3axis when process says so. Thresholds are
+    inputs, so the verdict is reproducible."""
+    try:
+        return recon.fit_report(model_path, scan_path=scan_path or None,
+                                clearance_mm=clearance_mm, min_wall_mm=min_wall_mm,
+                                max_penetration_mm=max_penetration_mm,
+                                bed=(bed_x, bed_y, bed_z), overhang_deg=overhang_deg,
+                                process=process)
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+
+
+@mcp.tool(**_annot(readOnlyHint=True))
+def capabilities_probe() -> dict:
+    """Which Preview/optional Fusion APIs exist on THIS build — one call
+    over every surface FusionMCP probes at runtime (mesh*Features, face-group
+    triangles, silhouette, DrawingManager, TimelineBuilderJob, canvases,
+    section analyses, UndoCommand...), with the tools each missing item
+    affects. Run after every Fusion update instead of a manual checklist."""
+    return _call('capabilities_probe')
+
+
+@mcp.tool()
+def new_document(kind: str = 'assembly', direct: bool = False, name: str = '') -> dict:
+    """Create and activate a new Fusion design document. Fusion 2026 opens
+    File>New documents as PART type (single component — create_component
+    fails); documents created here accept multiple components. direct=True
+    starts in direct modelling. Previous document's tokens become invalid."""
+    return _call('new_document', kind=kind, direct=direct, name=name or None)
 
 
 # --------------------------------------------------------------------------- #
@@ -2469,22 +2749,35 @@ def reverse_engineer_scan(scan_path: str = '', tolerance_mm: float = 0.2) -> str
     """Guide the model through a full scan-to-parametric-CAD workflow."""
     return (
         'Reverse-engineer the scan%s into a clean parametric Fusion design '
-        '(target deviation <= %s mm).\n'
-        '1) scan_analyze(path) — size, symmetry, planes, cylinders (holes vs '
-        'bosses), wall thickness. If units look wrong, ask the user.\n'
-        '2) Choose a strategy: (a) prismatic machine part -> rebuild from the '
-        'fitted primitives with sketches, extrude, hole, fillet; (b) complex '
-        'silhouette -> scan_sections(axis=...) and rebuild contours per slice '
-        '(construction_plane + sketch_circle/sketch_polyline + loft/extrude, '
-        'in one batch); (c) organic shape -> import_mesh + mesh_reduce + '
-        'mesh_to_brep(method="organic" or "prismatic").\n'
-        '3) Exploit symmetry: model half, then mirror.\n'
-        '4) Add parameters (add_parameter) for key dimensions so the rebuild '
-        'is editable.\n'
-        '5) Verify: export("stl", temp_path) then scan_deviation(scan, temp) '
-        '— scan_align first if the rebuild is not in the scan frame; iterate '
-        'on the worst regions until within tolerance.\n'
-        '6) Show the result: multi_screenshot + the deviation summary.'
+        '(target deviation <= %s mm). Turn the mesh into FEATURES, not splines.\n'
+        '0) If the file is GLB/PLY: scan_convert first. scan_analyze(path) for '
+        'size/units sanity — if the extents look wrong, ask the user.\n'
+        '1) scan_frame(path) — datum alignment: largest plane -> Z=0, long '
+        'direction -> X. Work on the *_framed.stl from here on (import_mesh '
+        'lands it on the origin).\n'
+        '2) scan_segment(framed) — read kinds: mostly planes+cylinders = '
+        'PRISMATIC part; mostly freeform = organic.\n'
+        '3) PRISMATIC: scan_features(framed) gives holes (Ø, depth, through), '
+        'patterns (pitch/rectangle/PCD), bosses, fillet radii, plate thickness. '
+        'Snap every number: fit_suggest / hole_spec / fastener_lookup / '
+        'scan_thread_identify on threaded stubs. Then per main face: '
+        'scan_profile(framed, axis, offset, to_fusion=true) -> a constrained '
+        'lines+arcs sketch -> extrude to the measured thickness; holes with '
+        'hole(); fillets with fillet_max_radius (never guess a radius that '
+        'BLEND_TOO_BIG rejects). new_document first if the current one is a '
+        'Part-type or has mesh edits.\n'
+        '   ORGANIC / covers over an object: scan_mesh_offset(mode="monotone") '
+        'for the drop-on cavity, scan_cavity_sections + loft_from_sections for '
+        'the outer skin, or mesh_to_brep for a faceted reference.\n'
+        '4) Exploit symmetry (scan_analyze.symmetry_planes): model half, mirror.\n'
+        '5) Parameters: add_parameter for every measured dimension (thickness, '
+        'pitch, hole Ø) so the rebuild is editable.\n'
+        '6) Verify with numbers: export("stl", temp) -> scan_deviation(scan, '
+        'temp) for shape, scan_fit_report(model, scan) for a part that must '
+        'seat on the scanned object (PASS/WARN/FAIL). Iterate on the worst '
+        'regions until within tolerance.\n'
+        '7) Show: multi_screenshot + the deviation / fit summary. Never quote '
+        'raw scan diameters as final — dark glossy surfaces scan 2-3 mm under.'
         % ((' at %r' % scan_path) if scan_path else '', tolerance_mm)
     )
 
@@ -2600,7 +2893,9 @@ _TOOLSET_RULES = (
     ('data', ('data_folders', 'version_history', 'share_link',
               'list_documents', 'open_document')),
     ('diag', ('design_diagnostics', 'sketch_status', 'sketch_doctor',
-              'interference', 'mass_properties', 'api_introspect')),
+              'interference', 'mass_properties', 'api_introspect',
+              'capabilities_probe')),
+    ('detail', ('add_boss', 'add_snap_fit', 'add_clip_fir_tree')),
 )
 
 

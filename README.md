@@ -154,6 +154,30 @@ raport odchyłek odbudowa↔skan (pętla: buduj → mierz → poprawiaj);
 FDM: zmieszczenie na stole (wszystkie orientacje), pole nawisów bez podpór,
 cienkie ścianki, szczelność + rekomendacje (bez Fusion; wymaga extras `re`).
 Prompt `reverse_engineer_scan` prowadzi cały przepływ skan→CAD.
+**Skan → cechy, nie splajny (v1.16+, moduł `recon`, deterministycznie — bez
+RANSAC)**: `scan_frame(path)` — ustawienie skanu na własnych bazach (największa
+płaszczyzna → Z=0, kierunek dominujący → X, macierz 4×4 do `import_mesh`);
+`scan_segment(path)` — podział na łaty płaszczyzna/walec/sfera/swobodna z grafem
+sąsiedztwa (opcjonalny PLY pokolorowany po łatach); `scan_features(path)` — karta
+pomiarowa: otwory (środek, Ø, głębokość, przelotowy/ślepy), wycięcia, czopy,
+promienie zaokrągleń, **wzory otworów** (para/liniowy/prostokąt/PCD), grubości
+płyt; `scan_profile(path, axis, offset, to_fusion)` — przekrój jako **linie +
+łuki** (narożniki, scalanie łuków, styczność, snap kątów 45° i promieni) i od razu
+szkic z wiązaniami w Fusion (`sketch_profile`); `scan_thread_identify(path)` —
+skok, kierunek, Ø zewn./wewn. gwintu i oznaczenie ISO 261/UNC/UNF;
+`scan_mesh_offset(path, distance, mode="offset"|"monotone")` — wokselowy offset
+skanu = gotowy cutter wnęki (monotone gwarantuje wsuwanie po osi);
+`scan_fit_report(model, scan)` — jedna karta PASS/WARN/FAIL (osadzenie,
+drukowalność, ścianki, DFM). Po stronie Fusion: `capabilities_probe()` — które
+Preview API istnieją na tym buildzie (zamiast ręcznego checklistu po update),
+`new_document(kind, direct)`, `fillet_max_radius(edges, radius, fallback)` —
+bisekcja do największego działającego promienia (opcjonalnie fazka),
+`sketch_profile(segments)`, generatory detali druku: `add_boss` (słupek pod
+heat-set/śrubę z otworem i zaokrągleniem), `add_snap_fit` (zatrzask wspornikowy z
+kontrolą odkształcenia i sił dla materiału), `add_clip_fir_tree` (spinka
+„choinka” w otwór — jeden revolve); `interference(ignore_coincident=True)` — test
+montażu; `set_design_mode(mode="get")` — tryb, rozmiar timeline i reguły trybu
+bezpośredniego.
 **FreeCAD (drugi kernel, v1.15+)** — headless przez `freecadcmd` (FreeCAD 1.x
 wykrywany automatycznie lub `FUSION_MCP_FREECAD`; subprocess — serwer nie
 importuje FreeCAD): `freecad_fem(path, fixed, loads, material)` — „czy ta

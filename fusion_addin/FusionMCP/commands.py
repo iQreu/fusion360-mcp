@@ -24,7 +24,7 @@ import adsk.fusion
 import logutil
 from registry import Registry
 
-VERSION = '1.15.0'
+VERSION = '1.16.0'
 MM = 0.1  # 1 mm = 0.1 cm (Fusion internal length unit)
 
 _registry = Registry()
@@ -60,7 +60,7 @@ _READ_ONLY_OPS = frozenset({
     'mesh_compare', 'thread_types', 'api_introspect', 'selection_filter',
     'list_materials', 'list_appearances', 'data_folders', 'version_history',
     'share_link', 'annotate', 'annotations_clear',
-    'design_diagnostics', 'sketch_status',
+    'design_diagnostics', 'sketch_status', 'capabilities_probe',
     # File writers that do not mutate the design (cache-wise read-only; the
     # server still omits readOnlyHint on them because they write user paths).
     'mesh_export', 'face_groups', 'canvas_list',
@@ -79,7 +79,10 @@ def _design_signature(app):
         tl = design.timeline.count
     except Exception:
         tl = 0
-    params = tuple((prm.name, prm.expression) for prm in design.allParameters)
+    try:
+        params = tuple((prm.name, prm.expression) for prm in design.allParameters)
+    except Exception:  # noqa: BLE001 - direct-modelling designs raise here
+        params = ()
     return (root.bRepBodies.count, root.sketches.count, root.occurrences.count,
             tl, hash(params))
 
@@ -296,9 +299,12 @@ def op_get_state(app, p):
         })
 
     params = []
-    for prm in design.allParameters:
-        params.append({'name': prm.name, 'value_internal': prm.value,
-                       'expression': prm.expression, 'unit': prm.unit})
+    try:
+        for prm in design.allParameters:
+            params.append({'name': prm.name, 'value_internal': prm.value,
+                           'expression': prm.expression, 'unit': prm.unit})
+    except Exception:  # noqa: BLE001 - direct-modelling designs have no parameters
+        params = []
 
     direct = design.designType == adsk.fusion.DesignTypes.DirectDesignType
     state = {
@@ -1718,6 +1724,11 @@ def op_interference(app, p):
     design = _design(app)
     coll = _collection(p['bodies'])
     iin = design.createInterferenceInput(coll)
+    if p.get('ignore_coincident'):
+        # Touching faces are not interference (assembly check: 40 bodies,
+        # 0 overlaps — live-verified 2026-09-01).
+        with contextlib.suppress(Exception):
+            iin.areCoincidentFacesIgnored = True
     results = design.analyzeInterference(iin)
     hits = []
     for i in range(results.count):
@@ -1734,7 +1745,14 @@ def op_interference(app, p):
                 hit[key] = _registry.add('bdy', ent)
                 hit[key + '_name'] = ent.name
         hits.append(hit)
-    return {'count': results.count, 'interferences': hits}
+    out = {'count': results.count, 'interferences': hits,
+           'bodies_checked': coll.count,
+           'coincident_faces_ignored': bool(p.get('ignore_coincident'))}
+    if hits:
+        out['pairs'] = ['%s <> %s (%s mm3)' % (h.get('body_a_name', '?'),
+                                               h.get('body_b_name', '?'),
+                                               h.get('volume_mm3')) for h in hits[:20]]
+    return out
 
 
 _IMPORT_OPTS = {
@@ -4158,16 +4176,43 @@ def op_set_design_mode(app, p):
     edit history. Switching to direct on a design with history flattens it.
     """
     design = _design(app)
-    mode = (p.get('mode') or '').lower()
+    mode = (p.get('mode') or 'get').lower()
     types = adsk.fusion.DesignTypes
+    before = design.designType == types.DirectDesignType
+    timeline_count = None
+    with contextlib.suppress(Exception):
+        timeline_count = design.timeline.count
     if mode == 'direct':
         design.designType = types.DirectDesignType
     elif mode == 'parametric':
         design.designType = types.ParametricDesignType
-    else:
-        raise ValueError('mode must be "parametric" or "direct", got %r' % p.get('mode'))
+    elif mode != 'get':
+        raise ValueError('mode must be "parametric", "direct" or "get", got %r'
+                         % p.get('mode'))
     is_direct = design.designType == types.DirectDesignType
-    return {'design_type': 'direct' if is_direct else 'parametric'}
+    out = {'design_type': 'direct' if is_direct else 'parametric',
+           'timeline_features': timeline_count}
+    if mode != 'get':
+        wanted = mode == 'direct'
+        out['applied'] = is_direct == wanted
+        if not out['applied']:
+            out['warning'] = ('Fusion silently ignored the designType change — '
+                              'seen after mesh edits in a document. Build in a '
+                              'fresh document (new_document) instead.')
+    if is_direct:
+        out['direct_mode_rules'] = [
+            'no timeline: get_state/timeline report no features',
+            'copyPasteBodies unsupported — copy via TemporaryBRepManager in run_code',
+            'bodies with touching faces auto-merge — keep 0.2 mm gaps between parts',
+            'a cut that removes nothing raises InternalValidationError',
+        ]
+    if (not is_direct) and timeline_count and timeline_count > 300:
+        out['hint'] = ('Timeline has %d features: deletes/recomputes can exceed '
+                       'the 300 s bridge timeout. Consider mode="direct" for '
+                       'bulk edits.' % timeline_count)
+    if before != is_direct and not is_direct:
+        out['note'] = 'Switched to parametric: history starts empty from here.'
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -5583,9 +5628,731 @@ def op_batch(app, p):
 # --------------------------------------------------------------------------- #
 # Dispatch table
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# v1.16 — capability probe, documents, robust fillet, profile sketches,
+# printed-detail generators
+# --------------------------------------------------------------------------- #
+# (label, kind, spec, tools that depend on it). kind: 'features' = collection on
+# root.features (checked `is not None` — Features collections are FALSY even
+# when alive); 'class' = attribute on an API class; 'module' = importable
+# adsk submodule attribute; 'call' = zero-arg probe on live objects.
+_CAPABILITY_PROBES = (
+    ('meshConvertFeatures', 'features', 'meshConvertFeatures', 'mesh_to_brep'),
+    ('meshRepairFeatures', 'features', 'meshRepairFeatures', 'mesh_repair'),
+    ('meshSmoothFeatures', 'features', 'meshSmoothFeatures', 'mesh_smooth'),
+    ('meshShellFeatures', 'features', 'meshShellFeatures', 'mesh_shell'),
+    ('meshSeparateFeatures', 'features', 'meshSeparateFeatures', 'mesh_separate'),
+    ('meshReduceFeatures', 'features', 'meshReduceFeatures', 'mesh_reduce'),
+    ('meshRemeshFeatures', 'features', 'meshRemeshFeatures', 'mesh_remesh'),
+    ('meshPlaneCutFeatures', 'features', 'meshPlaneCutFeatures', 'mesh_plane_cut'),
+    ('foldFeatures', 'features', 'foldFeatures', 'fold'),
+    ('joinByBendFeatures', 'features', 'joinByBendFeatures', 'join_by_bend'),
+    ('cornerClosureFeatures', 'features', 'cornerClosureFeatures', 'corner_closure'),
+    ('flangeFeatures.add', 'features_attr', ('flangeFeatures', 'add'),
+     '(flange — expected absent)'),
+    ('PolygonMesh.triangleFaceGroupTempIds', 'class',
+     ('fusion', 'PolygonMesh', 'triangleFaceGroupTempIds'), 'face_groups(export)'),
+    ('PolygonMesh.compareWith', 'class', ('fusion', 'PolygonMesh', 'compareWith'), 'mesh_compare'),
+    ('MeshBody.silhouette', 'class', ('fusion', 'MeshBody', 'silhouette'), 'silhouette(mesh)'),
+    ('MeshBodies.addByTriangleMeshData', 'class',
+     ('fusion', 'MeshBodies', 'addByTriangleMeshData'), '(point-cloud import path)'),
+    ('TimelineBuilderJob', 'class', ('fusion', 'TimelineBuilderJob', None), 'timeline_builder'),
+    ('FastenerOccurrenceDefinition', 'class',
+     ('fusion', 'FastenerOccurrenceDefinition', None), 'insert_fastener(native)'),
+    ('VolumetricModel', 'class', ('fusion', 'VolumetricModel', None), '(lattice — future)'),
+    ('SketchFittedSplines.addBlendCurve', 'class',
+     ('fusion', 'SketchFittedSplines', 'addBlendCurve'), 'sketch_blend_curve'),
+    ('AutoConstrainInput', 'class', ('fusion', 'AutoConstrainInput', None), 'auto_constrain'),
+    ('Workspace.selectionFilterSettings', 'class',
+     ('core', 'Workspace', 'selectionFilterSettings'), 'selection_filter'),
+    ('ConstructionPlane.isExtended', 'class',
+     ('fusion', 'ConstructionPlane', 'isExtended'), 'construction_plane(extended)'),
+    ('Design.configurationTopTable', 'class',
+     ('fusion', 'Design', 'configurationTopTable'), 'configurations'),
+    ('Occurrences.addFromCustomConfiguration', 'class',
+     ('fusion', 'Occurrences', 'addFromCustomConfiguration'), '(config insert — future)'),
+    ('ContactSets', 'class', ('fusion', 'ContactSets', None), 'contact_set'),
+    ('Document.creationId', 'class', ('core', 'Document', 'creationId'), 'doc-switch token reset'),
+    ('drawing.DrawingManager', 'module', ('drawing', 'DrawingManager'), 'create_drawing'),
+    ('drawing.CreateDrawingInput', 'module', ('drawing', 'CreateDrawingInput'), 'create_drawing'),
+    ('drawing.Sheet.customTables', 'module_class', ('drawing', 'Sheet', 'customTables'),
+     'drawing_table'),
+    ('electron', 'module', ('electron', None), 'electronics_*'),
+    ('cam.Setups.createInput', 'module_class', ('cam', 'Setups', 'createInput'), 'cam_setup'),
+    ('importManager.createSVGImportOptions', 'app_attr',
+     ('importManager', 'createSVGImportOptions'), 'import_svg'),
+    ('rootComponent.canvases', 'root_attr', ('canvases',), 'canvas_*'),
+    ('rootComponent.customGraphicsGroups', 'root_attr', ('customGraphicsGroups',), 'annotate'),
+    ('design.analyses.sectionAnalyses', 'design_attr', ('analyses', 'sectionAnalyses'),
+     'section_view'),
+    ('commandDefinitions.UndoCommand', 'call', 'undo', 'undo'),
+)
+
+
+def _probe_one(app, design, root, kind, spec):
+    """True/False for a capability; a string when probing itself errored."""
+    try:
+        if kind == 'features':
+            return getattr(root.features, spec, None) is not None
+        if kind == 'features_attr':
+            coll = getattr(root.features, spec[0], None)
+            return coll is not None and hasattr(coll, spec[1])
+        if kind == 'class':
+            module = getattr(adsk, spec[0])
+            cls = getattr(module, spec[1], None)
+            if cls is None:
+                return False
+            return True if spec[2] is None else hasattr(cls, spec[2])
+        if kind == 'module':
+            try:
+                module = __import__('adsk.%s' % spec[0], fromlist=[spec[0]])
+            except ImportError:
+                return False
+            return True if spec[1] is None else hasattr(module, spec[1])
+        if kind == 'module_class':
+            try:
+                module = __import__('adsk.%s' % spec[0], fromlist=[spec[0]])
+            except ImportError:
+                return False
+            cls = getattr(module, spec[1], None)
+            return cls is not None and hasattr(cls, spec[2])
+        if kind == 'app_attr':
+            obj = getattr(app, spec[0], None)
+            return obj is not None and hasattr(obj, spec[1])
+        if kind == 'root_attr':
+            return root is not None and getattr(root, spec[0], None) is not None
+        if kind == 'design_attr':
+            obj = design
+            for name in spec:
+                obj = getattr(obj, name, None)
+                if obj is None:
+                    return False
+            return True
+        if kind == 'call' and spec == 'undo':
+            cmd = app.userInterface.commandDefinitions.itemById('UndoCommand')
+            return cmd is not None and cmd.controlDefinition is not None
+        return 'unknown probe kind %r' % kind
+    except Exception as exc:  # noqa: BLE001 - the error IS the finding
+        return 'error: %s' % str(exc).splitlines()[0][:120]
+
+
+def op_capabilities_probe(app, p):
+    """One call answers "which Preview/optional Fusion APIs exist on THIS
+    build?" for every surface FusionMCP probes at runtime — replaces the
+    manual api_introspect checklist after each Fusion update. Read-only."""
+    import sys as _sys
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    root = design.rootComponent if design else None
+    available, missing, errors, affects = {}, [], {}, {}
+    for label, kind, spec, tools in _CAPABILITY_PROBES:
+        if kind in ('features', 'features_attr', 'root_attr', 'design_attr') and root is None:
+            errors[label] = 'no active design'
+            continue
+        result = _probe_one(app, design, root, kind, spec)
+        if result is True:
+            available[label] = True
+        elif result is False:
+            available[label] = False
+            missing.append(label)
+            affects[label] = tools
+        else:
+            errors[label] = result
+    out = {
+        'fusion_version': getattr(app, 'version', None),
+        'python': _sys.version.split()[0],
+        'addin_version': VERSION,
+        'has_active_design': design is not None,
+        'probed': len(_CAPABILITY_PROBES),
+        'available_count': sum(1 for v in available.values() if v),
+        'available': available,
+        'missing': missing,
+        'missing_affects_tools': affects,
+    }
+    if design is not None:
+        out['design_type'] = ('direct' if design.designType
+                              == adsk.fusion.DesignTypes.DirectDesignType else 'parametric')
+    if errors:
+        out['probe_errors'] = errors
+    return out
+
+
+def op_new_document(app, p):
+    """Create a new Fusion design document and make it active. The API cannot
+    choose Part vs Assembly document type, but documents.add() yields a design
+    that accepts multiple components (a File>New document in Fusion 2026 may
+    be Part-type and refuse create_component). direct=True switches the new
+    design to direct modelling immediately."""
+    doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    design = None
+    with contextlib.suppress(Exception):
+        design = adsk.fusion.Design.cast(doc.products.itemByProductType('DesignProductType'))
+    if design is None:
+        design = adsk.fusion.Design.cast(app.activeProduct)
+    notes = []
+    if p.get('direct') and design is not None:
+        with contextlib.suppress(Exception):
+            design.designType = adsk.fusion.DesignTypes.DirectDesignType
+    if p.get('name'):
+        try:
+            doc.name = str(p['name'])
+        except Exception:  # noqa: BLE001 - name is read-only until saved on many builds
+            notes.append('Document name is set on save (saveAs) — the requested '
+                         'name was not applied to the unsaved document.')
+    is_direct = bool(design is not None and design.designType
+                     == adsk.fusion.DesignTypes.DirectDesignType)
+    out = {'document': doc.name, 'design_type': 'direct' if is_direct else 'parametric',
+           'kind': (p.get('kind') or 'assembly').lower(),
+           'note': 'Tokens from the previous document are invalid now (registry '
+                   'reset on document switch). Use create_component for parts.'}
+    if notes:
+        out['warnings'] = notes
+    return out
+
+
+def _edges_snapshot(tokens):
+    """(body, tempId) per edge so edges can be re-found after a trial
+    feature is added and deleted (handles can go stale across that)."""
+    snap = []
+    for tok in tokens:
+        edge = _registry.get(tok)
+        body, temp = None, None
+        with contextlib.suppress(Exception):
+            body, temp = edge.body, edge.tempId
+        snap.append((tok, edge, body, temp))
+    return snap
+
+
+def _edges_collection(snap):
+    coll = adsk.core.ObjectCollection.create()
+    for tok, edge, body, temp in snap:
+        found = None
+        if body is not None and temp is not None:
+            with contextlib.suppress(Exception):
+                hits = body.findByTempId(temp)
+                if hits and len(hits):
+                    found = hits[0]
+        target = found if found is not None else edge
+        if found is not None and found is not edge:
+            with contextlib.suppress(Exception):
+                _registry.replace(tok, found)
+        coll.add(target)
+    return coll
+
+
+def op_fillet_max_radius(app, p):
+    """Largest fillet radius that succeeds on the given edges: try the
+    requested radius, then bisect between r_min and it (each trial fillet is
+    added and deleted — no dry-run API). apply=True adds the winning fillet;
+    fallback="chamfer" adds an equal-distance chamfer when NO radius works
+    (slim-deck perimeters where ASM_BL_BLEND_TOO_BIG bites even at R0.4)."""
+    root = _root(app)
+    feats = root.features.filletFeatures
+    tokens = p['edges']
+    r_hi = float(p['radius'])
+    r_lo = float(p.get('r_min', 0.2))
+    steps = max(1, int(p.get('steps', 7)))
+    apply = p.get('apply', True)
+    fallback = (p.get('fallback') or 'none').lower()
+    if r_hi <= 0 or r_lo <= 0 or r_lo > r_hi:
+        raise ValueError('need 0 < r_min <= radius')
+    snap = _edges_snapshot(tokens)
+    healthy = None
+    with contextlib.suppress(Exception):
+        healthy = adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState
+
+    def trial(radius):
+        fin = feats.createInput()
+        fin.addConstantRadiusEdgeSet(_edges_collection(snap), _vi(radius * MM), True)
+        try:
+            feat = feats.add(fin)
+        except Exception as exc:  # noqa: BLE001 - failure is the measurement
+            return False, str(exc).splitlines()[0][:160]
+        ok = True
+        if healthy is not None:
+            with contextlib.suppress(Exception):
+                ok = feat.healthState == healthy
+        removed = False
+        with contextlib.suppress(Exception):
+            removed = bool(feat.deleteMe())
+        if not removed:
+            raise RuntimeError('Could not remove a trial fillet (R%.3f) — the '
+                               'timeline now holds it; undo before retrying.' % radius)
+        return ok, None
+
+    tried = []
+    ok, err = trial(r_hi)
+    tried.append({'radius_mm': round(r_hi, 4), 'ok': ok, 'error': err})
+    best = r_hi if ok else None
+    if best is None:
+        ok, err = trial(r_lo)
+        tried.append({'radius_mm': round(r_lo, 4), 'ok': ok, 'error': err})
+        if ok:
+            best, lo, hi = r_lo, r_lo, r_hi
+            for _ in range(steps):
+                mid = (lo + hi) / 2.0
+                ok, err = trial(mid)
+                tried.append({'radius_mm': round(mid, 4), 'ok': ok, 'error': err})
+                if ok:
+                    best, lo = mid, mid
+                else:
+                    hi = mid
+                if hi - lo < 0.02:
+                    break
+    out = {'requested_mm': r_hi, 'max_radius_mm': round(best, 3) if best else None,
+           'trials': tried}
+    if not apply:
+        return out
+    if best is not None:
+        fin = feats.createInput()
+        fin.addConstantRadiusEdgeSet(_edges_collection(snap), _vi(best * MM), True)
+        out.update(_feature_result(feats.add(fin), 'fillet'))
+        out['applied'] = 'fillet'
+        if best < r_hi:
+            out['note'] = ('Requested R%.2f failed; applied the largest working '
+                           'R%.3f.' % (r_hi, best))
+    elif fallback == 'chamfer':
+        cfeats = root.features.chamferFeatures
+        dist = _vi(float(p.get('chamfer_distance', r_hi)) * MM)
+        edges = _edges_collection(snap)
+        try:
+            cin = cfeats.createInput2()
+            cin.chamferEdgeSets.addEqualDistanceChamferEdgeSet(edges, dist, True)
+        except Exception:  # noqa: BLE001 - older API
+            cin = cfeats.createInput(edges, True)
+            cin.setToEqualDistance(dist)
+        out.update(_feature_result(cfeats.add(cin), 'chamfer'))
+        out['applied'] = 'chamfer'
+        out['note'] = 'No fillet radius >= r_min works on these edges — chamfered instead.'
+    else:
+        out['applied'] = None
+        out['note'] = ('No fillet radius >= r_min works on these edges. Try '
+                       'fallback="chamfer", or fillet fewer edges at a time.')
+    return out
+
+
+def _plane_with_offset(app, plane_ref, offset_mm):
+    plane = _resolve_plane(app, plane_ref or 'XY')
+    if offset_mm:
+        planes = _root(app).constructionPlanes
+        cin = planes.createInput()
+        cin.setByOffset(plane, _vi(float(offset_mm) * MM))
+        plane = planes.add(cin)
+    return plane
+
+
+def _seg_point(sk, seg, key):
+    """Sketch-space Point3D for a segment endpoint: *_3d (world mm) goes
+    through modelToSketchSpace; plain 2D is taken as sketch coordinates."""
+    if seg.get(key + '_3d') is not None:
+        x, y, z = seg[key + '_3d']
+        return sk.modelToSketchSpace(_pt(x, y, z))
+    x, y = seg[key][:2]
+    return _pt(x, y)
+
+
+def op_sketch_profile(app, p):
+    """Build a sketch from LINE + ARC segments (scan_profile output) with
+    consecutive curves sharing their SketchPoints (implicitly coincident —
+    one closed profile, not a spline). Optional horizontal/vertical/tangent
+    constraints and driving dimensions. loops: [{segments, closed}] or a
+    single segments list. plane + offset place the sketch."""
+    plane = _plane_with_offset(app, p.get('plane', 'XY'), p.get('offset', 0))
+    sk = _root(app).sketches.add(plane)
+    if p.get('name'):
+        sk.name = p['name']
+    loops = p.get('loops')
+    if not loops:
+        loops = [{'segments': p.get('segments') or [], 'closed': p.get('closed', True)}]
+    want_constraints = bool(p.get('constraints', True))
+    want_dims = bool(p.get('dimensions', False))
+    lines_c = sk.sketchCurves.sketchLines
+    arcs_c = sk.sketchCurves.sketchArcs
+    gc = sk.geometricConstraints
+    dims = sk.sketchDimensions
+    n_curves = n_con = n_dim = 0
+    curve_tokens = []
+    warnings = []
+    for loop in loops:
+        segs = loop.get('segments') or []
+        closed = bool(loop.get('closed', True))
+        if len(segs) < (1 if not closed else 2):
+            continue
+        first_pt = None
+        prev_pt = None
+        prev_curve = None
+        created = []
+        for k, seg in enumerate(segs):
+            last = k == len(segs) - 1
+            start = prev_pt if prev_pt is not None else _seg_point(sk, seg, 'start')
+            end = first_pt if (closed and last and first_pt is not None) \
+                else _seg_point(sk, seg, 'end')
+            kind = (seg.get('kind') or 'line').lower()
+            if kind == 'arc':
+                mid = _seg_point(sk, seg, 'mid')
+                curve = arcs_c.addByThreePoints(start, mid, end)
+                curve_tokens.append(_registry.add('arc', curve))
+            else:
+                curve = lines_c.addByTwoPoints(start, end)
+                curve_tokens.append(_registry.add('lin', curve))
+            n_curves += 1
+            created.append((kind, curve))
+            if first_pt is None:
+                first_pt = curve.startSketchPoint
+            prev_pt = curve.endSketchPoint
+            if want_constraints:
+                if kind == 'line':
+                    with contextlib.suppress(Exception):
+                        a, b = curve.startSketchPoint.geometry, curve.endSketchPoint.geometry
+                        dx, dy = b.x - a.x, b.y - a.y
+                        length = math.hypot(dx, dy)
+                        if length > 0 and abs(dy) / length < 0.0087:   # 0.5 deg
+                            gc.addHorizontal(curve)
+                            n_con += 1
+                        elif length > 0 and abs(dx) / length < 0.0087:
+                            gc.addVertical(curve)
+                            n_con += 1
+                if prev_curve is not None and 'arc' in (kind, prev_curve[0]) \
+                        and seg.get('tangent', True):
+                    with contextlib.suppress(Exception):
+                        gc.addTangent(prev_curve[1], curve)
+                        n_con += 1
+            if want_dims:
+                with contextlib.suppress(Exception):
+                    a, b = curve.startSketchPoint, curve.endSketchPoint
+                    ga, gb = a.geometry, b.geometry
+                    tx = adsk.core.Point3D.create((ga.x + gb.x) / 2 + 2 * MM,
+                                                  (ga.y + gb.y) / 2 + 2 * MM, 0)
+                    if kind == 'arc':
+                        dims.addRadialDimension(curve, tx)
+                    else:
+                        dims.addDistanceDimension(
+                            a, b, adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+                            tx)
+                    n_dim += 1
+            prev_curve = (kind, curve)
+        if closed and want_constraints and created and 'arc' in (created[0][0], created[-1][0]):
+            with contextlib.suppress(Exception):
+                gc.addTangent(created[-1][1], created[0][1])
+                n_con += 1
+    out = _profiles_summary(sk)
+    out.update({'curves': n_curves, 'curve_tokens': curve_tokens[:60],
+                'constraints_added': n_con, 'dimensions_added': n_dim,
+                'plane': _registry.add('pln', plane) if p.get('offset') else p.get('plane', 'XY')})
+    if not out['profiles']:
+        warnings.append('No closed profile formed — check that the loop is '
+                        'closed and segments join end-to-start.')
+    if warnings:
+        out['warnings'] = warnings
+    return out
+
+
+def _sketch_frame(sk):
+    """World-space origin and unit directions of a sketch (Vector3D -> tuples)."""
+    o = sk.origin
+    xd, yd = sk.xDirection, sk.yDirection
+    x = (xd.x, xd.y, xd.z)
+    y = (yd.x, yd.y, yd.z)
+    n = (x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0])
+    return (o.x, o.y, o.z), x, y, n
+
+
+def _world_from_frame(origin, x_dir, y_dir, n_dir, u_cm, v_cm, w_cm):
+    return adsk.core.Point3D.create(
+        origin[0] + u_cm * x_dir[0] + v_cm * y_dir[0] + w_cm * n_dir[0],
+        origin[1] + u_cm * x_dir[1] + v_cm * y_dir[1] + w_cm * n_dir[1],
+        origin[2] + u_cm * x_dir[2] + v_cm * y_dir[2] + w_cm * n_dir[2])
+
+
+def _largest_profile(sk):
+    best, best_area = None, -1.0
+    for i in range(sk.profiles.count):
+        prof = sk.profiles.item(i)
+        area = 0.0
+        with contextlib.suppress(Exception):
+            area = prof.areaProperties().area
+        if area > best_area:
+            best, best_area = prof, area
+    return best
+
+
+def op_add_boss(app, p):
+    """Screw/heat-set boss: cylinder Ø`diameter` × `height` joined onto the
+    part at (x, y) on `plane` (a planar face token or XY/XZ/YZ + offset),
+    with a blind hole Ø`hole_diameter` × `hole_depth` from the top and an
+    optional base fillet. Use hole_spec(kind="heat_set") for the hole size."""
+    root = _root(app)
+    plane = _plane_with_offset(app, p.get('plane', 'XY'), p.get('offset', 0))
+    x, y = float(p.get('x', 0)), float(p.get('y', 0))
+    dia = float(p['diameter'])
+    height = float(p['height'])
+    hole_d = float(p.get('hole_diameter', 0) or 0)
+    hole_depth = float(p.get('hole_depth', 0) or 0) or height * 0.8
+    if hole_d and hole_d >= dia - 1.2:
+        raise ValueError('hole_diameter leaves < 0.6 mm wall on the boss')
+    operation = _operation(p.get('operation', 'join'))
+    sk = root.sketches.add(plane)
+    sk.name = p.get('name', 'boss')
+    sk.sketchCurves.sketchCircles.addByCenterRadius(_pt(x, y), dia / 2.0 * MM)
+    ext = root.features.extrudeFeatures
+    ein = ext.createInput(sk.profiles.item(0), operation)
+    ein.setDistanceExtent(False, _vi(height * MM))
+    boss = ext.add(ein)
+    out = _feature_result(boss, 'boss')
+    out['sketch'] = _registry.add('skt', sk)
+    if hole_d:
+        sk2 = root.sketches.add(plane)
+        sk2.name = '%s_hole' % sk.name
+        sk2.sketchCurves.sketchCircles.addByCenterRadius(_pt(x, y), hole_d / 2.0 * MM)
+        hin = ext.createInput(sk2.profiles.item(0),
+                              adsk.fusion.FeatureOperations.CutFeatureOperation)
+        # Start the cut `hole_depth` below the top and run past it.
+        hin.startExtent = adsk.fusion.OffsetStartDefinition.create(
+            _vi((height - hole_depth) * MM))
+        hin.setDistanceExtent(False, _vi((hole_depth + 0.5) * MM))
+        with contextlib.suppress(Exception):
+            hin.participantBodies = [b for b in boss.bodies]
+        hole = ext.add(hin)
+        out['hole'] = _feature_result(hole, 'boss_hole')
+        out['hole']['diameter_mm'] = hole_d
+        out['hole']['depth_mm'] = hole_depth
+    fillet_r = float(p.get('base_fillet', 0) or 0)
+    if fillet_r:
+        # The boss side face is cylindrical; of its two circular edges the
+        # base one lies on the sketch plane (smaller offset along the normal).
+        try:
+            origin, _xd, _yd, n_dir = _sketch_frame(sk)
+            best, best_h = None, None
+            for i in range(boss.sideFaces.count):
+                face = boss.sideFaces.item(i)
+                for edge in face.edges:
+                    geo = edge.geometry
+                    centre = getattr(geo, 'center', None)
+                    if centre is None:
+                        continue
+                    h = ((centre.x - origin[0]) * n_dir[0] + (centre.y - origin[1]) * n_dir[1]
+                         + (centre.z - origin[2]) * n_dir[2])
+                    if best is None or abs(h) < abs(best_h):
+                        best, best_h = edge, h
+            if best is not None:
+                coll = adsk.core.ObjectCollection.create()
+                coll.add(best)
+                fin = root.features.filletFeatures.createInput()
+                fin.addConstantRadiusEdgeSet(coll, _vi(fillet_r * MM), True)
+                out['base_fillet'] = _feature_result(
+                    root.features.filletFeatures.add(fin), 'fillet')
+        except Exception as exc:  # noqa: BLE001 - cosmetic; report, don't fail the boss
+            out['base_fillet_error'] = str(exc).splitlines()[0][:160]
+    wall = (dia - hole_d) / 2.0 if hole_d else dia / 2.0
+    out['wall_mm'] = round(wall, 3)
+    if hole_d and wall < 1.6:
+        out['warning'] = ('Boss wall %.2f mm is thin for a heat-set insert '
+                          '(aim >= 1.6-2 mm, or 2x nozzle + 0.4).' % wall)
+    return out
+
+
+# Allowable dynamic strain for a printed cantilever snap-fit (fraction).
+_SNAP_STRAIN = {'pla': 0.012, 'petg': 0.025, 'abs': 0.025, 'asa': 0.025,
+                'pa': 0.045, 'nylon': 0.045, 'pc': 0.03, 'pp': 0.06, 'tpu': 0.15}
+_SNAP_MODULUS_MPA = {'pla': 3200.0, 'petg': 2000.0, 'abs': 2000.0, 'asa': 2100.0,
+                     'pa': 1500.0, 'nylon': 1500.0, 'pc': 2300.0, 'pp': 1200.0,
+                     'tpu': 60.0}
+
+
+def snap_fit_profile(length, thickness, undercut, lead_angle_deg=30.0,
+                     tip_flat=None, taper=False):
+    """2D outline (mm, CCW) of a cantilever snap hook: root at x=0, beam along
+    +x, retention face vertical at x=length facing the root, lead-in slope on
+    the tip. Pure geometry — unit-tested without Fusion."""
+    t, u, L = float(thickness), float(undercut), float(length)
+    lf = float(tip_flat) if tip_flat is not None else max(0.4, 0.5 * t)
+    lead = u / math.tan(math.radians(max(5.0, min(80.0, lead_angle_deg))))
+    lh = lf + lead
+    t_end = t / 2.0 if taper else t
+    pts = [(0.0, 0.0)]
+    if taper:
+        pts.append((L, t - t_end))
+    pts += [(L + lh, t - t_end), (L + lh, t), (L + lf, t + u), (L, t + u), (L, t), (0.0, t)]
+    return [[round(a, 4), round(b, 4)] for a, b in pts]
+
+
+def snap_fit_mechanics(length, thickness, undercut, width, material='petg',
+                       lead_angle_deg=30.0, taper=False, friction=0.3):
+    """Strain, deflection force and insertion force for the hook (linear
+    cantilever formulas, Bayer/BASF snap-fit design guides)."""
+    L, t, u, w = float(length), float(thickness), float(undercut), float(width)
+    key = (material or 'petg').lower()
+    eps_allow = _SNAP_STRAIN.get(key, 0.02)
+    modulus = _SNAP_MODULUS_MPA.get(key, 2000.0)
+    k_factor = 1.09 if taper else 1.5          # tapered-to-half beam vs uniform
+    strain = k_factor * t * u / (L * L) if L > 0 else float('inf')
+    force = modulus * w * t * t * strain / (6.0 * L) if L > 0 else float('inf')
+    tan_a = math.tan(math.radians(lead_angle_deg))
+    denom = 1.0 - friction * tan_a
+    insertion = force * (friction + tan_a) / denom if denom > 0 else float('inf')
+    out = {'material': key, 'strain': round(strain, 4), 'strain_allowable': eps_allow,
+           'ok': strain <= eps_allow, 'deflection_force_n': round(force, 2),
+           'insertion_force_n': round(insertion, 2), 'modulus_mpa': modulus}
+    if strain > eps_allow:
+        needed = math.sqrt(k_factor * t * u / eps_allow)
+        out['suggest_length_mm'] = round(needed, 2)
+        out['suggest_undercut_mm'] = round(eps_allow * L * L / (k_factor * t), 2)
+    return out
+
+
+def op_add_snap_fit(app, p):
+    """Cantilever snap-fit hook sketched on `plane` (side view) at (x, y):
+    beam `length` × `thickness`, hook `undercut`, `lead_angle`, extruded
+    `width` symmetric about the plane (operation join/new). Returns strain
+    vs the material's allowable and the forces — redesign hints included."""
+    root = _root(app)
+    plane = _plane_with_offset(app, p.get('plane', 'XY'), p.get('offset', 0))
+    x0, y0 = float(p.get('x', 0)), float(p.get('y', 0))
+    angle = math.radians(float(p.get('direction_deg', 0)))
+    length, thick, under = float(p['length']), float(p['thickness']), float(p['undercut'])
+    width = float(p.get('width', 6.0))
+    lead = float(p.get('lead_angle', 30.0))
+    taper = bool(p.get('taper', False))
+    pts = snap_fit_profile(length, thick, under, lead, p.get('tip_flat'), taper)
+    ca, sa = math.cos(angle), math.sin(angle)
+    placed = [[x0 + a * ca - b * sa, y0 + a * sa + b * ca] for a, b in pts]
+    sk = root.sketches.add(plane)
+    sk.name = p.get('name', 'snap_fit')
+    lines = sk.sketchCurves.sketchLines
+    prev = None
+    first = None
+    for k, (a, b) in enumerate(placed):
+        nxt = placed[(k + 1) % len(placed)]
+        start = prev if prev is not None else _pt(a, b)
+        end = first if (k == len(placed) - 1 and first is not None) else _pt(nxt[0], nxt[1])
+        line = lines.addByTwoPoints(start, end)
+        if first is None:
+            first = line.startSketchPoint
+        prev = line.endSketchPoint
+    ext = root.features.extrudeFeatures
+    ein = ext.createInput(_largest_profile(sk), _operation(p.get('operation', 'join')))
+    if p.get('one_sided'):
+        ein.setDistanceExtent(False, _vi(width * MM))
+    else:
+        ein.setSymmetricExtent(_vi(width * MM), True)
+    out = _feature_result(ext.add(ein), 'snap_fit')
+    out['sketch'] = _registry.add('skt', sk)
+    out['profile_mm'] = pts
+    out['mechanics'] = snap_fit_mechanics(length, thick, under, width,
+                                          p.get('material', 'petg'), lead, taper)
+    if not out['mechanics']['ok']:
+        out['warning'] = ('Strain %.1f%% exceeds %.1f%% allowable for %s — '
+                          'lengthen the beam or reduce the undercut (see '
+                          'mechanics.suggest_*).' % (100 * out['mechanics']['strain'],
+                                                     100 * out['mechanics']['strain_allowable'],
+                                                     out['mechanics']['material']))
+    out['note'] = ('Print the hook with layers ALONG the beam (beam axis in '
+                   'the bed plane) — a hook printed standing up snaps at the '
+                   'root along a layer line.')
+    return out
+
+
+def fir_tree_profile(hole_diameter, panel_thickness, head_diameter=None,
+                     head_thickness=1.5, fins=3, fin_pitch=None, interference=0.4,
+                     stem_diameter=None, lead=1.2, fin_thickness=0.4, tip=1.5,
+                     gap=0.6):
+    """Half profile (r, z) of a push-in 'fir tree' clip for a round hole,
+    revolved about z. Head at z in [0, head_thickness]; stem points to -z;
+    each fin: flat retention face toward the head, conical lead-in toward
+    the tip. The closing segment runs along the axis (revolve axis)."""
+    d = float(hole_diameter)
+    rh = (float(head_diameter) if head_diameter else d + 6.0) / 2.0
+    rs = (float(stem_diameter) if stem_diameter else 0.55 * d) / 2.0
+    rf = d / 2.0 + float(interference)
+    pitch = float(fin_pitch) if fin_pitch else max(1.2, float(lead) + float(fin_thickness) + 0.4)
+    if rs >= rf:
+        raise ValueError('stem_diameter must be smaller than hole_diameter')
+    z_first = -(float(panel_thickness) + float(gap))
+    pts = [(0.0, float(head_thickness)), (rh, float(head_thickness)), (rh, 0.0), (rs, 0.0)]
+    z = z_first
+    for _ in range(max(1, int(fins))):
+        pts += [(rs, z), (rf, z - float(fin_thickness)),
+                (rs, z - float(fin_thickness) - float(lead))]
+        z -= pitch
+    z_tip = z + pitch - float(fin_thickness) - float(lead) - 0.4
+    pts += [(rs, z_tip), (0.6 * rs, z_tip - float(tip)), (0.0, z_tip - float(tip))]
+    return [[round(a, 4), round(b, 4)] for a, b in pts]
+
+
+def op_add_clip_fir_tree(app, p):
+    """Push-in 'fir tree' (Christmas-tree) clip for a round hole Ø
+    `hole_diameter` through a panel `panel_thickness`, standing on `plane`
+    at (x, y) with its axis along the plane normal: head bottom on the
+    plane, head on the +normal side, stem through -normal (into the panel);
+    flip=True mirrors (stem +normal — handy for a standalone part on XY).
+    Built as one revolve, so it is a single clean body (operation new/join)."""
+    root = _root(app)
+    base_plane = _plane_with_offset(app, p.get('plane', 'XY'), p.get('offset', 0))
+    x0, y0 = float(p.get('x', 0)), float(p.get('y', 0))
+    prof = fir_tree_profile(
+        p['hole_diameter'], p.get('panel_thickness', 1.5), p.get('head_diameter'),
+        p.get('head_thickness', 1.5), p.get('fins', 3), p.get('fin_pitch'),
+        p.get('interference', 0.4), p.get('stem_diameter'), p.get('lead', 1.2),
+        p.get('fin_thickness', 0.4), p.get('tip', 1.5), p.get('gap', 0.6))
+    sign = -1.0 if p.get('flip') else 1.0
+    # Helper sketch on the base plane gives the world frame + an in-plane
+    # line to hinge a perpendicular construction plane on.
+    base_sk = root.sketches.add(base_plane)
+    base_sk.name = p.get('name', 'clip') + '_axis'
+    helper = base_sk.sketchCurves.sketchLines.addByTwoPoints(_pt(x0, y0), _pt(x0 + 5.0, y0))
+    helper.isConstruction = True
+    origin, x_dir, y_dir, n_dir = _sketch_frame(base_sk)
+    planes = root.constructionPlanes
+    cin = planes.createInput()
+    cin.setByAngle(helper, _vi(math.radians(90.0)), base_plane)
+    side_plane = planes.add(cin)
+    sk = root.sketches.add(side_plane)
+    sk.name = p.get('name', 'clip')
+    # Profile (r, z) -> world: radius runs along the helper line (x_dir),
+    # z along the plane normal. Head bottom (z=0) sits on the plane, head on
+    # the +normal side, stem through -normal (into the panel); flip mirrors.
+
+    def world_point(r, z):
+        return _world_from_frame(origin, x_dir, y_dir, n_dir,
+                                 (x0 + r) * MM, y0 * MM, sign * z * MM)
+    sk_pts = [sk.modelToSketchSpace(world_point(r, z)) for r, z in prof]
+    lines = sk.sketchCurves.sketchLines
+    prev = None
+    first = None
+    axis_line = None
+    for k in range(len(sk_pts)):
+        nxt = sk_pts[(k + 1) % len(sk_pts)]
+        start = prev if prev is not None else sk_pts[k]
+        end = first if (k == len(sk_pts) - 1 and first is not None) else nxt
+        line = lines.addByTwoPoints(start, end)
+        if first is None:
+            first = line.startSketchPoint
+        prev = line.endSketchPoint
+        if k == len(sk_pts) - 1:
+            axis_line = line          # tip-on-axis -> head-on-axis: the revolve axis
+    rev = root.features.revolveFeatures
+    rin = rev.createInput(_largest_profile(sk), axis_line, _operation(p.get('operation', 'new')))
+    rin.setAngleExtent(False, _vi(2.0 * math.pi))
+    out = _feature_result(rev.add(rin), 'clip_fir_tree')
+    out.update({'sketch': _registry.add('skt', sk), 'profile_rz_mm': prof,
+                'hole_diameter_mm': float(p['hole_diameter']),
+                'fin_diameter_mm': round(2 * max(r for r, _z in prof if _z < 0), 3),
+                'length_mm': round(prof[0][1] - min(z for _r, z in prof), 3)})
+    out['note'] = ('Fins are 2x interference oversize vs the hole; print the clip '
+                   'standing on its head (axis vertical) so the fins are flat '
+                   'perimeters. PETG/PA flex far better than PLA here.')
+    return out
+
+
 DISPATCH = {
     'ping': op_ping,
     'server_info': op_server_info,
+    'capabilities_probe': op_capabilities_probe,
+    'new_document': op_new_document,
+    'fillet_max_radius': op_fillet_max_radius,
+    'sketch_profile': op_sketch_profile,
+    'add_boss': op_add_boss,
+    'add_snap_fit': op_add_snap_fit,
+    'add_clip_fir_tree': op_add_clip_fir_tree,
     'get_state': op_get_state,
     'query_entities': op_query_entities,
     'create_sketch': op_create_sketch,

@@ -1,19 +1,17 @@
 [project]
 name = "fusion360-mcp"
-version = "1.15.0"
+version = "1.16.0"
 description = "Model Context Protocol server for Autodesk Fusion 360"
 requires-python = ">=3.10"
 dependencies = [
-    # >=1.29: the FINAL 1.x line (2026-07-28) — 1.x is maintenance-only now, so
-    # take its last fixes deliberately. The server degrades gracefully to plain
-    # tools on older SDKs (see _annot in server.py).
-    # <2: mcp 2.0 (spec 2026-07-28) renames FastMCP to MCPServer with NO alias
-    # (mcp.server.fastmcp imports die), moves sync tools onto anyio worker
-    # threads, and replaces ctx.elicit on new-spec connections with the
-    # Resolve() pattern — migrate deliberately, not via a silent pip upgrade.
-    # >=1.29.1: final 1.x maintenance release (2026-08-24) — request-body
-    # limits on SSE/OAuth endpoints.
-    "mcp>=1.29.1,<2",
+    # >=1.29.1: final 1.x maintenance release (2026-08-24). The server degrades
+    # gracefully to plain tools on older SDKs (see _annot in server.py).
+    # <3: v1.16 runs on BOTH 1.x and 2.x — server.py shims the FastMCP ->
+    # MCPServer rename (2.x has no alias) and the Context import path; 2.x
+    # runs sync tools on anyio worker threads, which is safe because
+    # FusionClient.call holds a lock for the whole request/response. Verified
+    # by importing server.py under mcp 2.x (198 tools registered).
+    "mcp>=1.29.1,<3",
     # ISO 286 fit/tolerance data for fit_suggest (MIT, pure Python, tiny).
     "isofits>=1.0",
 ]
@@ -32,6 +30,8 @@ re = [
     "pyransac3d>=0.6",
     # trimesh's ray backend (wall thickness, dfm occlusion) needs rtree.
     "rtree>=1.0",
+    # marching cubes for scan_mesh_offset (voxel offset / drop-on cavity).
+    "scikit-image>=0.22",
 ]
 # Photo -> CAD (photo_rectify/photo_to_sketch). The -contrib- headless OpenCV
 # wheel carries the ArUco marker detector; plain opencv-python would clash.

@@ -65,6 +65,13 @@ class Registry:
     def get_opt(self, token):
         return self._by_token.get(token)
 
+    def replace(self, token, obj):
+        """Point an existing token at a fresh live object (e.g. an edge
+        re-found by tempId after a trial feature was added and deleted).
+        Unknown tokens are ignored — this never mints new tokens."""
+        if token in self._by_token:
+            self._by_token[token] = obj
+
     def remove(self, token):
         """Forget a token (its entity was deleted). A later get() then raises
         the helpful KeyError instead of returning a dead API wrapper."""

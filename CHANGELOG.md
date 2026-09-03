@@ -5,6 +5,49 @@ The section matching the pushed tag becomes the GitHub release body
 `fusionmcp_update` notice show to the user — keep entries short, user-facing
 and grouped under **Added / Fixed / Changed**.
 
+## v1.16.0 — 2026-09-03
+
+### Added
+- Scan reverse engineering as FEATURES, not splines (new `recon` module,
+  server-side, deterministic — no RANSAC):
+  - `scan_segment`: region-growing split of a scan into plane / cylinder /
+    sphere / freeform patches with an adjacency graph (optional coloured PLY).
+  - `scan_features`: the measurement sheet — holes (centre, Ø, depth,
+    through/blind), non-circular cutouts, bosses, fillet rounds, hole
+    patterns (pair / linear / rectangle / PCD) and plate thicknesses.
+  - `scan_profile`: one planar section turned into LINES + ARCS with
+    corner detection, arc merging, tangent junctions and angle/radius
+    snapping; `to_fusion=true` builds the constrained sketch directly.
+  - `scan_thread_identify`: pitch, handedness, major/minor of a scanned
+    thread (folded-phase periodogram) snapped to ISO 261 / UNC / UNF.
+  - `scan_frame`: datum alignment without a CAD model — largest plane to
+    Z=0, dominant direction to X, transform returned for import_mesh.
+  - `scan_mesh_offset`: voxel offset of a scan by +d mm, plain or monotone
+    (drop-on cavity along an axis) — the cavity cutter, ready to import.
+  - `scan_fit_report`: one PASS/WARN/FAIL sheet (seating vs scan,
+    printability, walls, DFM) with explicit thresholds.
+- Fusion side: `capabilities_probe` (which Preview/optional APIs exist on
+  this build — replaces the manual checklist after each Fusion update),
+  `new_document(kind, direct)`, `fillet_max_radius` (bisection to the
+  largest working radius, optional chamfer fallback), `sketch_profile`
+  (lines + arcs sharing endpoints, optional constraints/dimensions),
+  printed-detail generators `add_boss` (screw/heat-set boss with blind hole
+  and base fillet), `add_snap_fit` (cantilever hook with strain/force
+  check per material) and `add_clip_fir_tree` (push-in clip for a round
+  hole, one revolve).
+- `interference(ignore_coincident=true)` — the assembly check;
+  `set_design_mode(mode="get")` reports mode, timeline size and the
+  direct-mode rules, and flags a silently ignored switch.
+- Prompt `reverse_engineer_scan` rewritten around the new tools.
+
+### Fixed
+- `get_state` no longer fails on direct-modelling designs (parameters
+  unavailable there).
+
+### Changed
+- Runs on both mcp 1.x and 2.x SDKs (FastMCP/MCPServer shim); `[re]`
+  extras gain scikit-image (marching cubes for scan_mesh_offset).
+
 ## v1.15.0 — 2026-08-27
 
 ### Added
