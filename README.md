@@ -378,8 +378,10 @@ python -m pytest
 CI (GitHub Actions, [.github/workflows/ci.yml](.github/workflows/ci.yml)) uruchamia
 ruff + pytest na Pythonie 3.10 i 3.12 przy każdym push/PR.
 
-**Publikacja wersji**: podbij wersję (`mcp_server/_version.py`,
-`mcp_server/pyproject.toml`, `VERSION` w `commands.py`), zrób tag `vX.Y.Z` i
+**Publikacja wersji**: podbij wersję w CZTERECH miejscach (`mcp_server/_version.py`,
+`mcp_server/pyproject.toml`, `VERSION` w `commands.py` oraz `"version"` w
+`fusion_addin/FusionMCP/FusionMCP.manifest` — to ją pokazuje okno Add-Ins w
+Fusion; test wersji pilnuje zgodności), zrób tag `vX.Y.Z` i
 wypchnij go — workflow [release.yml](.github/workflows/release.yml) opublikuje
 release z automatycznymi release notes, które updater pokaże użytkownikom.
 

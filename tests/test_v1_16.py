@@ -33,6 +33,12 @@ def test_versions_pinned_to_1_16_0():
         assert re.search(r'^version = "1\.16\.0"$', fh.read(), re.M)
     with open(os.path.join(ROOT, 'CHANGELOG.md'), encoding='utf-8') as fh:
         assert '## v1.16.0' in fh.read()
+    # The add-in manifest is what Fusion's Add-Ins dialog shows as the
+    # version — it sat at "1.0.0" for fifteen releases.
+    import json
+    with open(os.path.join(ROOT, 'fusion_addin', 'FusionMCP', 'FusionMCP.manifest'),
+              encoding='utf-8') as fh:
+        assert json.load(fh)['version'] == commands.VERSION
 
 
 # --------------------------------------------------------------------------- #

@@ -43,6 +43,9 @@ and grouped under **Added / Fixed / Changed**.
 ### Fixed
 - `get_state` no longer fails on direct-modelling designs (parameters
   unavailable there).
+- The add-in manifest version (shown in Fusion's Utilities > Add-Ins dialog)
+  had been stuck at 1.0.0 since the first release — it now tracks the real
+  version and the version-sync test enforces it.
 
 ### Changed
 - Runs on both mcp 1.x and 2.x SDKs (FastMCP/MCPServer shim); `[re]`

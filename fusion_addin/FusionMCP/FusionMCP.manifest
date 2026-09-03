@@ -6,7 +6,7 @@
     "description": {
         "": "MCP bridge: exposes the Fusion 360 API over a local socket for an external Model Context Protocol server."
     },
-    "version": "1.0.0",
+    "version": "1.16.0",
     "runOnStartup": true,
     "supportedOS": "windows|mac",
     "editEnabled": true
